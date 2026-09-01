@@ -1,0 +1,11 @@
+# Embedded shader bytecode (byte arrays)
+src/videonative/renderer_*_ps.h linguist-generated
+
+# Vendored single-header libraries
+src/kernel/xam/stb_image.h linguist-vendored
+src/kernel/xam/avatars/stb_image_write.h linguist-vendored
+tools/avatarextract/stb_image_write.h linguist-vendored
+
+# Vendored upstream trees
+thirdparty/** linguist-vendored
+tools/XenosRecomp/** linguist-vendored

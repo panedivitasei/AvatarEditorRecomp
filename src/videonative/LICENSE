@@ -1,0 +1,14 @@
+The contents of this directory (src/videonative) are licensed under the
+GNU General Public License version 3 (GPL-3.0), NOT the BSD license used
+by the rest of the ReXGlue SDK.
+
+This module is a port of the native video layer from UnleashedRecomp:
+  https://github.com/hedge-dev/UnleashedRecomp  (GPL-3.0)
+Copyright (c) the UnleashedRecomp contributors.
+Adaptations for ReXGlue Copyright (c) 2026.
+
+It sits on the plume rendering interface (thirdparty/plume, MIT), which is
+not affected by this notice.
+
+You should have received a copy of the GNU General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/gpl-3.0>.

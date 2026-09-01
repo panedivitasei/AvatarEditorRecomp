@@ -1,0 +1,267 @@
+
+# Save-and-Exit null-op guard: the save flow's UI states 76/77 poll a
+# GamerPicManager op object; if its creation fails the slot stays null and the
+# pollers deref op+12. With r3 == 0 skip the body; r3 already holds the correct
+# idle return. XamAvatarSetManifest persists the save data before these states
+# run, so a null op only skips the gamerpic upload.
+
+# sub_92201DF8: op-state getter `return *(op+12)`.
+[[midasm_hook]]
+address = 0x92201DF8
+name = "AE_GuardNullOpState"
+registers = ["r3"]
+return_on_true = true
+
+# sub_920C7680: op "is active (states 1..4)" check, same NULL deref.
+[[midasm_hook]]
+address = 0x920C7680
+name = "AE_GuardNullOpActive"
+registers = ["r3"]
+return_on_true = true
+
+# The guest must LockRect (0x9211B6A0, texture r3) before CPU-reading any
+# texture, tile composes included. Flushing pending writebacks for the
+# locked base right here guarantees the compose reads delivered bytes and
+# leaves nothing to deliver late.
+[[midasm_hook]]
+address = 0x9211B6A0
+name = "AE_HookTextureLock"
+registers = ["r3"]
+
+# In-game XUI search bar (Ctrl+F): sniff the core handle-resolved XUI
+# message dispatch 0x9215E1B0(handle, XuiMessage*). XuiMessage: +4 = msg
+# id, +16 -> params, params+12 = wchar* text for set-text messages. While
+# the search is open the heading set-text carries the status line; see
+# video_hooks.cpp.
+[[midasm_hook]]
+address = 0x9215E1B0
+name = "AE_SniffXuiSetText"
+registers = ["r3", "r4"]
+
+[[midasm_hook]]
+address = 0x92116428
+name = "VideoNative_CreateDevice"
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x9211DA80
+name = "VideoNative_Swap"
+registers = ["r3", "r4", "r5"]
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x92124A48
+name = "VideoNative_Clear"
+registers = ["r3", "r4", "r5", "r6", "r7", "f1", "r9"]
+return_on_true = true
+
+# Shared SetViewport tail 0x921192D0: both D3DDevice_SetViewport and
+# D3DDevice_SetViewportF (the float variant the avatar lib's preview pass
+# uses) land here, so the tail sees strictly more callers than the int
+# entry (f1..f6 = x,y,w,h,minZ,maxZ floats).
+[[midasm_hook]]
+address = 0x921192D0
+name = "VideoNative_SetViewportTail"
+registers = ["r3", "f1", "f2", "f3", "f4", "f5", "f6"]
+return_on_true = true
+
+# 0x9212EC08/0x9212EF50 are the unused GPU-composite swap pair, not draws.
+# The real workhorse draw + SetTexture are below.
+[[midasm_hook]]
+address = 0x92121380
+name = "VideoNative_DrawVerticesUP"
+registers = ["r3", "r4", "r5", "r6"]
+return_on_true = true
+
+# 0x92118C00 = SetStreamSource: writes the vertex vfetch pairs. The actual
+# SetTexture is 0x9211BA20 below.
+[[midasm_hook]]
+address = 0x92118C00
+name = "VideoNative_SetStreamSource"
+registers = ["r3", "r4", "r5", "r6", "r7", "r8"]
+return_on_true = true
+
+# Parked on the dead swap-composite entry (never fires) so the handler stays
+# linked.
+[[midasm_hook]]
+address = 0x9212EC08
+name = "VideoNative_DrawIndexedVertices"
+registers = ["r3", "r4", "r5", "r6", "r7"]
+return_on_true = true
+
+# Mapped-but-unwired draw APIs are fatal in dev builds (ae_vn_strict, default
+# on); the crash log names the function that still needs wiring.
+[[midasm_hook]]
+address = 0x92120898
+name = "AE_VnUnwiredDraw"
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x92120DA0
+name = "AE_VnUnwiredDraw"
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x92121798
+name = "VideoNative_DrawIndexedVertices"
+registers = ["r3", "r4", "r5", "r6", "r7"]
+return_on_true = true
+
+# DrawPrimitiveUP(dev, prim, count=r5, data=r6, stride=r7). The "Packed" in
+# the handler name is a naming artifact, not a vertex format.
+[[midasm_hook]]
+address = 0x92120D58
+name = "VideoNative_DrawVerticesUP_Packed"
+registers = ["r3", "r4", "r5", "r6", "r7"]
+return_on_true = true
+
+# Shader binds (see video_hooks.cpp): C938=SetVertexShader,
+# C730=SetPixelShader, CB50=SetVertexDecl, 92118DA8=SetIndices.
+[[midasm_hook]]
+address = 0x9211CB50
+name = "VideoNative_SetVertexDecl"
+registers = ["r3", "r4"]
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x9211C938
+name = "VideoNative_SetVertexShader"
+registers = ["r3", "r4"]
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x92118DA8
+name = "VideoNative_SetIndices"
+registers = ["r3", "r4"]
+return_on_true = true
+
+# Core texture lock (glyph-atlas CPU writes) -> cache invalidation.
+[[midasm_hook]]
+address = 0x9211B090
+name = "VideoNative_TextureLock"
+registers = ["r3"]
+return_on_true = true
+
+# Resource Unlock (0x92119DD0, resource r3): the CPU write is complete, so
+# retire the native texture-cache entries over the texture's range and let
+# the next bind upload the finished texels.
+[[midasm_hook]]
+address = 0x92119DD0
+name = "VideoNative_TextureUnlock"
+registers = ["r3"]
+return_on_true = true
+
+# BeginVertices wrapper: entry latch (shape) + return-site capture (ring
+# pointer from DrawApi_A) -> deferred auto-UP draw at the next boundary.
+[[midasm_hook]]
+address = 0x921B2728
+name = "VideoNative_BeginVerticesUP"
+registers = ["r3", "r4", "r5", "r6"]
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x921B2744
+name = "VideoNative_BeginVerticesRet"
+registers = ["r3"]
+return_on_true = true
+
+# DrawIndexedPrimitiveUP wrapper over DrawApi_B (index+vertex ring copy).
+# r1 carries the stack pointer for the stride argument at r1+0x54.
+[[midasm_hook]]
+address = 0x921212E0
+name = "VideoNative_DrawIndexedUP"
+registers = ["r1", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"]
+return_on_true = true
+
+# Deferred-draw flush points: shader-constant setters, the vertex fetch
+# constant setter, and the raw fetch-block SetTexture; every route that
+# mutates draw-time-read device shadows between two draws. Observe-only.
+[[midasm_hook]]
+address = 0x9211C490      # D3DDevice_SetVertexShaderConstantFN
+name = "VideoNative_FlushPoint"
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x9211C568      # D3DDevice_SetPixelShaderConstantFN
+name = "VideoNative_FlushPoint"
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x9211C640      # D3DDevice_SetPixelShaderConstantB
+name = "VideoNative_FlushPoint"
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x9211C6A0      # D3DDevice_SetPixelShaderConstantI
+name = "VideoNative_FlushPoint"
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x92119108      # D3DDevice_SetVertexFetchConstant
+name = "VideoNative_FlushPoint"
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x9211BA20      # the real D3DDevice_SetTexture (dev+1152 writer)
+name = "VideoNative_SetTexture"
+registers = ["r3", "r4", "r5"]
+return_on_true = true
+
+# 0x92119668/0x921199B8 are the render target pair
+# (SetRenderTarget / SetDepthStencilSurface), not a shader API.
+[[midasm_hook]]
+address = 0x92119668
+name = "VideoNative_SetRenderTarget"
+registers = ["r3", "r4", "r5"]
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x921199B8
+name = "VideoNative_SetDepthStencilSurface"
+registers = ["r3", "r4"]
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x92123790
+name = "VideoNative_Resolve"
+registers = ["r3", "r4", "r5", "r6", "r7"]
+return_on_true = true
+
+# The EDRAM tiling bracket: AE renders every frame in predicated tiles and
+# reaches the front buffer only through EndTiling's per-tile resolve.
+[[midasm_hook]]
+address = 0x9211F940
+name = "VideoNative_BeginTiling"
+registers = ["r3", "r4", "r5", "r6", "r7", "f1"]
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x9211FCB0
+name = "VideoNative_EndTiling"
+registers = ["r3", "r4", "r6"]
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x9211C730
+name = "VideoNative_SetPixelShader"
+registers = ["r3", "r4"]
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x921FF0A0        # sub_921FF0A0 entry, r3 = XUI tile task
+name = "AE_TileSizeHint"
+registers = ["r3"]
+
+[[midasm_hook]]
+address = 0x921FF0C4        # sub_921FF0A0: after li r11,16384 (tile buffer size, stored at +80)
+name = "AE_TileBufferSize"
+registers = ["r11"]
+
+# Kinect identity hint ("Identifying. Please face the sensor."): end of the
+# widget ctor sub_921FA7C0, r31 = widget with the IdentifyingGrp handle at
+# +12; the hook hides that element (there is no Kinect).
+[[midasm_hook]]
+address = 0x921FA820        # sub_921FA7C0: addi r1 after the 2nd bl sub_92168390
+name = "AE_HideIdentifyingGrp"
+registers = ["r31"]
+return_on_true = true
