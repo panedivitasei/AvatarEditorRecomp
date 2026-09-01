@@ -25,10 +25,10 @@ add_library(rexvideonative STATIC ${REXVIDEONATIVE_SOURCES})
 add_library(rex::videonative ALIAS rexvideonative)
 
 target_include_directories(rexvideonative PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-# xxHash in header-only mode (XXH_INLINE_ALL), no link dependency, from the
-# SDK submodule.
-target_include_directories(rexvideonative PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../sdk/thirdparty/xxHash)
+# xxHash in header-only mode (XXH_INLINE_ALL), no link dependency; take it
+# from wherever REXSDK_DIR points instead of assuming sdk/ in the repo root.
+get_filename_component(REXSDK_ABS "${REXSDK_DIR}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+target_include_directories(rexvideonative PRIVATE "${REXSDK_ABS}/thirdparty/xxHash")
 
 target_link_libraries(rexvideonative PUBLIC plume rex::runtime)
 
