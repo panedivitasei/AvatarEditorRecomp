@@ -13,7 +13,7 @@ if (-not (Get-Command cmake -ErrorAction SilentlyContinue) -or
     $env:PATH = "$vs\VC\Tools\Llvm\x64\bin;$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;$env:PATH"
 }
 $root = (Resolve-Path "$PSScriptRoot\..\..").Path
-$title = "$root\out\build\win-amd64-relwithdebinfo\avatareditor.exe"
+$title = "$root\out\build\win-amd64-release\avatareditor.exe"
 $xrDir = "$root\tools\XenosRecomp"
 $xrBuild = "$root\out\build\xenosrecomp"
 $xr = "$xrBuild\XenosRecomp\XenosRecomp.exe"

@@ -47,17 +47,12 @@ class AvatareditorApp : public rex::ReXApp {
         ShadowTableImageInfo()));
   }
 
-  // The generated dispatch reads its function table at
-  // REX_IMAGE_BASE + REX_IMAGE_SIZE, and Runtime::Setup allocates the table
-  // it maintains at image_base + image_size from the title (v80000000) heap.
-  // For this 0x92000000-based system executable that address lies outside
-  // the title heap, so Setup would fail at boot with "Failed to allocate
-  // function table". Hand Setup shadow image bounds that keep the
-  // SDK-maintained table inside the title heap, then commit the real table
-  // location and mirror the shadow into it before launch
-  // (MirrorDispatchTable). Slots written after the mirror only reach the
-  // shadow copy; the real table reads zero there and the generated dispatch
-  // falls back to the FunctionDispatcher, which is always correct.
+  // The SDK allocates its function table at image_base + image_size in the
+  // title heap, which for a 0x92000000 system exe is out of range and kills
+  // Setup at boot. So hand Setup shadow bounds inside the title heap and
+  // mirror the table over the real location before launch; anything
+  // registered late misses the mirror, reads zero, and falls back to the
+  // dispatcher.
   static constexpr uint32_t kShadowTableBase = 0x8F000000u;
   static constexpr uint32_t kDispatchTableBase =
       uint32_t(REX_IMAGE_BASE + REX_IMAGE_SIZE);
@@ -211,10 +206,8 @@ class AvatareditorApp : public rex::ReXApp {
   }
 
  private:
-  // Commit the dispatch table region the generated code reads and seed it
-  // from the shadow table (see ShadowTableImageInfo), so everything
-  // registered before launch -- recompiled functions and import stubs --
-  // stays on the fast path.
+  // Commit the table the generated code reads and copy the shadow table
+  // into it, so everything registered before launch stays on the fast path.
   void MirrorDispatchTable() {
     auto* memory = runtime()->memory();
     auto* heap = memory->LookupHeap(kDispatchTableBase);
