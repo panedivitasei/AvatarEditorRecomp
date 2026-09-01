@@ -10,12 +10,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(generated/rexglue.cmake)
 
-# On a tree that's never run codegen, seed an empty sources.cmake so it can
-# land in the rerun rule; the first build's codegen overwrites it and the
-# next build reconfigures.
-if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/ae/sources.cmake")
-    file(WRITE "${CMAKE_CURRENT_SOURCE_DIR}/generated/ae/sources.cmake" "")
-endif()
+# sources.cmake is committed so a fresh tree knows the generated file names
+# up front; watching it makes a build reconfigure if codegen reshapes the list.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/generated/ae/sources.cmake")
 
