@@ -1,5 +1,4 @@
 out/
-sdk/out/
 outfits/
 userdata/
 /shaderpack/
@@ -9,4 +8,3 @@ plume_present_dbg.txt
 .publish/
 __pycache__/
 /sdk/
-/thirdparty/renderdoc/
