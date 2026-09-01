@@ -63,4 +63,3 @@ Disclaimer: This project was developed using LLM tools.
 ## License
 
 See [LICENSE](LICENSE).
-Forked and third-party dependencies retain their own licenses.
