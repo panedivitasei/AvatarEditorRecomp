@@ -46,7 +46,7 @@ assets/
 
 ## Steps
 
-Builds with CMake against the ReXGlue SDK source tree (`-DREXSDK_DIR=<path>`).
+Builds with CMake against the ReXGlue SDK (`-DREXSDK_DIR=<path>`).
 
 ```powershell
 cmake --preset win-amd64-release -DREXSDK_DIR=<path>
