@@ -43,3 +43,15 @@ assets/
 ├── AvatarAssetPack.toc
 └── AvatarAssetPackLegacyV1.toc
 ```
+
+## Steps
+
+Builds with CMake against the ReXGlue SDK source tree (`-DREXSDK_DIR=<path>`).
+
+```powershell
+cmake --preset win-amd64-release -DREXSDK_DIR=<path>
+cmake --build --preset win-amd64-release
+tools/shaderpack/build_shaderpack.ps1
+```
+
+Run the build twice on a fresh tree.
