@@ -10,6 +10,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(generated/rexglue.cmake)
 
+# On a tree that's never run codegen, seed an empty sources.cmake so it can
+# land in the rerun rule; the first build's codegen overwrites it and the
+# next build reconfigures.
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/ae/sources.cmake")
+    file(WRITE "${CMAKE_CURRENT_SOURCE_DIR}/generated/ae/sources.cmake" "")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/generated/ae/sources.cmake")
+
 # Sources: the app shell plus the title-owned kernel subsystems (avatar
 # library, XAM avatar/user surface, HTTP and XLiveBase services). These
 # compile into the exe so their __imp__ definitions override the runtime's
@@ -72,7 +81,7 @@ if(WIN32)
     target_link_libraries(avatareditor PRIVATE xaudio2)
 endif()
 
-rexglue_setup_target(avatareditor)
+rexglue_setup_target(avatareditor GPU_PLUGINS xenos)
 
 # The config is read from the executable root.
 if(NOT EXISTS "${CMAKE_BINARY_DIR}/avatareditor.toml")
