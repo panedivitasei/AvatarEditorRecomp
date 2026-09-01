@@ -1,0 +1,84 @@
+
+# Branch targets the scanner misses (thunk/stub block at 0x922A88xx plus
+# 0x92274AE0; each is reached only by a bare `b` from another function).
+# Declaring them as function entries resolves the matching UnresolvedCall
+# analysis errors.
+[functions]
+0x922A8890 = {}
+0x922A88A8 = {}
+0x922A88B0 = {}
+0x922A88B8 = {}
+0x922A88C0 = {}
+0x92274AE0 = {}
+
+# Vtable-referenced function entries neither the scanner nor plain analysis
+# finds: virtual methods reachable only through data pointers. Without these,
+# REX_CALL_INDIRECT_FUNC raises "invalid or unregistered function" at runtime
+# (for example 0x922734F0, an XAUDIO AddRef via vtable 0x9207EB6C).
+0x920AD4F8 = {}
+0x920AD508 = {}
+0x920AD520 = {}
+0x920AD538 = {}
+0x920AD548 = {}
+0x920AD560 = {}
+0x920AD578 = {}
+0x920AD590 = {}
+0x920AD5A8 = {}
+0x920AD5F8 = {}
+0x920AD608 = {}
+0x920AD620 = {}
+0x920AD638 = {}
+0x920AD650 = {}
+0x920AD660 = {}
+0x920AD680 = {}
+0x920B83C4 = {}
+0x920B8988 = {}
+0x920B8990 = {}
+0x920D7EB0 = {}
+0x920DA0E0 = {}
+0x920E5348 = {}
+0x92100198 = {}
+0x9213D890 = {}
+0x92151400 = {}
+0x921A0068 = {}
+0x921A0078 = {}
+0x921A12C0 = {}
+0x921A1738 = {}
+0x92214DB0 = {}
+0x92214DB8 = {}
+0x92214FE0 = {}
+0x922150C0 = {}
+0x922150C8 = {}
+0x92215158 = {}
+0x92215160 = {}
+0x92215218 = {}
+0x92215298 = {}
+0x92215670 = {}
+0x922156B8 = {}
+0x9226BF68 = {}
+0x9226F3F8 = {}
+0x9226F440 = {}
+0x922734F0 = {}
+0x92274AD8 = {}
+0x92279580 = {}
+0x922795A8 = {}
+0x922795B0 = {}
+0x922799A0 = {}
+0x9227B490 = {}
+0x9227B840 = {}
+0x9227B868 = {}
+0x9227B880 = {}
+0x9227B888 = {}
+0x9227B890 = {}
+0x9227B898 = {}
+0x92295170 = {}
+0x92295188 = {}
+0x922954B0 = {}
+
+# Handler thunks whose addresses are materialized as lis/addi constants in
+# code (XUI message-handler registrations); same invalid-indirect-call class
+# as above, reached through the XUI dispatch loop at 0x9215DE50.
+0x92157108 = {}
+0x921755A8 = {}
+0x9220AB48 = {}
+0x9228F388 = {}

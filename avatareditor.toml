@@ -1,0 +1,17 @@
+# Avatar Editor Recomp config.
+game_data_root = "../../../assets"
+content_root = "outfits" #Relative to game_data_root
+avatar_closet_dir = "closet" #Relative to game_data_root
+
+fullscreen = false
+mnk_mode = true      # keyboard controls
+mnk_mouse = false
+
+native_video = true
+native_video_fps = false
+native_video_shader_pack = "../../../shaderpack"
+
+avatar_eye_whites = false
+log_single_file = true
+gpu_plugin = "xenos"
+model_shadows = true

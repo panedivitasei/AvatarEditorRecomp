@@ -1,0 +1,17 @@
+# Avatar Editor recompilation manifest (ReXGlue codegen input).
+
+[project]
+name = "ae"
+sdk_version = "0.10.0"
+game_root = "assets"
+
+[entrypoint]
+file_path = "assets/avatareditor.xex"
+out_directory_path = "generated/ae"
+# CRT setjmp/longjmp
+setjmp_address = 0x92260D70
+longjmp_address = 0x92260A50
+includes = [
+"config/ae_funcs.toml",
+"config/ae_hooks.toml",
+]
