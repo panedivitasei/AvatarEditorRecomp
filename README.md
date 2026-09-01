@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/ae.png" width="128" alt="AE recomp png">
+  <img src="assets/ae.png" width="2554" alt="AE recomp png">
 </p>
 
 # Avatar Editor Recomp
