@@ -1,3 +1,6 @@
 *
 !.gitignore
 !rexglue.cmake
+!ae/
+ae/*
+!ae/sources.cmake
