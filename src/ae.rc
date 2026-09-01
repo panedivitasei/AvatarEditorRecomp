@@ -1,0 +1,31 @@
+// Avatar Editor (avatareditor recomp) - Windows resources.
+// MAINICON is the name the runtime's window class loads
+// (src/ui/window_win.cpp: LoadIconW(hinstance, L"MAINICON")), and the first
+// icon resource is also what Explorer/taskbar show for the exe.
+// The VERSIONINFO FileDescription is the display name Task Manager uses.
+
+MAINICON ICON "icon.ico"
+
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "Avatar Editor"
+      VALUE "ProductName", "Avatar Editor"
+      VALUE "FileVersion", "1.0.0.0"
+      VALUE "ProductVersion", "1.0.0.0"
+      VALUE "InternalName", "avatareditor"
+      VALUE "OriginalFilename", "avatareditor.exe"
+      VALUE "CompanyName", "ReXGlue recompilation"
+      VALUE "LegalCopyright", "Game content (c) Microsoft. Recompiled with ReXGlue."
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

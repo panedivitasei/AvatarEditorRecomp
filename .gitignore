@@ -1,0 +1,13 @@
+out/
+sdk/out/
+generated/
+outfits/
+userdata/
+/shaderpack/
+*.xex
+*.log
+plume_present_dbg.txt
+.publish/
+__pycache__/
+/sdk/
+/thirdparty/renderdoc/
