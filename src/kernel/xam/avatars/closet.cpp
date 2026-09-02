@@ -44,7 +44,7 @@ uint32_t TitleIdOf(const AssetId& id) {
 
 // "aaaaaaaa-bbbb-cccc-dddd-dddddddddddd" -> AssetId. Returns false on any
 // malformed field.
-static bool ParseGuid(const std::string& s, AssetId* out) {
+bool ParseAssetId(const std::string& s, AssetId* out) {
   if (s.size() != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-') {
     return false;
   }
@@ -78,7 +78,11 @@ bool Closet::Load(const std::filesystem::path& dir) {
   const std::filesystem::path index_path = dir / "closet_index.tsv";
   FILE* f = std::fopen(index_path.string().c_str(), "rb");
   if (!f) {
-    return false;  // no closet: fine
+    // No index yet: purchases will create one here, so say where "here" is.
+    std::error_code ec;
+    REXKRNL_INFO("[avatar] closet: no closet_index.tsv in {}, starting empty",
+                 std::filesystem::absolute(dir, ec).string());
+    return false;
   }
   std::fseek(f, 0, SEEK_END);
   long sz = std::ftell(f);
@@ -103,7 +107,7 @@ bool Closet::Load(const std::filesystem::path& dir) {
     if (t3 == std::string::npos) continue;
     ClosetItem item{};
     const std::string guid = line.substr(0, t1);
-    if (!ParseGuid(guid, &item.id)) continue;
+    if (!ParseAssetId(guid, &item.id)) continue;
     item.categories = (uint32_t)std::strtoul(line.substr(t1 + 1, t2 - t1 - 1).c_str(), nullptr, 16);
     item.bodies = (uint8_t)std::strtoul(line.substr(t2 + 1, t3 - t2 - 1).c_str(), nullptr, 10);
     item.name = line.substr(t3 + 1);
@@ -117,6 +121,11 @@ bool Closet::Load(const std::filesystem::path& dir) {
   }
   is_loaded_ = true;
   LoadAwardDetails();
+  {
+    std::error_code ec;
+    REXKRNL_INFO("[avatar] closet: {} items from {}", items_.size(),
+                 std::filesystem::absolute(dir, ec).string());
+  }
   return true;
 }
 
@@ -236,12 +245,102 @@ static bool ReadWholeFile(const std::filesystem::path& path, std::vector<uint8_t
   return sz > 0 && got == out.size();
 }
 
-bool Closet::ReadItemBytes(const AssetId& id, std::vector<uint8_t>& out) const {
-  const ClosetItem* item = Find(id);
-  if (!item) {
+void Closet::RegisterCustomItem(const AssetId& id, const uint8_t* data, size_t size) {
+  std::lock_guard<std::mutex> lock(custom_mutex_);
+  custom_items_[id.to_string()].assign(data, data + size);
+}
+
+void Closet::RegisterCustomIcon(const AssetId& id, const uint8_t* data, size_t size) {
+  std::lock_guard<std::mutex> lock(custom_mutex_);
+  custom_icons_[id.to_string()].assign(data, data + size);
+}
+
+static bool WriteWholeFile(const std::filesystem::path& path, const std::vector<uint8_t>& bytes) {
+  FILE* f = std::fopen(path.string().c_str(), "wb");
+  if (!f) {
     return false;
   }
+  const size_t put = std::fwrite(bytes.data(), 1, bytes.size(), f);
+  std::fclose(f);
+  return put == bytes.size();
+}
+
+bool Closet::InstallItem(const AssetId& id, const std::vector<uint8_t>& blob,
+                         const std::vector<uint8_t>& icon, uint32_t categories, uint8_t bodies,
+                         const std::string& name) {
+  if (dir_.empty() || blob.empty()) {
+    return false;
+  }
+  const std::string guid = id.to_string();
+  std::error_code ec;
+  std::filesystem::create_directories(dir_ / "icons", ec);
+  if (!WriteWholeFile(dir_ / (guid + ".bin"), blob)) {
+    REXKRNL_WARN("[avatar] closet: cannot write {}.bin in {}", guid, dir_.string());
+    return false;
+  }
+  if (!icon.empty()) {
+    WriteWholeFile(dir_ / "icons" / (guid + ".png"), icon);
+  }
+  if (Find(id)) {
+    return true;  // a reinstall: files refreshed, the row is already there
+  }
+  // Same row avatarextract writes: guid, categories hex, bodies, name.
+  std::string safe_name;
+  for (char c : name) safe_name.push_back(c == '\t' || c == '\n' || c == '\r' ? ' ' : c);
+  FILE* f = std::fopen((dir_ / "closet_index.tsv").string().c_str(), "ab");
+  if (!f) {
+    REXKRNL_WARN("[avatar] closet: cannot append to closet_index.tsv in {}", dir_.string());
+    return false;
+  }
+  std::fprintf(f, "%s\t%08x\t%u\t%s\n", guid.c_str(), categories, unsigned(bodies),
+               safe_name.c_str());
+  std::fclose(f);
+  // List it now, in the name order the grids expect. Grid enumeration and this
+  // run on the guest thread, so no lock guards the item table.
+  ClosetItem item{};
+  item.id = id;
+  item.categories = categories;
+  item.bodies = bodies;
+  item.name = safe_name;
+  items_.push_back(std::move(item));
+  std::sort(items_.begin(), items_.end(),
+            [](const ClosetItem& a, const ClosetItem& b) { return a.name < b.name; });
+  by_guid_.clear();
+  for (size_t i = 0; i < items_.size(); ++i) {
+    by_guid_[items_[i].id.to_string()] = i;
+  }
+  is_loaded_ = true;
+  return true;
+}
+
+bool Closet::HasItemBytes(const AssetId& id) const {
+  const std::string guid = id.to_string();
+  {
+    std::lock_guard<std::mutex> lock(custom_mutex_);
+    if (custom_items_.count(guid)) {
+      return true;
+    }
+  }
+  std::error_code ec;
+  return !dir_.empty() && std::filesystem::exists(dir_ / (guid + ".bin"), ec);
+}
+
+bool Closet::ReadItemBytes(const AssetId& id, std::vector<uint8_t>& out) const {
+  {
+    std::lock_guard<std::mutex> lock(custom_mutex_);
+    auto it = custom_items_.find(id.to_string());
+    if (it != custom_items_.end()) {
+      out = it->second;
+      return true;
+    }
+  }
   const std::filesystem::path path = dir_ / (id.to_string() + ".bin");
+  const ClosetItem* item = Find(id);
+  if (!item) {
+    // A blob dropped in without a reindex is still wearable; only the grids
+    // need the index row.
+    return !is_loaded_ || IsStockPackId(id) ? false : ReadWholeFile(path, out);
+  }
   if (!ReadWholeFile(path, out)) {
     REXKRNL_WARN("[avatar] closet item file missing: {}", path.string());
     return false;
@@ -250,6 +349,14 @@ bool Closet::ReadItemBytes(const AssetId& id, std::vector<uint8_t>& out) const {
 }
 
 bool Closet::ReadItemIcon(const AssetId& id, std::vector<uint8_t>& out) const {
+  {
+    std::lock_guard<std::mutex> lock(custom_mutex_);
+    auto it = custom_icons_.find(id.to_string());
+    if (it != custom_icons_.end()) {
+      out = it->second;
+      return true;
+    }
+  }
   const ClosetItem* item = Find(id);
   if (!item) {
     return false;

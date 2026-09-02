@@ -265,3 +265,151 @@ address = 0x921FA820        # sub_921FA7C0: addi r1 after the 2nd bl sub_9216839
 name = "AE_HideIdentifyingGrp"
 registers = ["r31"]
 return_on_true = true
+
+# Marketplace manifest parser probes (observe-only, ae_mkt_trace). The channel
+# manifest goes through a SAX state machine (sub_922077B8, r3 = parser ctx);
+# these print the event stream and what its two validators actually see.
+[[midasm_hook]]
+address = 0x922077B8        # sub_922077B8 entry: one call per SAX event
+name = "AE_MktParserEvent"
+registers = ["r3"]
+
+[[midasm_hook]]
+address = 0x92207680        # sub_92207680 entry: per-slot validator
+name = "AE_MktSlotValidate"
+registers = ["r3"]
+
+[[midasm_hook]]
+address = 0x922075B8        # sub_922075B8 entry: channel validator at </manifest>
+name = "AE_MktChannelValidate"
+registers = ["r3"]
+
+# Net driver probes (observe-only). r3 = driver object; the XHTTP pump struct
+# sits at +840 and the abort flags at +288.
+[[midasm_hook]]
+address = 0x9220B2D8        # sub_9220B2D8 entry: poll step, r4 = target pump state
+name = "AE_MktNetPoll"
+registers = ["r3", "r4"]
+
+[[midasm_hook]]
+address = 0x9220B038        # sub_9220B038 entry: headers stage, r4 = hr
+name = "AE_MktNetHeaders"
+registers = ["r3", "r4"]
+
+[[midasm_hook]]
+address = 0x9220AE28        # sub_9220AE28 entry: driver teardown
+name = "AE_MktNetTeardown"
+registers = ["r3"]
+
+[[midasm_hook]]
+address = 0x9228E3F0        # sub_9228E3F0 entry: request/connection close
+name = "AE_MktNetClose"
+registers = ["r3"]
+
+# Store navigation probes (observe-only). Selecting a tile resolves its action
+# string against the category registry and then lazily builds a preview object;
+# the fault lands in that window.
+[[midasm_hook]]
+address = 0x920D2EF0        # sub_920D2EF0(registry, name, flags): scene/slot lookup
+name = "AE_MktSceneLookup"
+registers = ["r3", "r4", "r5"]
+
+[[midasm_hook]]
+address = 0x920E0620        # sub_920E0620(obj): lazy preview load on selection
+name = "AE_MktPreviewLoad"
+registers = ["r3"]
+
+[[midasm_hook]]
+address = 0x920E04B0        # sub_920E04B0(obj, record): applies the found record
+name = "AE_MktPreviewApply"
+registers = ["r3", "r4"]
+
+[[midasm_hook]]
+address = 0x920D4970        # sub_920D4970(fetcher, name, ...): item metadata fetch
+name = "AE_MktItemFetch"
+registers = ["r3", "r4"]
+
+[[midasm_hook]]
+address = 0x920D4C70        # sub_920D4C70(fetcher, request): issues the query
+name = "AE_MktQueryIssue"
+registers = ["r3", "r4"]
+
+[[midasm_hook]]
+address = 0x920D4548        # sub_920D4548(_, kind): scene kind -> query descriptor
+name = "AE_MktDispatchKind"
+registers = ["r4"]
+
+[[midasm_hook]]
+address = 0x92203D60        # sub_92203D60(client, req): builds the title:<id> query
+name = "AE_MktTitleQuery"
+registers = ["r3", "r4"]
+
+[[midasm_hook]]
+address = 0x922031E0        # sub_922031E0(handle, ...): marshals the query call
+name = "AE_MktMarshal"
+registers = ["r3", "r5"]
+
+# Try-on pipeline probes (observe-only): does hovering a store item ask for a
+# preview at all, and what error does the pipeline record if it refuses.
+[[midasm_hook]]
+address = 0x920DFDF0        # sub_920DFDF0: gated preview/try-on start
+name = "AE_MktWearStart"
+registers = ["r3"]
+
+[[midasm_hook]]
+address = 0x920E0680        # sub_920E0680: preview pipeline continuation
+name = "AE_MktWearStep"
+registers = ["r3"]
+
+# The FindGameOffers URL formatter passes nine arguments to _snwprintf; the
+# ninth (the RatingIds tail, its sixth vararg) travels in the first stack
+# slot, where the title stores the word at slot+0 and the host CRT shim reads
+# the slot's low half. Mirror the word across the slot before the call so the
+# shim picks up the real pointer instead of stale stack garbage.
+[[midasm_hook]]
+address = 0x922044DC        # sub_922042D8: bl _snwprintf, the 9-arg query build
+name = "AE_MktRatingArgFix"
+registers = ["r1"]
+
+# Purchase history. The store marks a tile "purchased" when its id is in the
+# history the title fetches from an XBOS service behind the LIVE secure
+# gateway, which never answers here, so the fetch stays pending for good.
+# Locally the closet is the purchase history: the manager reports itself
+# complete and the lookup is answered from the closet. The fetch itself is
+# left alone; skipping it moved the heap around enough to leave store tiles
+# on their spinner.
+[[midasm_hook]]
+address = 0x92201DF8        # sub_92201DF8 entry: manager status getter, r3 = manager
+name = "AE_MktOwnStatus"
+registers = ["r3"]
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x92202A80        # sub_92202A80 entry: CResourceManager contains(r3 = manager, r4 = 16-byte id)
+name = "AE_MktOwnContains"
+registers = ["r3", "r4"]
+return_on_true = true
+
+# Hover try-on. Each store tile only wears its item once sub_920DB528 stops
+# calling it busy, and that needs the generation word at unk_9452E398 (copied
+# into tile+952 by the tick) to be non-zero. Nothing in the binary writes it,
+# so seed it once when the first tile ticks.
+[[midasm_hook]]
+address = 0x920DBCD0        # sub_920DBCD0 entry: store tile tick, r3 = tile
+name = "AE_MktHoverTryOn"
+registers = ["r3"]
+
+# Purchase gate. sub_920DB6F8 reads the parental-control XConfig byte and
+# treats a missing setting as "restricted", which routes every store
+# purchase through XamShowPasscodeVerifyUI, a system overlay that does not
+# exist here. Report unrestricted so the purchase reaches XamShowMarketplaceUI.
+[[midasm_hook]]
+address = 0x920DB6F8        # sub_920DB6F8 entry: parental restriction query
+name = "AE_MktNoParentalGate"
+registers = ["r3"]
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x920DB768        # sub_920DB768 entry: marketplace UI launch for a tile, r3 = tile
+name = "AE_MktPurchase"
+registers = ["r3"]
