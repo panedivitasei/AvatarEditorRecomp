@@ -32,6 +32,7 @@
 #define REX_AVATARS_CLOSET_H_
 
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -55,6 +56,10 @@ struct ClosetItem {
   uint64_t unlock_time = 0;   // FILETIME; closet_awards.tsv, else the bin's mtime
 };
 
+// Reads the canonical 8-4-4-4-12 GUID text an item id is written as, the
+// inverse of AssetId::to_string(). False on any malformed field.
+bool ParseAssetId(const std::string& text, AssetId* out);
+
 // True when the asset id carries the award provenance nibble.
 bool IsAwardId(const AssetId& id);
 // The granting title id encoded in an award/marketplace id (d[4..7]).
@@ -72,8 +77,25 @@ class Closet {
 
   const ClosetItem* Find(const AssetId& id) const;
 
-  // Reads the item's raw YTGR/STRB blob from disk.
+  // Reads the item's raw YTGR/STRB blob from disk, or from the custom
+  // registry when the title handed the bytes over itself.
   bool ReadItemBytes(const AssetId& id, std::vector<uint8_t>& out) const;
+  // Whether the bytes are at hand (custom map or file), without touching the
+  // index tables the guest thread may be rebuilding.
+  bool HasItemBytes(const AssetId& id) const;
+
+  // Keeps a blob the title pushed through XamAvatarSetCustomAsset, or one the
+  // store fetched, so the loader resolves its id like any closet item; lives
+  // until exit. RegisterCustomIcon is the same for art.
+  void RegisterCustomItem(const AssetId& id, const uint8_t* data, size_t size);
+  void RegisterCustomIcon(const AssetId& id, const uint8_t* data, size_t size);
+
+  // A purchase landing: writes <guid>.bin and icons/<guid>.png, appends the
+  // closet_index.tsv row and lists the item, so it is owned and in the
+  // wardrobe from this call on.
+  bool InstallItem(const AssetId& id, const std::vector<uint8_t>& blob,
+                   const std::vector<uint8_t>& icon, uint32_t categories, uint8_t bodies,
+                   const std::string& name);
 
   // Reads the item's imported marketplace icon (icons/<guid>.png) as raw PNG
   // file bytes. False when the item exists but carries no icon art.
@@ -91,6 +113,9 @@ class Closet {
   std::filesystem::path dir_;
   std::vector<ClosetItem> items_;
   std::unordered_map<std::string, size_t> by_guid_;  // guid string -> index
+  mutable std::mutex custom_mutex_;
+  std::unordered_map<std::string, std::vector<uint8_t>> custom_items_;  // guid -> blob
+  std::unordered_map<std::string, std::vector<uint8_t>> custom_icons_;  // guid -> png
 };
 
 // Global closet instance, loaded next to the avatar asset pack.
