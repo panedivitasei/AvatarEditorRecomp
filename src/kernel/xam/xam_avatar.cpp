@@ -17,18 +17,22 @@
  */
 
 #include <atomic>
+#include <memory>
+#include <thread>
 #include <chrono>
 #include <algorithm>
 #include <functional>
 #include <string_view>
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <mutex>
 #include <random>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -47,6 +51,7 @@
 
 #include "avatars/asset_pack.h"
 #include "avatars/closet.h"
+#include "marketplace.h"
 #include "avatars/guest_animation.h"
 #include "avatars/guest_asset.h"
 #include "avatars/guest_load_animation.h"
@@ -56,6 +61,7 @@
 // game_data_root is defined in the runtime (runtime.cpp, global namespace);
 // read here to locate the title's AI avatar looks under data/art/_avatar/.
 REXCVAR_DECLARE(std::string, game_data_root);
+REXCVAR_DECLARE(bool, avatar_marketplace);
 
 // Native-renderer guest-texture notifications, called on the rexvideonative
 // renderer queues directly. The exe links the videonative static lib; both
@@ -854,6 +860,14 @@ u32 XamAvatarGetAssets_entry(ppc_ptr_t<X_AVATAR_METADATA> avatar_metadata_ptr,
     }
     const auto* metadata =
         mem->TranslateVirtual<const avatars::X_AVATAR_METADATA*>(meta_addr);
+    // Receipt: marketplace items in the manifest being built, so a try-on
+    // that never reaches the avatar shows up as silence here.
+    for (const auto& comp : metadata->components) {
+      if (!comp.asset_id.is_zero() && !avatars::IsStockPackId(comp.asset_id)) {
+        REXKRNL_INFO("[avatar] build wears {} cats={:#x}", comp.asset_id.to_string(),
+                     uint16_t(comp.categories));
+      }
+    }
     // Distinguish the local player's build from other builds. The player's
     // manifest is byte-identical to the captured one (the game is fed that
     // exact buffer via GetManifestLocalUser); synthesized metadata carries
@@ -1008,9 +1022,144 @@ u32 XamAvatarGetAssets_entry(ppc_ptr_t<X_AVATAR_METADATA> avatar_metadata_ptr,
   return run();
 }
 
-u32 XamAvatarSetCustomAsset_entry(u32 buffer_size, mapped_u32 asset_data_ptr,
-                                  u32 custom_color_count, mapped_u32 custom_colors_ptr,
-                                  ppc_ptr_t<X_AVATAR_METADATA> avatar_metadata_ptr) {
+// Blobs GetAssetBinary handed out lately, keyed by size and content hash.
+// A raw STRB carries no asset id of its own, so when one comes back through
+// SetCustomAsset this is how it gets named.
+struct ServedBinary {
+  avatars::AssetId id;
+  size_t size;
+  uint64_t hash;
+};
+static std::mutex g_served_mutex;
+static ServedBinary g_served_binaries[64];
+static size_t g_served_next = 0;
+
+static uint64_t HashBytes(const uint8_t* data, size_t size) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (size_t i = 0; i < size; ++i) {
+    h = (h ^ data[i]) * 0x100000001b3ull;
+  }
+  return h;
+}
+
+static void RememberServedBinary(const avatars::AssetId& id, const uint8_t* data, size_t size) {
+  std::lock_guard<std::mutex> lock(g_served_mutex);
+  g_served_binaries[g_served_next] = {id, size, HashBytes(data, size)};
+  g_served_next = (g_served_next + 1) % rex::countof(g_served_binaries);
+}
+
+// Names a blob: marketplace packages carry the id in their YTGR header, and
+// anything else has to be something GetAssetBinary served a moment ago.
+static bool IdentifyAssetBlob(const uint8_t* data, size_t size, avatars::AssetId* id) {
+  static constexpr size_t kYtgrHeaderSize = 0x140;
+  static constexpr size_t kYtgrIdOffset = 0x130;
+  if (size >= kYtgrHeaderSize + 24 && std::memcmp(data, "YTGR", 4) == 0) {
+    std::memcpy(id, data + kYtgrIdOffset, sizeof(*id));
+    if (!id->is_zero()) {
+      return true;
+    }
+  }
+  const uint64_t hash = HashBytes(data, size);
+  std::lock_guard<std::mutex> lock(g_served_mutex);
+  for (const auto& served : g_served_binaries) {
+    if (served.size == size && served.hash == hash && !served.id.is_zero()) {
+      *id = served.id;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Dresses a manifest in one item the way XAM's writer does: whatever the
+// item's categories overlap comes off, garments that left a required slot
+// bare come back from the manifest's own fallbacks, then the item goes in.
+static bool WearComponent(avatars::X_AVATAR_METADATA& meta, const avatars::AssetId& id,
+                          uint16_t categories) {
+  using namespace avatars::ComponentCategory;
+  avatars::X_AVATAR_COMPONENT_INFO item{};
+  item.asset_id = id;
+  item.categories = categories;
+  if (categories & kBody) {
+    meta.body_component = item;
+    return true;
+  }
+  if (categories & kHead) {
+    meta.head_component = item;
+    return true;
+  }
+  constexpr size_t kSlots = sizeof(meta.components) / sizeof(meta.components[0]);
+  avatars::X_AVATAR_COMPONENT_INFO kept[kSlots];
+  size_t count = 0;
+  uint32_t vacated = 0;
+  for (const auto& comp : meta.components) {
+    if (comp.asset_id.is_zero()) {
+      continue;
+    }
+    if (uint32_t(comp.categories) & categories) {
+      vacated |= uint32_t(comp.categories);
+      continue;
+    }
+    kept[count++] = comp;
+  }
+  uint32_t bare = vacated & ~uint32_t(categories) & (kTop | kBottom | kShoes | kHair);
+  for (const auto& fallback : meta.fallback_components) {
+    if (!bare || count >= kSlots) {
+      break;
+    }
+    const uint32_t cats = fallback.categories;
+    if (fallback.asset_id.is_zero() || !(cats & bare) || (cats & categories)) {
+      continue;
+    }
+    kept[count++] = fallback;
+    bare &= ~cats;
+  }
+  if (count >= kSlots) {
+    return false;
+  }
+  kept[count++] = item;
+  for (size_t i = 0; i < kSlots; ++i) {
+    meta.components[i] = i < count ? kept[i] : avatars::X_AVATAR_COMPONENT_INFO{};
+  }
+  return true;
+}
+
+// XamAvatarSetCustomAsset(size, data, color_count, colors, flags, metadata):
+// the editor's try-on path. It hands over an item's STRB and expects the
+// manifest to come back wearing it; the bytes are kept so GetAssets can load
+// the id. The XAM export takes six arguments, one more than the public
+// XAvatarSetCustomAsset: the title's thunk (sub_92143220) zeroes r7 and moves
+// the manifest to r8.
+u32 XamAvatarSetCustomAsset_entry(u32 buffer_size, mapped_void asset_data_ptr,
+                                  u32 custom_color_count, mapped_void custom_colors_ptr,
+                                  u32 flags, ppc_ptr_t<X_AVATAR_METADATA> avatar_metadata_ptr) {
+  if (!buffer_size || !asset_data_ptr || !avatar_metadata_ptr || custom_color_count > 3 ||
+      (custom_color_count && !custom_colors_ptr)) {
+    REXKRNL_WARN("[avatar] SetCustomAsset: bad arguments (size={:#x} data={:#x} colors={} meta={:#x})",
+                 buffer_size, asset_data_ptr.guest_address(), custom_color_count,
+                 avatar_metadata_ptr.guest_address());
+    return 0x80070057u;  // E_INVALIDARG
+  }
+  auto* mem = REX_KERNEL_MEMORY();
+  const auto* data = mem->TranslateVirtual<const uint8_t*>(asset_data_ptr.guest_address());
+  auto* meta =
+      mem->TranslateVirtual<avatars::X_AVATAR_METADATA*>(avatar_metadata_ptr.guest_address());
+  avatars::AssetId id{};
+  if (!IdentifyAssetBlob(data, buffer_size, &id)) {
+    REXKRNL_WARN("[avatar] SetCustomAsset: {:#x}-byte blob carries no asset id", buffer_size);
+    return 0x80004005u;  // E_FAIL
+  }
+  // The category mask rides in the id's first dword, for stock and
+  // marketplace ids alike.
+  const uint16_t categories = uint16_t(id.a.get() & 0xFFFFu);
+  if (!avatars::IsStockPackId(id)) {
+    avatars::GetCloset().RegisterCustomItem(id, data, buffer_size);
+  }
+  if (!WearComponent(*meta, id, categories)) {
+    REXKRNL_WARN("[avatar] SetCustomAsset: no free component slot for {}", id.to_string());
+    return 0x80004005u;
+  }
+  REXKRNL_INFO("[avatar] SetCustomAsset: wearing {} cats={:#x} ({:#x} bytes)", id.to_string(),
+               categories, buffer_size);
   return X_STATUS_SUCCESS;
 }
 
@@ -1116,6 +1265,202 @@ u32 XamAvatarGetInstrumentation_entry(u64 unk1, mapped_u32 unk2) {
 // Icon art comes from closet icons/<guid>.png, the marketplace package's own
 // ICON.PNG, imported by `avatarextract --closet-import` / `--closet-icons`.
 
+// Items the store lists that the closet does not hold come from the
+// marketplace server: art for their tiles, bytes for try-on. Each id is asked
+// for once per session, either way it goes.
+static std::mutex g_remote_mutex;
+static std::unordered_set<std::string> g_remote_missing_icons;
+static std::unordered_set<std::string> g_remote_missing_items;
+
+static std::string RemoteItemPath(const avatars::AssetId& id) {
+  return fmt::format("/live/{:08x}/avataritems/{}.acp", avatars::TitleIdOf(id), id.to_string());
+}
+
+static bool FetchRemoteIcon(const avatars::AssetId& id, std::vector<uint8_t>& png) {
+  if (avatars::IsStockPackId(id) || !REXCVAR_GET(avatar_marketplace)) {
+    return false;
+  }
+  const std::string guid = id.to_string();
+  {
+    std::lock_guard<std::mutex> lock(g_remote_mutex);
+    if (g_remote_missing_icons.count(guid)) {
+      return false;
+    }
+  }
+  std::string body;
+  if (!MarketplaceGet("/icons/" + guid + ".png", &body) || body.empty()) {
+    std::lock_guard<std::mutex> lock(g_remote_mutex);
+    g_remote_missing_icons.insert(guid);
+    return false;
+  }
+  png.assign(body.begin(), body.end());
+  avatars::GetCloset().RegisterCustomIcon(id, png.data(), png.size());
+  return true;
+}
+
+// The blob comes back with the index-row fields the server knows about, so a
+// purchase can write the closet row without a second round trip.
+struct RemoteItem {
+  std::vector<uint8_t> blob;
+  std::string name;
+  uint32_t categories = 0;
+  uint8_t bodies = 0;
+};
+
+static std::string HeaderValue(const std::string& block, const std::string& name) {
+  size_t pos = 0;
+  while (pos < block.size()) {
+    size_t end = block.find("\r\n", pos);
+    if (end == std::string::npos) end = block.size();
+    const std::string line = block.substr(pos, end - pos);
+    const size_t colon = line.find(':');
+    if (colon == name.size() && _strnicmp(line.c_str(), name.c_str(), colon) == 0) {
+      size_t v = colon + 1;
+      while (v < line.size() && line[v] == ' ') ++v;
+      return line.substr(v);
+    }
+    pos = end + 2;
+  }
+  return std::string();
+}
+
+static std::string PercentDecode(const std::string& text) {
+  std::string out;
+  for (size_t i = 0; i < text.size(); ++i) {
+    if (text[i] == '%' && i + 2 < text.size() && std::isxdigit(uint8_t(text[i + 1])) &&
+        std::isxdigit(uint8_t(text[i + 2]))) {
+      out.push_back(char(std::strtoul(text.substr(i + 1, 2).c_str(), nullptr, 16)));
+      i += 2;
+    } else {
+      out.push_back(text[i] == '+' ? ' ' : text[i]);
+    }
+  }
+  return out;
+}
+
+static bool FetchRemoteItem(const avatars::AssetId& id, RemoteItem& item) {
+  if (avatars::IsStockPackId(id) || !REXCVAR_GET(avatar_marketplace)) {
+    return false;
+  }
+  const std::string guid = id.to_string();
+  {
+    std::lock_guard<std::mutex> lock(g_remote_mutex);
+    if (g_remote_missing_items.count(guid)) {
+      return false;
+    }
+  }
+  std::string body, headers;
+  if (!MarketplaceGet(RemoteItemPath(id), &body, &headers) || body.empty()) {
+    std::lock_guard<std::mutex> lock(g_remote_mutex);
+    g_remote_missing_items.insert(guid);
+    return false;
+  }
+  item.blob.assign(body.begin(), body.end());
+  item.name = PercentDecode(HeaderValue(headers, "X-Avatar-Item-Name"));
+  item.categories = uint32_t(
+      std::strtoul(HeaderValue(headers, "X-Avatar-Item-Categories").c_str(), nullptr, 16));
+  item.bodies =
+      uint8_t(std::strtoul(HeaderValue(headers, "X-Avatar-Item-Bodies").c_str(), nullptr, 10));
+  // The id carries both masks itself when the server did not say.
+  if (!item.categories) item.categories = id.a.get();
+  if (!item.bodies) item.bodies = uint8_t(id.c.get() & 0xF);
+  if (item.name.empty()) item.name = guid;
+  avatars::GetCloset().RegisterCustomItem(id, item.blob.data(), item.blob.size());
+  return true;
+}
+
+// Ids from a catalog page that the closet cannot serve, parsed once for both
+// prefetches.
+static std::vector<avatars::AssetId> PrefetchCandidates(const std::vector<std::string>& guids,
+                                                        bool icons) {
+  std::vector<avatars::AssetId> out;
+  for (const auto& guid : guids) {
+    avatars::AssetId id{};
+    if (!avatars::ParseAssetId(guid, &id) || avatars::IsStockPackId(id)) {
+      continue;
+    }
+    std::vector<uint8_t> have;
+    const bool held = icons ? avatars::GetCloset().ReadItemIcon(id, have)
+                            : avatars::GetCloset().HasItemBytes(id);
+    if (!held) {
+      out.push_back(id);
+    }
+  }
+  return out;
+}
+
+// A few workers share the list; each takes the next id until it runs dry.
+template <typename Fetch>
+static void RunPrefetch(std::vector<avatars::AssetId> ids, size_t max_workers, bool wait,
+                        Fetch fetch) {
+  auto pending = std::make_shared<std::vector<avatars::AssetId>>(std::move(ids));
+  auto next = std::make_shared<std::atomic<size_t>>(0);
+  const size_t workers = std::min<size_t>(max_workers, pending->size());
+  std::vector<std::thread> threads;
+  for (size_t w = 0; w < workers; ++w) {
+    threads.emplace_back([pending, next, fetch]() {
+      for (size_t i = next->fetch_add(1); i < pending->size(); i = next->fetch_add(1)) {
+        fetch((*pending)[i]);
+      }
+    });
+  }
+  for (auto& t : threads) {
+    if (wait) {
+      t.join();
+    } else {
+      t.detach();
+    }
+  }
+}
+
+void MarketplacePrefetchIcons(const std::vector<std::string>& guids, bool wait) {
+  if (!REXCVAR_GET(avatar_marketplace)) {
+    return;
+  }
+  auto ids = PrefetchCandidates(guids, true);
+  if (ids.empty()) {
+    return;
+  }
+  REXKRNL_INFO("[avatar] prefetching {} tile icons{}", ids.size(), wait ? " (page waits)" : "");
+  RunPrefetch(std::move(ids), 6, wait, [](const avatars::AssetId& id) {
+    std::vector<uint8_t> png;
+    FetchRemoteIcon(id, png);
+  });
+}
+
+void MarketplacePrefetchItems(const std::vector<std::string>& guids) {
+  if (!REXCVAR_GET(avatar_marketplace)) {
+    return;
+  }
+  auto ids = PrefetchCandidates(guids, false);
+  if (ids.empty()) {
+    return;
+  }
+  REXKRNL_INFO("[avatar] prefetching {} item packages in the background", ids.size());
+  RunPrefetch(std::move(ids), 4, false, [](const avatars::AssetId& id) {
+    RemoteItem item;
+    FetchRemoteItem(id, item);
+  });
+}
+
+bool MarketplaceInstallItem(const avatars::AssetId& id) {
+  RemoteItem item;
+  if (!FetchRemoteItem(id, item)) {
+    return false;
+  }
+  std::vector<uint8_t> png;
+  if (!avatars::GetCloset().ReadItemIcon(id, png)) {
+    FetchRemoteIcon(id, png);
+  }
+  const bool ok = avatars::GetCloset().InstallItem(id, item.blob, png, item.categories,
+                                                  item.bodies, item.name);
+  if (ok) {
+    REXKRNL_INFO("[avatar] installed {} '{}' ({:#x} bytes, icon {})", id.to_string(), item.name,
+                 item.blob.size(), png.empty() ? "none" : "yes");
+  }
+  return ok;
+}
+
 u32 XamAvatarGetAssetIcon_entry(mapped_void asset_id_ptr, u32 flags, mapped_u32 size_inout,
                                 mapped_void buffer, mapped_void overlapped_ptr) {
   auto run = [&]() -> X_RESULT {
@@ -1132,7 +1477,16 @@ u32 XamAvatarGetAssetIcon_entry(mapped_void asset_id_ptr, u32 flags, mapped_u32 
     const auto* id =
         mem->TranslateVirtual<const avatars::AssetId*>(asset_id_ptr.guest_address());
     std::vector<uint8_t> png;
-    if (!avatars::GetCloset().ReadItemIcon(*id, png)) {
+    const bool closet_icon = avatars::GetCloset().ReadItemIcon(*id, png);
+    const bool have_icon = closet_icon || FetchRemoteIcon(*id, png);
+    // Receipt: which tiles ask for art and where it came from.
+    static std::atomic<uint32_t> icon_calls{0};
+    const uint32_t icon_n = icon_calls.fetch_add(1, std::memory_order_relaxed);
+    if (icon_n < 48 || (icon_n & 0x3F) == 0) {
+      REXKRNL_INFO("[avatar] GetAssetIcon #{} {} -> {}", icon_n, id->to_string(),
+                   closet_icon ? "closet" : have_icon ? "server" : "none");
+    }
+    if (!have_icon) {
       // Only closet-imported marketplace items carry icon art; no icon store
       // has been located in the stock pack. Fail so the editor falls through
       // to its own live mannequin preview render.
@@ -1192,11 +1546,18 @@ u32 XamAvatarGetAssetBinary_entry(mapped_void asset_id_ptr, u32 flags, mapped_u3
     const uint8_t* data = nullptr;
     size_t size = 0;
     std::vector<uint8_t> closet_bytes;
+    RemoteItem remote;
     if (avatars::GetCloset().ReadItemBytes(*id, closet_bytes) && !closet_bytes.empty()) {
       // Imported marketplace item: hand the title the raw YTGR/STRB blob.
       data = closet_bytes.data();
       size = closet_bytes.size();
-    } else if (!pack->GetAssetData(*id, data, size) || !size) {
+    } else if (pack->GetAssetData(*id, data, size) && size) {
+      // Stock pack asset.
+    } else if (FetchRemoteItem(*id, remote)) {
+      // A store item the closet does not hold yet, for its try-on.
+      data = remote.blob.data();
+      size = remote.blob.size();
+    } else {
       REXKRNL_WARN("[avatar] GetAssetBinary: no data for {}", id->to_string());
       return X_ERROR_FUNCTION_FAILED;
     }
@@ -1205,6 +1566,14 @@ u32 XamAvatarGetAssetBinary_entry(mapped_void asset_id_ptr, u32 flags, mapped_u3
       REXKRNL_WARN("[avatar] GetAssetBinary: {} needs {:#x} > capacity {:#x}", id->to_string(),
                    size, capacity);
       return X_ERROR_INSUFFICIENT_BUFFER;
+    }
+    RememberServedBinary(*id, data, size);
+    // Receipt: which items the editor pulls bytes for, and from where.
+    static std::atomic<uint32_t> binary_calls{0};
+    const uint32_t binary_n = binary_calls.fetch_add(1, std::memory_order_relaxed);
+    if (binary_n < 48 || (binary_n & 0x3F) == 0) {
+      REXKRNL_INFO("[avatar] GetAssetBinary #{} {} from={} bytes={:#x}", binary_n,
+                   id->to_string(), closet_bytes.empty() ? "pack" : "closet", size);
     }
     std::memcpy(mem->TranslateVirtual<uint8_t*>(buffer.guest_address()), data, size);
     *size_inout = static_cast<uint32_t>(size);
@@ -1222,7 +1591,16 @@ void XamAvatarGetInstalledAssetPackageDescription_entry(ppc_ptr_t<X_ASSET_ID> as
                                                         mapped_void content_data_ptr) {
   // rexglue ships no installed avatar-asset packages; report "none" by leaving
   // the descriptor as-is. (xenia fills an XCONTENT_AGGREGATE_DATA from the id.)
-  REXKRNL_DEBUG("XamAvatarGetInstalledAssetPackageDescription (no installed packages)");
+  static std::atomic<uint32_t> calls{0};
+  const uint32_t n = calls.fetch_add(1, std::memory_order_relaxed);
+  if (n < 24 || (n & 0x3F) == 0) {
+    const auto* id = asset_id_ptr
+                         ? REX_KERNEL_MEMORY()->TranslateVirtual<const avatars::AssetId*>(
+                               asset_id_ptr.guest_address())
+                         : nullptr;
+    REXKRNL_INFO("[avatar] GetInstalledAssetPackageDescription #{} {} (no packages)", n,
+                 id ? id->to_string() : "?");
+  }
 }
 
 void XamAvatarSetMocks_entry() {
@@ -1557,6 +1935,8 @@ u32 XamAvatarBeginEnumAssets_entry(u32 user_index, u32 items_per_enumerate, u32 
                                    u32 body_mask, u32 flags, mapped_void overlapped_ptr) {
   std::lock_guard<std::mutex> lock(g_asset_enum_mutex);
   g_asset_enumerator = AssetEnumerator(items_per_enumerate ? items_per_enumerate : 50);
+  REXKRNL_INFO("[avatar] enum assets cats={:#x} bodies={:#x} closet={}", category_mask, body_mask,
+               avatars::GetCloset().items().size());
 
   // Catalog search (Ctrl+F): while a query is armed, enumerate only items
   // whose display name matches, the grid then shows exactly the matches.
@@ -1668,8 +2048,14 @@ u32 XamAvatarBeginEnumAssets_entry(u32 user_index, u32 items_per_enumerate, u32 
       guest_info->body_mask = item.bodies;
       guest_info->random_body_mask = item.bodies;
       // Stock pack entries carry flags=0x01 and the editor enumerates with
-      // flags=0x1; items without it are filtered out of the grids.
-      guest_info->flags = 1;
+      // flags=0x1; items without it are filtered out of the grids. 0x400 marks
+      // downloaded content: the re-enumeration after a purchase (sub_92210748)
+      // only adds items that carry it.
+      guest_info->flags = 1 | 0x400;
+      // That same pass locks an item (entry+51, the exclamation badge) unless
+      // this mask carries the bit for the running skeleton version,
+      // 1 << (version >= 3). Closet items load on both, so advertise both.
+      guest_info->skeleton_version_mask = 0x3;
       guest_info->subcategory = 0;
       CopyUtf8ToUtf16(item.name, guest_info->name, rex::countof(guest_info->name));
       if (item.is_award) {
@@ -1683,12 +2069,8 @@ u32 XamAvatarBeginEnumAssets_entry(u32 user_index, u32 items_per_enumerate, u32 
         // name/description).
         // 0x400 = installed: the editor's second pass (sub_92210748) only
         // marks an award wearable (entry+50) when this bit is set; otherwise
-        // the Awards page legend reads "Download". That pass also locks the
-        // item (entry+51) unless skeleton_version_mask carries the bit for
-        // the running skeleton version (1 << (version >= 3)); closet items
-        // load on both, so advertise both.
+        // the Awards page legend reads "Download".
         guest_info->flags = 1u | 0x100u | 0x200u | 0x400u;
-        guest_info->skeleton_version_mask = 0x3;
         guest_info->title_id = item.title_id;
         CopyUtf8ToUtf16(item.title_name, guest_info->title_name,
                         rex::countof(guest_info->title_name));

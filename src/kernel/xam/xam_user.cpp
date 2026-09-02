@@ -21,13 +21,16 @@
 #include <rex/kernel/xam/xam_avatar.h>
 
 #include "avatars/closet.h"
+#include "marketplace.h"
 #include <rex/kernel/xnet.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/memory/utils.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/string.h>
+#include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 #include <rex/system/xenumerator.h>
@@ -49,6 +52,23 @@ REXCVAR_DEFINE_STRING(user_gamerpic, "", "Kernel",
                       "Path to an image (PNG/JPG/BMP/TGA) served as the profile's gamer picture "
                       "(64x64 recommended). Relative paths resolve against the exe folder. "
                       "Empty keeps the title's default tile.");
+
+// The editor's store section is gated on a single live hive flag. Opening it
+// makes the storelist scenes reachable again; everything behind them comes
+// from the one server below.
+REXCVAR_DEFINE_BOOL(avatar_marketplace, true, "Kernel",
+                    "Enable the Avatar Editor's marketplace section.");
+
+// The store's server (tools/mktserver). Every hive value the store reads is
+// derived from this: the catalog host and port, the Epix root the storefront
+// manifest hangs off, and the root item downloads are built from.
+REXCVAR_DEFINE_STRING(avatar_marketplace_key, "", "Kernel",
+                      "Shared secret sent as X-Marketplace-Key on every request to the "
+                      "marketplace server. Leave empty for a server that does not check one.");
+REXCVAR_DEFINE_STRING(avatar_marketplace_server, "http://127.0.0.1:8080", "Kernel",
+                      "Marketplace server as scheme://host[:port], e.g. http://127.0.0.1:8080 or "
+                      "https://example.org. https means port 443. It is the only host the "
+                      "store will talk to.");
 
 namespace rex {
 namespace kernel {
@@ -919,7 +939,18 @@ static X_RESULT ReadTileImage(uint32_t tile_type, uint32_t game_id, uint64_t ite
     return X_ERROR_INVALID_PARAMETER;
   }
   std::vector<uint8_t> file;
-  if (!game_id || !avatars::GetCloset().ReadTitleIcon(game_id, file)) {
+  const bool have_art = game_id && avatars::GetCloset().ReadTitleIcon(game_id, file);
+  // Which screens ask for a game tile, and whether titles/ can answer. A
+  // request stream with no art is the game-tile placeholder on screen.
+  {
+    static std::atomic<uint32_t> tile_calls{0};
+    const uint32_t n = tile_calls.fetch_add(1, std::memory_order_relaxed);
+    if (n < 16 || (n & 0x3F) == 0) {
+      REXKRNL_INFO("[tile] #{} type={} game={:08X} art={} bytes={}", n, tile_type, game_id,
+                   have_art, file.size());
+    }
+  }
+  if (!have_art) {
     // No art anywhere (not even titles/_default.*): serve a fully transparent
     // 64x64 PNG instead of failing. The catalog popup's logo element only
     // repaints when an image loads, so a failure leaves whatever logo was
@@ -1087,41 +1118,199 @@ u32 XamReadTileToTexture_entry(u32 unknown, u32 title_id, u64 tile_id, u32 user_
 }
 
 // ---------------------------------------------------------------------------
+// XamWebInstrumentation*: the store raises a telemetry report when a tile is
+// selected and writes into the handle it gets back. REX_STUB leaves r3 alone,
+// so that handle was whatever the caller happened to have left in the register
+// and the first write through it faulted on a junk address. Hand back one
+// zeroed block and let the writes land somewhere harmless; nothing reads them.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// XamUserIsUnsafeProgrammingAllowed(user_index, flags, allowed_out): the answer
+// comes back through the third argument, not r3. sub_92203890 branches on that
+// out-parameter to decide whether to build a ",RatingIds=..." filter for its
+// catalog query, and a stub that only set r3 left it reading uninitialized
+// stack. Report "allowed" so no parental rating filter is applied offline.
+// ---------------------------------------------------------------------------
+u32 XamUserIsUnsafeProgrammingAllowed_entry(u32 user_index, u32 flags, mapped_u32 allowed_out) {
+  if (allowed_out) {
+    *allowed_out = 1;
+  }
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamWebInstrumentationCreateReport_entry() {
+  static constexpr uint32_t kReportSize = 1024;
+  static uint32_t report = 0;
+  if (!report) {
+    report = REX_KERNEL_MEMORY()->SystemHeapAlloc(kReportSize);
+    if (report) {
+      std::memset(REX_KERNEL_MEMORY()->TranslateVirtual<uint8_t*>(report), 0, kReportSize);
+    }
+  }
+  return report;
+}
+
+// ---------------------------------------------------------------------------
+// XamUserGetOnlineCountryFromXUID / XamUserGetOnlineLanguageFromXUID: the store
+// expands the "$locale" token in its manifest path through these
+// (sub_922067A0 -> sub_9228FF00 -> sub_9228FDC8, which turns the country and
+// language pair into a string itself). sub_922067A0 treats a zero country as a
+// hard failure and returns E_FAIL before any request is built, which is what
+// stopped the storefront once the hive values were in place.
+//
+// Both ids are byte-sized and come from the profile's configured locale;
+// user_country's default of 103 is "US" in the same table the title indexes.
+// ---------------------------------------------------------------------------
+u32 XamUserGetOnlineCountryFromXUID_entry(u32 xuid) {
+  return static_cast<uint8_t>(REXCVAR_GET(user_country));
+}
+
+u32 XamUserGetOnlineLanguageFromXUID_entry(u32 xuid) {
+  return static_cast<uint8_t>(REXCVAR_GET(user_language));
+}
+
+// ---------------------------------------------------------------------------
 // XamGetLiveHiveValueA(name, buffer, size, flags, overlapped): live service
 // configuration ("hive") values. The Avatar Editor reads two feature flags
 // through 52-byte async readers (sub_920D1CB8: value into a 16-byte buffer,
 // ready when the overlapped is no longer pending with extended error 0):
 // "AvatarPhotoBoothEnabled" gates the Gamer Pic camera (sub_920FDCE0 compares
 // the value with "1"; anything else = "feature isn't currently available")
-// and "AvatarMarketplaceEnabled" gates the live marketplace. It also asks for
-// "AvatarAssetUriRoot" (download root) and "AvatarAssetRefreshFrequency".
-// Offline: the photo booth is on (its ops are served by XamPngEncodeEx /
-// XamWriteGamerTileEx below); every other key reports X_ERROR_NOT_FOUND, a
-// positive error callers read as "no value, skip", so no marketplace and no
-// asset downloads.
+// and "AvatarMarketplaceEnabled" gates the store. The store's router
+// (sub_920E2080) reads the same flag block at index 1 and only then lets its
+// "storelist:storefront" / "storelist:alltitles" scenes load, so this key is
+// the whole switch. "AvatarAssetUriRoot" feeds the item downloader
+// (sub_920B5C20 cracks it into host/path/port and formats
+// "<path>/%08x/avataritems/%s.acp"), which the XHTTP layer answers out of the
+// closet.
+//
+// A key with no value reports X_ERROR_NOT_FOUND, a positive error callers read
+// as "no value, skip". That is still what "AvatarAssetRefreshFrequency" gets:
+// nothing here expires, so the editor should never schedule a re-fetch.
 // ---------------------------------------------------------------------------
 u32 XamGetLiveHiveValueA_entry(mapped_string name, mapped_string buffer, u32 buffer_size, u32 flags,
                                mapped_void overlapped_ptr) {
   const std::string key = name ? std::string(name.value()) : std::string();
-  const char* value = nullptr;
+  std::string value;
   if (key == "AvatarPhotoBoothEnabled") {
     value = "1";
+  } else if (REXCVAR_GET(avatar_marketplace)) {
+    const MarketplaceServer server = GetMarketplaceServer();
+    if (key == "AvatarMarketplaceEnabled") {
+      value = "1";
+    } else if (key == "AvatarAssetUriRoot") {
+      // sub_920B5C20 cracks this into host, port and path and wants all three.
+      value = server.base + "/live";
+    } else if (key == "CatalogUriRoot" || key == "CatalogCDNUriRoot") {
+      // sub_9228FC28 copies a scheme-less value straight into the host field
+      // ("%s"), and only runs it through the URL parser when it starts with
+      // "http://". Keep it bare so the host lands verbatim.
+      value = server.host;
+    } else if (key == "CatalogUriPort" || key == "CatalogCDNUriPort") {
+      value = std::to_string(server.port);
+    }
   }
   u32 result = X_ERROR_NOT_FOUND;
-  if (value && buffer && buffer_size) {
-    const size_t len = std::strlen(value);
-    if (len + 1 <= buffer_size) {
-      std::memcpy(buffer.as<char*>(), value, len + 1);
+  if (!value.empty() && buffer && buffer_size) {
+    if (value.size() + 1 <= buffer_size) {
+      std::memcpy(buffer.as<char*>(), value.c_str(), value.size() + 1);
       result = X_ERROR_SUCCESS;
     } else {
       result = X_ERROR_INSUFFICIENT_BUFFER;
     }
+  }
+  if (!value.empty()) {
+    REXKRNL_INFO("[hive] {} -> '{}' ({:#x})", key, value, result);
   }
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
     return X_ERROR_IO_PENDING;
   }
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// XamGetLiveHiveValueW(name, buffer, chars, flags, overlapped): the wide half
+// of the hive, and the one the store actually runs on. sub_922069C8 caches four
+// values behind a one-shot lock, and the storefront will not build a request
+// unless they came back:
+//   EpixUriRoot / EpixPreviewUriRoot  service root, picked by the staging flag
+//   EpixManifestUriPath               path under the root, "$locale" expanded
+//   AvatarMarketplaceManifest         manifest name, appended last
+// sub_92206820 joins root + path and substitutes the country, then sub_92206B80
+// appends the manifest name. That last one being empty is the specific thing
+// that produced "Can't retrieve Avatar Marketplace data" — it guards on
+// word_94583D10[0] and bails with E_UNEXPECTED before any HTTP happens.
+//
+// "Epix" is the service's own name for the avatar marketplace. Everything here
+// resolves to a host the XHTTP layer answers in-process.
+// ---------------------------------------------------------------------------
+u32 XamGetLiveHiveValueW_entry(mapped_wstring name, mapped_wstring buffer, u32 buffer_size,
+                               u32 flags, mapped_void overlapped_ptr) {
+  std::string key;
+  if (name) {
+    key = rex::string::to_utf8(
+        rex::memory::load_and_swap<std::u16string>(name.as<const void*>()));
+  }
+
+  std::string value;
+  if (REXCVAR_GET(avatar_marketplace)) {
+    if (key == "EpixUriRoot" || key == "EpixPreviewUriRoot") {
+      value = GetMarketplaceServer().base + "/epix/";
+    } else if (key == "EpixManifestUriPath") {
+      value = "$locale/";
+    } else if (key == "AvatarMarketplaceManifest") {
+      value = "manifest.xml";
+    }
+  }
+
+  u32 result = X_ERROR_NOT_FOUND;
+  const std::u16string value16 = rex::string::to_utf16(value);
+  if (!value16.empty() && buffer && buffer_size) {
+    if (value16.size() + 1 <= buffer_size) {
+      rex::string::copy_and_swap_truncating(buffer, value16, buffer_size);
+      result = X_ERROR_SUCCESS;
+    } else {
+      result = X_ERROR_INSUFFICIENT_BUFFER;
+    }
+  }
+  // Log misses too: an unserved key here is the next thing the store trips on.
+  REXKRNL_INFO("[hive-w] {} -> '{}' ({:#x})", key, value, result);
+
+  if (overlapped_ptr) {
+    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
+    return X_ERROR_IO_PENDING;
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// XamShowMarketplaceUI(user, ui_type, offer_id, content_types, ...): the
+// store's Purchase button. The purchase overlay was a system UI, so there is
+// nothing to show; report the UI opened and closed and let the store re-read
+// its purchase history, which the local catalog answers from the closet.
+// ---------------------------------------------------------------------------
+static constexpr uint32_t kXnSysUi = 0x00000009;
+
+static u32 ShowMarketplaceUI(const char* which, u32 user_index, u32 ui_type, u64 offer_id,
+                             u32 content_types) {
+  REXKRNL_INFO("[hive] {}(user={}, type={}, offer={:#018x}, categories={:#x}) served locally",
+               which, user_index, ui_type, offer_id, content_types);
+  auto* kernel_state = REX_KERNEL_STATE();
+  kernel_state->BroadcastNotification(kXnSysUi, 1);
+  kernel_state->BroadcastNotification(kXnSysUi, 0);
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamShowMarketplaceUI_entry(u32 user_index, u32 ui_type, u64 offer_id, u32 content_types,
+                               u32 unk5, u32 unk6) {
+  return ShowMarketplaceUI("XamShowMarketplaceUI", user_index, ui_type, offer_id, content_types);
+}
+
+u32 XamShowNuiMarketplaceUI_entry(u32 unk1, u32 user_index, u32 ui_type, u64 offer_id,
+                                  u32 content_types, u32 unk6, u32 unk7) {
+  return ShowMarketplaceUI("XamShowNuiMarketplaceUI", user_index, ui_type, offer_id,
+                           content_types);
 }
 
 // ---------------------------------------------------------------------------
@@ -1330,6 +1519,148 @@ u32 XamUserValidateAvatarManifest_entry(u32 user_index, mapped_void manifest_ptr
 }  // namespace kernel
 }  // namespace rex
 
+// ---------------------------------------------------------------------------
+// XamFormatMessage(out, cch, format, ...): FormatMessage-from-string over a
+// wide template. The editor's dialog and status text runs through this with
+// %N[!printf-spec!] inserts and C varargs; the default insert is a wide
+// string, matching FormatMessageW. The SDK's stub left the output buffer
+// untouched, which is why store labels came up blank.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::u16string XamFmtReadWide(uint8_t* base, uint32_t addr, size_t cap = 0x800) {
+  std::u16string s;
+  if (!addr) {
+    return s;
+  }
+  const auto* p = rex::memory::GuestPtr<const uint8_t*>(base, addr);
+  for (size_t i = 0; i < cap; ++i) {
+    const char16_t c = char16_t((p[i * 2] << 8) | p[i * 2 + 1]);
+    if (!c) {
+      break;
+    }
+    s.push_back(c);
+  }
+  return s;
+}
+
+// Varargs follow the fixed r3..r5: five register slots, then 8-byte stack
+// slots at r1+0x54 with the significant word at slot+0.
+uint32_t XamFmtArg(PPCContext& ctx, uint8_t* base, uint32_t index) {
+  switch (index) {
+    case 0: return ctx.r6.u32;
+    case 1: return ctx.r7.u32;
+    case 2: return ctx.r8.u32;
+    case 3: return ctx.r9.u32;
+    case 4: return ctx.r10.u32;
+    default:
+      return *rex::memory::GuestPtr<rex::be<uint32_t>*>(
+          base, ctx.r1.u32 + 0x54 + (index - 5) * 8);
+  }
+}
+
+}  // namespace
+
+REX_HOOK_RAW(__imp__XamFormatMessage) {
+  const uint32_t out_ptr = ctx.r3.u32;
+  const uint32_t out_cch = ctx.r4.u32;
+  const uint32_t fmt_ptr = ctx.r5.u32;
+  if (!out_ptr || !out_cch || !fmt_ptr) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  const std::u16string fmt = XamFmtReadWide(base, fmt_ptr);
+  std::u16string out;
+  for (size_t i = 0; i < fmt.size();) {
+    const char16_t c = fmt[i++];
+    if (c != u'%') {
+      out.push_back(c);
+      continue;
+    }
+    if (i >= fmt.size()) {
+      break;
+    }
+    const char16_t sel = fmt[i];
+    if (sel == u'%') { out.push_back(u'%'); ++i; continue; }
+    if (sel == u'0') { ++i; break; }  // terminate without trailing newline
+    if (sel == u'n') { out += u"\r\n"; ++i; continue; }
+    if (sel == u'r') { out.push_back(u'\r'); ++i; continue; }
+    if (sel == u't') { out.push_back(u'\t'); ++i; continue; }
+    if (sel == u'!') { out.push_back(u'!'); ++i; continue; }
+    if (sel < u'1' || sel > u'9') {
+      out.push_back(c);
+      out.push_back(sel);
+      ++i;
+      continue;
+    }
+    uint32_t arg_index = sel - u'0';
+    ++i;
+    if (i < fmt.size() && fmt[i] >= u'0' && fmt[i] <= u'9') {
+      arg_index = arg_index * 10 + (fmt[i] - u'0');
+      ++i;
+    }
+    std::string spec = "s";
+    if (i < fmt.size() && fmt[i] == u'!') {
+      const size_t end = fmt.find(u'!', i + 1);
+      if (end != std::u16string::npos) {
+        spec.clear();
+        for (size_t k = i + 1; k < end; ++k) {
+          spec.push_back(char(fmt[k] & 0xFF));
+        }
+        i = end + 1;
+      }
+    }
+    const uint32_t value = XamFmtArg(ctx, base, arg_index - 1);
+    const char kind = spec.empty() ? 's' : spec.back();
+    if (kind == 's' || kind == 'S' || kind == 'c') {
+      const bool narrow =
+          kind == 'S' || (spec.size() >= 2 && spec[spec.size() - 2] == 'h');
+      if (kind == 'c') {
+        out.push_back(char16_t(value));
+      } else if (!value) {
+        out += u"(null)";
+      } else if (narrow) {
+        const auto* p = rex::memory::GuestPtr<const char*>(base, value);
+        for (size_t k = 0; k < 0x800 && p[k]; ++k) {
+          out.push_back(char16_t(uint8_t(p[k])));
+        }
+      } else {
+        out += XamFmtReadWide(base, value);
+      }
+    } else {
+      // Integer insert: the spec is a printf conversion without its %.
+      char buf[64];
+      const std::string host_spec = "%" + spec;
+      if (kind == 'd' || kind == 'i') {
+        std::snprintf(buf, sizeof(buf), host_spec.c_str(), int32_t(value));
+      } else {
+        std::snprintf(buf, sizeof(buf), host_spec.c_str(), value);
+      }
+      for (const char* q = buf; *q; ++q) {
+        out.push_back(char16_t(uint8_t(*q)));
+      }
+    }
+  }
+  if (out.size() >= out_cch) {
+    out.resize(out_cch - 1);
+  }
+  auto* dst = rex::memory::GuestPtr<uint8_t*>(base, out_ptr);
+  for (size_t k = 0; k < out.size(); ++k) {
+    dst[k * 2] = uint8_t(out[k] >> 8);
+    dst[k * 2 + 1] = uint8_t(out[k]);
+  }
+  dst[out.size() * 2] = 0;
+  dst[out.size() * 2 + 1] = 0;
+  ctx.r3.u64 = out.size();
+}
+
+// The shell polls these every frame. The SDK stubs warn and leave r3 holding
+// whatever the last call returned, so answer them properly: no Kinect, no
+// automation, default dash context.
+REX_HOOK_RAW(__imp__XamIsNuiAutomationEnabled) { ctx.r3.u64 = 0; }
+REX_HOOK_RAW(__imp__XamNuiIsDeviceReady) { ctx.r3.u64 = 0; }
+REX_HOOK_RAW(__imp__XamGetDashContext) { ctx.r3.u64 = 0; }
+
 REX_EXPORT(__imp__XamUserGetXUID, rex::kernel::xam::XamUserGetXUID_entry)
 REX_EXPORT(__imp__XamUserGetSigninState, rex::kernel::xam::XamUserGetSigninState_entry)
 REX_EXPORT(__imp__XamUserGetSigninInfo, rex::kernel::xam::XamUserGetSigninInfo_entry)
@@ -1365,6 +1696,27 @@ REX_EXPORT(__imp__XamWriteGamerTileEx, rex::kernel::xam::XamWriteGamerTileEx_ent
 REX_EXPORT(__imp__XamWriteTile, rex::kernel::xam::XamWriteTile_entry)
 REX_EXPORT(__imp__XamPngEncodeEx, rex::kernel::xam::XamPngEncodeEx_entry)
 REX_EXPORT(__imp__XamGetLiveHiveValueA, rex::kernel::xam::XamGetLiveHiveValueA_entry)
+REX_EXPORT(__imp__XamShowMarketplaceUI, rex::kernel::xam::XamShowMarketplaceUI_entry)
+REX_EXPORT(__imp__XamShowNuiMarketplaceUI, rex::kernel::xam::XamShowNuiMarketplaceUI_entry)
+REX_EXPORT(__imp__XamGetLiveHiveValueW, rex::kernel::xam::XamGetLiveHiveValueW_entry)
+REX_EXPORT(__imp__XamUserIsUnsafeProgrammingAllowed,
+           rex::kernel::xam::XamUserIsUnsafeProgrammingAllowed_entry)
+REX_EXPORT(__imp__XamWebInstrumentationCreateReport,
+           rex::kernel::xam::XamWebInstrumentationCreateReport_entry)
+REX_EXPORT(__imp__XamWebInstrumentationCreateSampledReport,
+           rex::kernel::xam::XamWebInstrumentationCreateReport_entry)
+// The rest take the handle and report success; none of their results are read
+// for anything but an error check.
+REX_EXPORT_STUB_RETURN(__imp__XamWebInstrumentationSetUserVar, 0);
+REX_EXPORT_STUB_RETURN(__imp__XamWebInstrumentationSetUserVarNoEscape, 0);
+REX_EXPORT_STUB_RETURN(__imp__XamWebInstrumentationSendReport, 0);
+REX_EXPORT_STUB_RETURN(__imp__XamWebInstrumentationDestroyReport, 0);
+REX_EXPORT_STUB_RETURN(__imp__XamWebInstrumentationGetURL, 0);
+REX_EXPORT_STUB_RETURN(__imp__XamWebInstrumentationGetURLEx, 0);
+REX_EXPORT(__imp__XamUserGetOnlineCountryFromXUID,
+           rex::kernel::xam::XamUserGetOnlineCountryFromXUID_entry)
+REX_EXPORT(__imp__XamUserGetOnlineLanguageFromXUID,
+           rex::kernel::xam::XamUserGetOnlineLanguageFromXUID_entry)
 REX_EXPORT(__imp__XamPngDecode, rex::kernel::xam::XamPngDecode_entry)
 REX_EXPORT(__imp__XamSessionCreateHandle, rex::kernel::xam::XamSessionCreateHandle_entry)
 REX_EXPORT(__imp__XamSessionRefObjByHandle, rex::kernel::xam::XamSessionRefObjByHandle_entry)
@@ -1380,8 +1732,6 @@ REX_EXPORT_STUB(__imp__XamUserGetCachedUserFlags);
 REX_EXPORT_STUB(__imp__XamUserGetDeviceId);
 REX_EXPORT_STUB(__imp__XamUserGetIndexFromXUID);
 REX_EXPORT_STUB(__imp__XamUserGetMembershipTierFromXUID);
-REX_EXPORT_STUB(__imp__XamUserGetOnlineCountryFromXUID);
-REX_EXPORT_STUB(__imp__XamUserGetOnlineLanguageFromXUID);
 REX_EXPORT_STUB(__imp__XamUserGetOnlineXUIDFromOfflineXUID);
 REX_EXPORT_STUB(__imp__XamUserGetReportingInfo);
 REX_EXPORT_STUB(__imp__XamUserGetRequestedUserIndexMask);
@@ -1398,7 +1748,6 @@ REX_EXPORT_STUB(__imp__XamUserIsLogonPreviewModeEnabled);
 REX_EXPORT_STUB(__imp__XamUserIsParentalControlled);
 REX_EXPORT_STUB(__imp__XamUserIsPartial);
 REX_EXPORT_STUB(__imp__XamUserIsPartialProfile);
-REX_EXPORT_STUB(__imp__XamUserIsUnsafeProgrammingAllowed);
 REX_EXPORT_STUB(__imp__XamUserLockLogonPreviewMode);
 REX_EXPORT_STUB(__imp__XamUserLogon);
 REX_EXPORT_STUB(__imp__XamUserLogonEx);
