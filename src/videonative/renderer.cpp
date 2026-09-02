@@ -132,6 +132,12 @@ REXCVAR_DEFINE_BOOL(native_video_resolve_writeback, true, "GPU",
                     "Write color resolve results back into guest memory, delivered at the "
                     "guest\'s resolve fence waits, for engines that CPU-read resolved "
                     "bytes.");
+// A depth texture no resolve ever produced is a fresh allocation the guest
+// expects zeroed (reversed Z: nothing occludes). Recycled guest pages hold
+// old bytes there, and the avatar tile bakes turn them into shadows.
+REXCVAR_DEFINE_BOOL(native_video_unresolved_depth_zero, true, "GPU",
+                    "Upload never-resolved depth-format textures as zeros "
+                    "instead of their guest bytes.");
 REXCVAR_DEFINE_INT32(native_video_writeback_max_dim, 256, "GPU",
                      "Skip resolve writeback for destinations wider or "
                      "taller than this (0 = no limit). Only the small "
@@ -2213,6 +2219,10 @@ CachedTexture* GetOrCreateTexture(uint32_t header_addr,
   const uint32_t padded_row_bytes = (row_bytes + 255u) & ~255u;
   const uint32_t staging_size = padded_row_bytes * height_blocks;
   auto& commandList = g_commandLists[g_frame];
+  const bool zero_depth =
+      REXCVAR_GET(native_video_unresolved_depth_zero) && !for_resolve &&
+      (format == 22 || format == 23) &&
+      !g_resolvedBaseToKey.count(base_address & kGuestBaseMask);
   commandList->barriers(RenderBarrierStage::COPY,
                         RenderTextureBarrier(entry.texture.get(),
                                              RenderTextureLayout::COPY_DEST));
@@ -2247,7 +2257,9 @@ CachedTexture* GetOrCreateTexture(uint32_t header_addr,
       }
       continue;
     }
-    if (tiled) {
+    if (zero_depth) {
+      std::memset(linear.data(), 0, linear.size());
+    } else if (tiled) {
       // Packed mip tail (ring GetPackedMipOffset, mip 0): min dimension
       // <= 16 texels means the base level is packed inside the 32x32 tile,
       // wider-than-tall at y=16, else (incl. square) at x=16, texel
