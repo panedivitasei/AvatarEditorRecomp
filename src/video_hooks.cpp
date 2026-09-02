@@ -10,6 +10,9 @@
 
 #include "generated/ae/ae_init.h"
 
+#include "catalog_search.h"
+#include "kernel/xam/marketplace.h"
+
 #include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/kernel/xam/avatar_search.h>
@@ -232,8 +235,8 @@ void AE_SniffXuiSetText(PPCRegister& r3, PPCRegister& r4) {
         rex::videonative::fps::GetSearchStatusLine(line, sizeof(line));
     // Nothing open or armed: append the search hint to the
     // catalog's own heading.
-    if (len <= 0 &&
-        g_aeCurCatalogScope.load(std::memory_order_relaxed) >= 0) {
+    if (len <= 0 && (g_aeCurCatalogScope.load(std::memory_order_relaxed) >= 0 ||
+                     ae_search::GamesListOpen())) {
       int i = 0;
       for (; i < 60; i++) {
         const uint8_t hi = p[i * 2], lo = p[i * 2 + 1];
@@ -300,6 +303,7 @@ static void AeXuiSearchTick(PPCContext& ctx, uint8_t* base) {
   // The awards screens answer the grid probe below too, so gate them out
   // by navigation page kind (ring of 16 x 2188-byte entries).
   bool in_awards = false;
+  uint32_t top_kind = 0;
   {
     const uint32_t nav = 0x922E7604u;
     const uint32_t forced = rd32(nav + 35012u);
@@ -312,6 +316,7 @@ static void AeXuiSearchTick(PPCContext& ctx, uint8_t* base) {
     for (int i = 0; !in_awards && i <= top && i < 16; ++i) {
       in_awards = unsearchable(rd32(nav + 4u + 2188u * uint32_t(i)));
     }
+    top_kind = (top >= 0 && top < 16) ? rd32(nav + 4u + 2188u * uint32_t(top)) : 0u;
   }
   {
     const uint32_t screen = in_awards ? 0u : rd32(0x922E7604u + 37092u);
@@ -392,6 +397,106 @@ static void AeXuiSearchTick(PPCContext& ctx, uint8_t* base) {
     s_srchArmed =
         !rex::kernel::xam::GetAvatarCatalogSearch().empty() && scope >= 0;
     s_srchArmedScope = scope;
+  }
+
+  // The store's Game Styles list is page kind 70; 67 is the loading page a
+  // tile press pushes and 73 a game opened from the list.
+  constexpr uint32_t kNavGameStyles = 70u, kNavGameOpening = 67u, kNavGameItems = 73u;
+  struct Repush {
+    bool pending;
+    int frames;
+    uint32_t slot_ea, title_ea;
+  };
+  static Repush s_repush = {};
+  const auto wr32 = [&](uint32_t ea, uint32_t v) {
+    *mem->TranslateVirtual<uint32_t*>(ea) = __builtin_bswap32(v);
+  };
+  // Fetched lists live in the store's ring of eight records (sub_920D3668),
+  // and a page with the same slot name reuses one that looks live instead of
+  // querying. Marking the list's records empty makes the next entry ask.
+  const auto drop_game_list_cache = [&]() {
+    constexpr uint32_t kStoreRing = 0x9426CF08u + 4u, kRecordStride = 158372u;
+    for (uint32_t n = 0; n < 8; ++n) {
+      const uint32_t rec = kStoreRing + n * kRecordStride;
+      const char* name = reinterpret_cast<const char*>(mem->TranslateVirtual<const uint8_t*>(rec));
+      if (name && std::strncmp(name, "storelist:alltitles", 20) == 0) {
+        wr32(rec + 2432u, 0);
+        wr32(rec + 158368u, 0xFFFFFFFFu);
+        wr32(rec + 80396u, 0xFFFFFFFFu);
+        wr32(rec + 80396u + 77964u, 0xFFFFFFFFu);
+      }
+    }
+  };
+  ae_search::SetGamesListOpen(top_kind == kNavGameStyles && !s_repush.pending);
+  if (ae_search::ConsumeGamesReloadRequest() && top_kind == kNavGameStyles) {
+    // Re-enter the page the way a tile press does: pop to the storefront,
+    // then push the loading page with the slot name, whose router fetches the
+    // list and swaps the real page in. The slot and title strings come from
+    // the record being popped, so they go through a scratch copy.
+    const auto nav_get = [&](void (*fn)(PPCContext&, uint8_t*)) {
+      PPCContext c = ctx;
+      c.r3.u32 = 0x922E7604u;
+      fn(c, base);
+      return c.r3.u32;
+    };
+    const uint32_t prev = nav_get(sub_920EBD50);
+    static uint32_t s_navScratch = 0;
+    if (!s_navScratch) {
+      s_navScratch = mem->SystemHeapAlloc(0x200);
+    }
+    uint32_t slot_ea = 0, title_ea = 0;
+    const uint32_t nav = 0x922E7604u;
+    const int top = int(rd32(nav));
+    if (s_navScratch && top >= 0 && top < 16) {
+      const uint32_t rec = nav + 2188u * uint32_t(top);
+      const uint8_t* slot = mem->TranslateVirtual<const uint8_t*>(rec + 8u);
+      const uint8_t* title = mem->TranslateVirtual<const uint8_t*>(rec + 136u);
+      uint8_t* out = mem->TranslateVirtual<uint8_t*>(s_navScratch);
+      std::memset(out, 0, 0x200);
+      for (int i = 0; i < 0x7F && slot[i]; ++i) out[i] = slot[i];
+      for (int i = 0; i < 0xFF; ++i) {
+        const uint8_t hi = title[i * 2], lo = title[i * 2 + 1];
+        if (!hi && !lo) break;
+        out[0x80 + i] = (!hi && lo >= 0x20 && lo < 0x7F) ? lo : ' ';
+      }
+      slot_ea = s_navScratch;
+      title_ea = out[0x80] ? s_navScratch + 0x80u : 0u;
+    }
+    drop_game_list_cache();
+    PPCContext c = ctx;
+    c.r3.u32 = 0x922E7604u;
+    c.r4.u32 = prev;
+    c.r5.u32 = 2;
+    c.r6.u32 = 1;
+    sub_920EDA10(c, base);
+    s_repush = Repush{true, 0, slot_ea, title_ea};
+    REXKRNL_INFO("[xuisearch] game list reloading with filter '{}'",
+                 rex::kernel::xam::MarketplaceGamesFilter());
+  }
+  // The push waits a frame for the pop to settle.
+  bool just_pushed = false;
+  if (s_repush.pending && ++s_repush.frames >= 2) {
+    s_repush.pending = false;
+    just_pushed = true;
+    PPCContext c = ctx;
+    c.r3.u32 = 0x922E7604u;
+    c.r4.u32 = kNavGameOpening;
+    c.r5.u32 = s_repush.slot_ea;
+    c.r6.u32 = s_repush.title_ea;
+    c.r7.u32 = 0xFFFFFFFFu;
+    c.r8.u32 = 0xFFFFFFFFu;
+    sub_920ED0E0(c, base);
+  }
+  // Leaving the list for anything but one of its games drops the filter and
+  // the filtered list it cached. top_kind predates this tick's push, so the
+  // push frame still reads as the storefront and is skipped.
+  if (!rex::kernel::xam::MarketplaceGamesFilter().empty() && !s_repush.pending && !just_pushed &&
+      top_kind != kNavGameStyles && top_kind != kNavGameOpening && top_kind != kNavGameItems) {
+    rex::kernel::xam::SetMarketplaceGamesFilter("");
+    drop_game_list_cache();
+    if (rex::kernel::xam::GetAvatarCatalogSearch().empty()) {
+      rex::videonative::fps::SetSearchApplied(false);
+    }
   }
 
   // Rebuild completion watch: on ready, latch so the open grid re-pushes.

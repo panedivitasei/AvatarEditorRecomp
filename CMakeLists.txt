@@ -25,6 +25,7 @@ set(AVATAREDITOR_SOURCES
     src/patches.cpp
     src/video_hooks.cpp
     src/input_hooks.cpp
+    src/catalog_search.cpp
     src/notify_hooks.cpp
     src/kernel/xam/xam_avatar.cpp
     src/kernel/xam/xam_user.cpp
