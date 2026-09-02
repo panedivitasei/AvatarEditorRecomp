@@ -1265,9 +1265,8 @@ u32 XamAvatarGetInstrumentation_entry(u64 unk1, mapped_u32 unk2) {
 // Icon art comes from closet icons/<guid>.png, the marketplace package's own
 // ICON.PNG, imported by `avatarextract --closet-import` / `--closet-icons`.
 
-// Items the store lists that the closet does not hold come from the
-// marketplace server: art for their tiles, bytes for try-on. Each id is asked
-// for once per session, either way it goes.
+// Store items the closet does not hold come from the marketplace server, art
+// and bytes alike. Each id is asked for once per session.
 static std::mutex g_remote_mutex;
 static std::unordered_set<std::string> g_remote_missing_icons;
 static std::unordered_set<std::string> g_remote_missing_items;
@@ -1298,8 +1297,8 @@ static bool FetchRemoteIcon(const avatars::AssetId& id, std::vector<uint8_t>& pn
   return true;
 }
 
-// The blob comes back with the index-row fields the server knows about, so a
-// purchase can write the closet row without a second round trip.
+// The blob comes with the index-row fields, so a purchase writes its row
+// without a second round trip.
 struct RemoteItem {
   std::vector<uint8_t> blob;
   std::string name;
