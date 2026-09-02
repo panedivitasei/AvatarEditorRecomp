@@ -59,9 +59,9 @@ REXCVAR_DEFINE_STRING(user_gamerpic, "", "Kernel",
 REXCVAR_DEFINE_BOOL(avatar_marketplace, true, "Kernel",
                     "Enable the Avatar Editor's marketplace section.");
 
-// The store's server (tools/mktserver). Every hive value the store reads is
-// derived from this: the catalog host and port, the Epix root the storefront
-// manifest hangs off, and the root item downloads are built from.
+// The store's server. Every hive value the store reads is derived from
+// this: the catalog host and port, the Epix root the storefront manifest
+// hangs off, and the root item downloads are built from.
 REXCVAR_DEFINE_STRING(avatar_marketplace_key, "", "Kernel",
                       "Shared secret sent as X-Marketplace-Key on every request to the "
                       "marketplace server. Leave empty for a server that does not check one.");
