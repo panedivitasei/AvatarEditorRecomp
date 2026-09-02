@@ -44,13 +44,17 @@ bool MarketplaceGet(const std::string& path, std::string* body, std::string* hea
 bool MarketplaceInstallItem(const avatars::AssetId& id);
 
 // Fetches the tile art of the given item guids in parallel, skipping what the
-// closet already has. With wait set it returns once the art is in; a catalog
-// page is handed to the title only after that, so its grid opens complete.
+// closet already has. With wait set it returns once the art is in.
 void MarketplacePrefetchIcons(const std::vector<std::string>& guids, bool wait);
 
 // Fetches the item packages of the given guids in the background, for the
 // hover try-on, skipping what the closet already has.
 void MarketplacePrefetchItems(const std::vector<std::string>& guids);
+
+// Ctrl+F on the store's Game Styles list: the needle goes on every FindGames
+// query as NameFilter, which the server applies before paging.
+void SetMarketplaceGamesFilter(const std::string& needle);
+std::string MarketplaceGamesFilter();
 
 }  // namespace xam
 }  // namespace kernel

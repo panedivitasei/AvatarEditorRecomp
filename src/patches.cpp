@@ -311,9 +311,8 @@ void AE_MktPurchase(PPCRegister& r3) {
     return;
   }
   MktGuestWriteU32(0x9452E398u, MktGuestU32(0x9452E398u) + 1u);
-  // The console raised XN_LIVE_CONTENT_INSTALLED when a download landed, and the
-  // editor re-enumerates its assets on it (per-frame pump sub_920B8C40), which
-  // is how the wardrobe shows the item without a restart.
+  // The console raised XN_LIVE_CONTENT_INSTALLED when a download landed; the
+  // editor re-enumerates its assets on it (sub_920B8C40), so the wardrobe updates.
   REX_KERNEL_STATE()->BroadcastNotification(0x02000007u, 0);
   REXKRNL_INFO("[mkt-buy] {} bought and installed (tile {:#x})", id->to_string(), tile);
 }

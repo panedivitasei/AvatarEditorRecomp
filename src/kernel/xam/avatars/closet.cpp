@@ -78,7 +78,7 @@ bool Closet::Load(const std::filesystem::path& dir) {
   const std::filesystem::path index_path = dir / "closet_index.tsv";
   FILE* f = std::fopen(index_path.string().c_str(), "rb");
   if (!f) {
-    // No index yet: purchases will create one here, so say where "here" is.
+    // No index yet; purchases will create one here.
     std::error_code ec;
     REXKRNL_INFO("[avatar] closet: no closet_index.tsv in {}, starting empty",
                  std::filesystem::absolute(dir, ec).string());

@@ -137,9 +137,8 @@ static std::wstring Widen(const std::string& s) {
   return std::wstring(s.begin(), s.end());
 }
 
-// One session for the process and one connect handle per host, kept open:
-// WinHttp then reuses the TLS connection across requests instead of paying a
-// handshake per tile.
+// One session and one connect handle per host, kept open so WinHttp reuses
+// the TLS connection instead of paying a handshake per tile.
 static std::mutex g_http_mutex;
 static HINTERNET g_http_session = nullptr;
 static std::unordered_map<std::string, HINTERNET> g_http_connects;
@@ -256,6 +255,47 @@ MarketplaceServer GetMarketplaceServer() {
   server.valid = !server.host.empty() && server.port != 0;
   server.base = "http://" + server.host + ":" + std::to_string(server.port);
   return server;
+}
+
+static std::mutex g_games_filter_mutex;
+static std::string g_games_filter;
+
+void SetMarketplaceGamesFilter(const std::string& needle) {
+  std::lock_guard<std::mutex> lock(g_games_filter_mutex);
+  g_games_filter = needle;
+}
+
+std::string MarketplaceGamesFilter() {
+  std::lock_guard<std::mutex> lock(g_games_filter_mutex);
+  return g_games_filter;
+}
+
+static std::string PercentEncode(const std::string& text) {
+  static const char kHex[] = "0123456789ABCDEF";
+  std::string out;
+  for (unsigned char c : text) {
+    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out.push_back(char(c));
+    } else {
+      out.push_back('%');
+      out.push_back(kHex[c >> 4]);
+      out.push_back(kHex[c & 0xF]);
+    }
+  }
+  return out;
+}
+
+// The Game Styles list is FindGames; while its filter is set the needle
+// goes along as one more Names/Values pair.
+static std::string WithGamesFilter(const std::string& path) {
+  if (path.find("methodName=FindGames&") == std::string::npos) {
+    return path;
+  }
+  const std::string needle = MarketplaceGamesFilter();
+  if (needle.empty()) {
+    return path;
+  }
+  return path + "&Names=NameFilter&Values=" + PercentEncode(needle);
 }
 
 bool MarketplaceGet(const std::string& path, std::string* body, std::string* headers) {
@@ -500,22 +540,20 @@ u32 NetDll_XHttpSendRequest_entry(u32 caller, u32 request_handle, mapped_string 
     return 1;
   }
 
-  // The real fetch runs on its own thread and completes through DoWork, the
-  // way the title expects: it keeps drawing its spinner instead of stalling
-  // the guest thread, and requests it issues together overlap.
+  // The fetch runs on its own thread and completes through DoWork, so the
+  // title keeps drawing its spinner and its parallel requests overlap.
   std::thread([request_handle, verb, path, host, port]() {
     int status = 0;
     std::string response_headers, body;
-    const bool fetched =
-        HttpFetch(host, port, port == 443, verb, path, &status, &response_headers, &body);
+    const std::string request_path = WithGamesFilter(path);
+    const bool fetched = HttpFetch(host, port, port == 443, verb, request_path, &status,
+                                   &response_headers, &body);
     if (fetched) {
-      REXKRNL_INFO("[xhttp] {} http://{}:{}{} -> {} ({} bytes)", verb, host, port, path, status,
-                   body.size());
+      REXKRNL_INFO("[xhttp] {} http://{}:{}{} -> {} ({} bytes)", verb, host, port, request_path,
+                   status, body.size());
     }
-    // A catalog page lists its items as urn:uuid entries. Its tile art is
-    // fetched before the page is handed over, so the grid opens complete
-    // instead of stalling per tile; the item packages follow in the
-    // background for the hover try-on.
+    // A catalog page lists its items as urn:uuid entries. Their art is fetched
+    // before the page is handed over, the packages after, in the background.
     if (fetched && status == 200 && path.find("methodName=FindGameOffers") != std::string::npos) {
       std::vector<std::string> guids;
       static const char kUrn[] = "urn:uuid:";

@@ -23,6 +23,7 @@
 #include <rex/ui/window_listener.h>
 #include <video_native.h>
 
+#include "catalog_search.h"
 #include "input_hooks.h"
 
 #if REX_PLATFORM_WIN32
@@ -133,17 +134,21 @@ class AvatareditorApp : public rex::ReXApp {
       window()->SetPresenter(nullptr);
     }
     window()->AddInputListener(&key_feed_, 0);
+    ae_search::Get().Attach(window());
     return true;
   }
 
   // Separate input listener feeding the keystroke synthesizer
   // (input_hooks.cpp); the base app's own listener keeps the overlay binds.
   class KeyFeed : public rex::ui::WindowInputListener {
+    // Typing into the search box is not navigation.
     void OnKeyDown(rex::ui::KeyEvent& e) override {
+      if (ae_search::Get().open()) return;
       ae_input::OnHostKey(e.virtual_key(), true, e.is_shift_pressed(),
                           e.is_ctrl_pressed(), e.is_alt_pressed());
     }
     void OnKeyUp(rex::ui::KeyEvent& e) override {
+      if (ae_search::Get().open()) return;
       ae_input::OnHostKey(e.virtual_key(), false, e.is_shift_pressed(),
                           e.is_ctrl_pressed(), e.is_alt_pressed());
     }
