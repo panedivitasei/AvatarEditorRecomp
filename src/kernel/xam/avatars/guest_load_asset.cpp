@@ -8,10 +8,12 @@
  */
 
 #include <array>
+#include <cmath>
 #include <filesystem>
 #include <mutex>
 #include <map>
 #include <stack>
+#include <unordered_map>
 
 #include "guest_load_asset.h"
 
@@ -85,6 +87,45 @@ static std::shared_ptr<Model> LoadLegacyBody(uint16_t gender_c,
     break;
   }
   return slot;
+}
+
+// Mirrored halves and UV seams carry twin vertices one quantization step
+// apart (about 10 um), and without the console's 4x MSAA the rasterizer turns
+// that sliver into pinholes down the face's centre line. Snap near-coincident
+// vertices to one position after the shapes have moved them.
+static void WeldSeams(Model& model) {
+  constexpr float kCell = 0.0002f;       // bin size, metres
+  constexpr float kTolerance = 0.0001f;  // legit vertices are never this close
+  std::unordered_map<uint64_t, Vector3<float>> anchors;
+  const auto cell_key = [](int32_t x, int32_t y, int32_t z) {
+    const uint64_t bias = 1u << 20;
+    return ((uint64_t(x) + bias) << 42) | ((uint64_t(y) + bias) << 21) | (uint64_t(z) + bias);
+  };
+  for (auto& batch : model.triangle_batches) {
+    for (auto& v : batch.vertices) {
+      const int32_t cx = int32_t(std::floor(v.position.x / kCell));
+      const int32_t cy = int32_t(std::floor(v.position.y / kCell));
+      const int32_t cz = int32_t(std::floor(v.position.z / kCell));
+      bool snapped = false;
+      for (int32_t dx = -1; dx <= 1 && !snapped; ++dx) {
+        for (int32_t dy = -1; dy <= 1 && !snapped; ++dy) {
+          for (int32_t dz = -1; dz <= 1 && !snapped; ++dz) {
+            auto it = anchors.find(cell_key(cx + dx, cy + dy, cz + dz));
+            if (it == anchors.end()) continue;
+            const float ex = v.position.x - it->second.x, ey = v.position.y - it->second.y,
+                        ez = v.position.z - it->second.z;
+            if (ex * ex + ey * ey + ez * ez < kTolerance * kTolerance) {
+              v.position = it->second;
+              snapped = true;
+            }
+          }
+        }
+      }
+      if (!snapped) {
+        anchors.emplace(cell_key(cx, cy, cz), v.position);
+      }
+    }
+  }
 }
 
 static BodyType GetBodyType(const X_AVATAR_METADATA& metadata) {
@@ -1092,6 +1133,9 @@ bool LoadAssetsToGuest(const X_AVATAR_METADATA& metadata,
              blend_shape.first.to_string(),
              source_component.first.asset_id.to_string());
     }
+  }
+  for (const auto& source_component : source_components) {
+    WeldSeams(*source_component.second);
   }
 
   std::shared_ptr<Prop> prop = nullptr;

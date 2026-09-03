@@ -820,17 +820,40 @@ static void BuildRandomAvatarMetadata(avatars::X_AVATAR_METADATA* out, uint32_t 
   out->owner_xuid = kRandomAvatarXuid;
 }
 
-u32 XamAvatarGetAssetsResultSize_entry(u32 avatar_component_mask, mapped_u32 result_buffer_size_ptr,
-                                       mapped_u32 gpu_resource_buffer_size_ptr) {
-  uint32_t cpu_size =
-      !(avatar_component_mask & avatars::ComponentCategory::kProp) ? 0x1F80u : 0x3147Cu;
-  uint32_t gpu_size = 0;
-  for (size_t i = 0; i < rex::countof(kAvatarComponentAssetInfos); ++i) {
-    if (avatar_component_mask & (1u << i)) {
-      cpu_size += rex::align(kAvatarComponentAssetInfos[i].cpu_size, 16u);
-      gpu_size += rex::align(kAvatarComponentAssetInfos[i].gpu_size, 4096u);
+// Buffer sizes a build with `mask` needs. The table budgets stock categories,
+// but a worn component covering categories outside the mask (a fused costume
+// is top+bottom+shoes) is still emitted whole, so its other categories join
+// the budget, and marketplace items get headroom the stock figures lack. The
+// title places its own data right after these sizes; overrunning them puts
+// the avatar's bone palette under the next build's bytes.
+static void AssetBuildBudget(uint32_t mask, uint32_t* cpu_size, uint32_t* gpu_size) {
+  uint32_t budget = mask & 0x1fffu;
+  if (g_have_metadata) {
+    const auto* meta =
+        reinterpret_cast<const avatars::X_AVATAR_METADATA*>(g_captured_metadata);
+    for (const auto& comp : meta->components) {
+      const uint32_t cats = comp.categories;
+      if (!comp.asset_id.is_zero() && (cats & mask)) {
+        budget |= cats & 0x1fffu;
+      }
     }
   }
+  uint32_t cpu = !(mask & avatars::ComponentCategory::kProp) ? 0x1F80u : 0x3147Cu;
+  uint32_t gpu = 0;
+  for (size_t i = 0; i < rex::countof(kAvatarComponentAssetInfos); ++i) {
+    if (budget & (1u << i)) {
+      cpu += rex::align(kAvatarComponentAssetInfos[i].cpu_size, 16u);
+      gpu += rex::align(kAvatarComponentAssetInfos[i].gpu_size, 4096u);
+    }
+  }
+  *cpu_size = cpu + 0x1000u;
+  *gpu_size = gpu + 0x10000u;
+}
+
+u32 XamAvatarGetAssetsResultSize_entry(u32 avatar_component_mask, mapped_u32 result_buffer_size_ptr,
+                                       mapped_u32 gpu_resource_buffer_size_ptr) {
+  uint32_t cpu_size = 0, gpu_size = 0;
+  AssetBuildBudget(avatar_component_mask, &cpu_size, &gpu_size);
   if (result_buffer_size_ptr) *result_buffer_size_ptr = cpu_size;
   if (gpu_resource_buffer_size_ptr) *gpu_resource_buffer_size_ptr = gpu_size;
   return X_STATUS_SUCCESS;
@@ -861,11 +884,16 @@ u32 XamAvatarGetAssets_entry(ppc_ptr_t<X_AVATAR_METADATA> avatar_metadata_ptr,
     const auto* metadata =
         mem->TranslateVirtual<const avatars::X_AVATAR_METADATA*>(meta_addr);
     // Receipt: marketplace items in the manifest being built, so a try-on
-    // that never reaches the avatar shows up as silence here.
+    // that never reaches the avatar shows up as silence here. 
     for (const auto& comp : metadata->components) {
       if (!comp.asset_id.is_zero() && !avatars::IsStockPackId(comp.asset_id)) {
         REXKRNL_INFO("[avatar] build wears {} cats={:#x}", comp.asset_id.to_string(),
                      uint16_t(comp.categories));
+        if (!avatars::GetCloset().HasItemBytes(comp.asset_id)) {
+          REXKRNL_INFO("[avatar] worn item {} is not in the closet, fetching it: {}",
+                       comp.asset_id.to_string(),
+                       MarketplaceInstallItem(comp.asset_id) ? "installed" : "not available");
+        }
       }
     }
     // Distinguish the local player's build from other builds. The player's
@@ -1002,6 +1030,17 @@ u32 XamAvatarGetAssets_entry(ppc_ptr_t<X_AVATAR_METADATA> avatar_metadata_ptr,
     }
     cpu_memory.ResolvePointers(cpu_addr);
     gpu_memory.ResolvePointers(gpu_addr);
+    {
+      // Past the budget means the title's neighbouring data is already gone.
+      uint32_t budget_cpu = 0, budget_gpu = 0;
+      AssetBuildBudget(avatar_component_mask, &budget_cpu, &budget_gpu);
+      if (cpu_memory.used() > budget_cpu || gpu_memory.used() > budget_gpu) {
+        REXKRNL_WARN("[avatar] GetAssets: build (mask={:#x}) used cpu {:#x} gpu {:#x}, over the "
+                     "{:#x}/{:#x} the title was told to allocate",
+                     avatar_component_mask, cpu_memory.used(), gpu_memory.used(), budget_cpu,
+                     budget_gpu);
+      }
+    }
     // The title recycles a handful of GPU resource buffers across builds (each
     // grid tile is one GetAssets call into one of a few addresses). The native
     // renderer's texture cache keys on the fetch header, which is identical
