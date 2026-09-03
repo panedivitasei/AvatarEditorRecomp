@@ -56,6 +56,7 @@
 
 #include "renderer_fps.h"
 #include "renderer_depth_ps.h"
+#include "renderer_downsample_ps.h"
 #include "renderer_fps_ps.h"
 #include "render_queue.h"
 #include "semantics/sampler_semantics.h"
@@ -138,6 +139,15 @@ REXCVAR_DEFINE_BOOL(native_video_resolve_writeback, true, "GPU",
 REXCVAR_DEFINE_BOOL(native_video_unresolved_depth_zero, true, "GPU",
                     "Upload never-resolved depth-format textures as zeros "
                     "instead of their guest bytes.");
+REXCVAR_DEFINE_INT32(native_video_resolution_scale, 100, "GPU",
+                     "Internal render resolution as a percentage of the console's 720p "
+                     "(25-200, 100 = native). Above 100 supersamples the scene, below it "
+                     "trades sharpness for speed; the guest still sees 720p.");
+REXCVAR_DEFINE_INT32(native_video_msaa, 4, "GPU",
+                     "Sample count for guest surfaces the title created multisampled "
+                     "(the avatar scene and its preview element are 4x on the console): "
+                     "0 or 1 renders them single-sampled, 2/4/8 multisample them. "
+                     "Surfaces the title created single-sampled stay so.");
 REXCVAR_DEFINE_INT32(native_video_writeback_max_dim, 256, "GPU",
                      "Skip resolve writeback for destinations wider or "
                      "taller than this (0 = no limit). Only the small "
@@ -316,17 +326,24 @@ void LatchHostScale() {
   static bool latched = false;
   if (latched) return;
   latched = true;
-  const int32_t v = QueryResolutionScale();
-  if (v == 2) {
-    g_hsNum = 2;
-    REXGPU_INFO(
-        "videonative: internal resolution 2x (720p content rendered at "
-        "1440p-class)");
-  } else if (v != 1 && v != 0) {
-    REXGPU_WARN(
-        "videonative: resolution_scale {} unsupported on the native "
-        "path (1 or 2) - using 1",
-        v);
+  // native_video_resolution_scale in percent; the runtime's integer
+  // resolution_scale = 2 still means 200 when the percentage is left alone.
+  int32_t percent = REXCVAR_GET(native_video_resolution_scale);
+  if (percent == 100 && QueryResolutionScale() == 2) percent = 200;
+  if (percent <= 0) percent = 100;
+  percent = std::clamp(percent, 25, 200);
+  uint32_t num = uint32_t(percent), den = 100u;
+  for (uint32_t g = 2; g <= den; ++g) {
+    while (num % g == 0 && den % g == 0) {
+      num /= g;
+      den /= g;
+    }
+  }
+  g_hsNum = num;
+  g_hsDen = den;
+  if (percent != 100) {
+    REXGPU_INFO("videonative: internal resolution {}% ({}x{} for the 1280x720 scene)", percent,
+                (1280u * num + den - 1) / den, (720u * num + den - 1) / den);
   }
 }
 bool Scaled() {
@@ -1215,6 +1232,17 @@ uint64_t g_depthShaderResolves = 0;  // depth resolves rendered
 uint64_t g_texInvalidations = 0;  // cache drops on guest destroy
 std::unique_ptr<RenderShader> g_depthResolvePs;
 std::unique_ptr<RenderPipeline> g_depthResolvePipeline;
+// Write-back downsample under a resolution scale: a guest-sized staging
+// target per (size, format) that the scaled resolve texture is box-filtered
+// into before the readback copy, so the guest reads bytes at its own size.
+std::unique_ptr<RenderShader> g_downsamplePs;
+std::unordered_map<uint32_t, std::unique_ptr<RenderPipeline>> g_downsamplePipelines;
+struct DownsampleStaging {
+  std::unique_ptr<RenderTexture> texture;
+  std::unique_ptr<RenderFramebuffer> framebuffer;
+  RenderTextureLayout layout = RenderTextureLayout::UNKNOWN;
+};
+std::unordered_map<uint64_t, DownsampleStaging> g_downsampleStaging;
 
 // ---------------------------------------------------------------------------
 // Guest EDRAM surfaces -> host render targets.
@@ -1232,6 +1260,7 @@ struct SurfaceInfo {
   uint32_t guest_format = 0;
   uint32_t edram_base = 0;  // tile index, distinct surfaces must not alias
   int32_t exp_bias = 0;     // RB_COLOR_INFO color exponent bias (signed)
+  uint32_t samples = 1;     // host sample count (see native_video_msaa)
   bool valid = false;
 };
 
@@ -1275,6 +1304,7 @@ struct CachedRenderTarget {
       RenderTextureLayout::UNKNOWN, RenderTextureLayout::UNKNOWN,
       RenderTextureLayout::UNKNOWN, RenderTextureLayout::UNKNOWN};
   RenderTextureLayout depth_layout = RenderTextureLayout::UNKNOWN;
+  uint32_t samples = 1;  // multisample count of every attachment
 };
 
 // Predicated-tiling extent (BeginTiling..EndTiling): while nonzero, host RTs
@@ -1309,6 +1339,7 @@ const uint8_t* GuestPtr(uint32_t addr);
 // scratch, so same-shaped surfaces share one host RT.
 std::unordered_map<uint64_t, CachedRenderTarget> g_renderTargets;
 uint64_t g_activeRtKey = 0;  // 0 = swapchain framebuffer
+uint32_t g_activeRtSamples = 1;  // sample count of the bound framebuffer
 // The active RT object + a layouts-dirty flag for the lazy resolve path:
 // a mid-pass resolve leaves the active RT's surfaces in COPY_SOURCE; the
 // next draw (or same-key rebind) repairs the layouts on demand instead of
@@ -2349,6 +2380,14 @@ std::unordered_map<uint32_t, SurfaceInfo> g_surfaces;
 
 // Parse a real XDK D3DSurface object (CreateSurface 0x8252BB30, 48 bytes):
 // +20 = 0xFFFF0000 stamp, +36 = ((w-1)<<18)|((h-1)<<3), +40 = format dword.
+// The title's multisample request maps to the host sample count the user
+// picked; a single-sampled surface is never multisampled.
+static uint32_t HostSamplesFor(uint32_t msaa_type) {
+  if (msaa_type == 0) return 1u;
+  const int32_t want = REXCVAR_GET(native_video_msaa);
+  return (want == 2 || want == 4 || want == 8) ? uint32_t(want) : 1u;
+}
+
 SurfaceInfo ParseSurface(uint32_t surface_obj) {
   SurfaceInfo info;
   if (!surface_obj) return info;
@@ -2371,6 +2410,9 @@ SurfaceInfo ParseSurface(uint32_t surface_obj) {
   // key: keying on it separates passes the game expects to share a surface,
   // which drops scene resolves.
   info.edram_base = 0;
+  // Surface+24 = RB_SURFACE_INFO; bits 16-17 carry the D3DMULTISAMPLE type
+  // (D3DSurface_GetDesc reads MultiSampleType back from exactly there).
+  info.samples = HostSamplesFor((LoadGuestU32(surface_obj + 24) >> 16) & 3u);
   info.valid = (size_dword & 7) == 0 && info.width > 1 &&
                info.width <= 8192 && info.height > 1 && info.height <= 8192;
   return info;
@@ -2410,7 +2452,8 @@ RenderFormat TranslateSurfaceFormat(uint32_t guest_format) {
 }
 
 uint64_t RtKeyOf(uint32_t width, uint32_t height,
-                 const RenderFormat formats[kMrtCount], uint32_t edram_base) {
+                 const RenderFormat formats[kMrtCount], uint32_t edram_base,
+                 uint32_t samples) {
   // Slot formats folded into the low 16 bits (weighted so slot order
   // matters); the practical surface format set here is tiny (8888 /
   // 10.10.10.2 / 16F families), so distinct weights cannot collide.
@@ -2418,8 +2461,8 @@ uint64_t RtKeyOf(uint32_t width, uint32_t height,
       (uint64_t(formats[0]) * 131 + uint64_t(formats[1]) * 31 +
        uint64_t(formats[2]) * 17 + uint64_t(formats[3]) * 7) &
       0xFFFFu;
-  return (uint64_t(edram_base) << 48) | (uint64_t(width) << 32) |
-         (uint64_t(height) << 16) | fmix;
+  return (uint64_t(samples & 0xFu) << 60) | (uint64_t(edram_base & 0xFFFu) << 48) |
+         (uint64_t(width) << 32) | (uint64_t(height) << 16) | fmix;
 }
 
 // RT-cache VRAM accounting (bounded by the sweep in the stats block).
@@ -2428,6 +2471,7 @@ std::deque<std::pair<uint64_t, CachedRenderTarget>> g_retiredRts;
 
 CachedRenderTarget* GetOrCreateRenderTarget(uint32_t width, uint32_t height,
                                             const RenderFormat formats[kMrtCount],
+                                            uint32_t samples,
                                             uint32_t edram_base) {
   // Reject implausible dimensions: surface objects read mid-init parse
   // as garbage shapes that each allocate a fresh multi-hundred-MB RT set.
@@ -2444,7 +2488,7 @@ CachedRenderTarget* GetOrCreateRenderTarget(uint32_t width, uint32_t height,
     }
     return nullptr;
   }
-  const uint64_t key = RtKeyOf(width, height, formats, edram_base);
+  const uint64_t key = RtKeyOf(width, height, formats, edram_base, samples);
   auto it = g_renderTargets.find(key);
   if (it != g_renderTargets.end()) {
     it->second.last_bind_frame = g_frameIndex;
@@ -2456,20 +2500,20 @@ CachedRenderTarget* GetOrCreateRenderTarget(uint32_t width, uint32_t height,
   const uint32_t host_h = HostDim(height);
   const RenderTexture* colors[kMrtCount];
   for (uint32_t i = 0; i < kMrtCount; i++) {
-    rt.color[i] = g_device->createTexture(
-        RenderTextureDesc::ColorTarget(host_w, host_h, formats[i]));
-    rt.color[i]->setName(fmt::format("rt color{} {}x{} (host {}x{})", i,
-                                     width, height, host_w, host_h));
+    rt.color[i] = g_device->createTexture(RenderTextureDesc::ColorTarget(
+        host_w, host_h, formats[i], RenderMultisampling(samples)));
+    rt.color[i]->setName(fmt::format("rt color{} {}x{} (host {}x{} {}x)", i,
+                                     width, height, host_w, host_h, samples));
     colors[i] = rt.color[i].get();
   }
   // Depth resource format: D32S8 maps to R32G8X24_TYPELESS in plume's D3D12
   // backend, so the depth plane stays SRV-readable for the shader resolve
   // path; D3D12 forbids an SRV over a typed depth resource. The DSV and
   // every pipeline use kDepthFormat; plume specializes the views.
-  rt.depth = g_device->createTexture(
-      RenderTextureDesc::DepthTarget(host_w, host_h, kDepthFormat));
-  rt.depth->setName(
-      fmt::format("rt depth {}x{} (host {}x{})", width, height, host_w, host_h));
+  rt.depth = g_device->createTexture(RenderTextureDesc::DepthTarget(
+      host_w, host_h, kDepthFormat, RenderMultisampling(samples)));
+  rt.depth->setName(fmt::format("rt depth {}x{} (host {}x{} {}x)", width, height,
+                                host_w, host_h, samples));
   RenderFramebufferDesc desc;
   desc.colorAttachments = colors;
   desc.colorAttachmentsCount = kMrtCount;
@@ -2478,6 +2522,9 @@ CachedRenderTarget* GetOrCreateRenderTarget(uint32_t width, uint32_t height,
   rt.width = width;
   rt.height = height;
   rt.edram_base = edram_base;
+  rt.samples = samples;
+  REXGPU_INFO("videonative: render target {}x{} created (host {}x{}, {} sample{})", width,
+              height, host_w, host_h, samples, samples == 1 ? "" : "s");
   for (uint32_t i = 0; i < kMrtCount; i++) rt.formats[i] = formats[i];
   rt.last_bind_frame = g_frameIndex;
   rt.approx_bytes = 0;
@@ -2515,7 +2562,7 @@ CachedRenderTarget* GetOrCreateRenderTarget(uint32_t width, uint32_t height,
 }
 
 uint64_t RtKey(const CachedRenderTarget* rt) {
-  return RtKeyOf(rt->width, rt->height, rt->formats, rt->edram_base);
+  return RtKeyOf(rt->width, rt->height, rt->formats, rt->edram_base, rt->samples);
 }
 
 // The active pass is depth-only (shadow map): its output is sampled via
@@ -2565,6 +2612,7 @@ void ApplyRenderTargetState() {
         // Back to the swapchain framebuffer.
         commandList->setFramebuffer(g_framebuffers[g_backBufferIndex].get());
         g_activeRtKey = 0;
+        g_activeRtSamples = 1;
         g_activeRtFormat = kColorFormat;
         for (uint32_t i = 0; i < kMrtCount; i++) {
           g_activeRtFormats[i] = kColorFormat;
@@ -2698,14 +2746,15 @@ void ApplyRenderTargetState() {
     fold = (fold ^ (fold >> 4) ^ (fold >> 8) ^ (fold >> 12)) & 0xFu;
     info.edram_base ^= fold << 12;
   }
-  CachedRenderTarget* rt =
-      GetOrCreateRenderTarget(info.width, info.height, formats, info.edram_base);
+  CachedRenderTarget* rt = GetOrCreateRenderTarget(info.width, info.height, formats,
+                                                   info.samples, info.edram_base);
   if (!rt) {
     // Implausible-dimension rejection: bind the swapchain so state stays
     // sane; draws land there (and the real surface binds moments later).
     if (g_activeRtKey != 0) {
       commandList->setFramebuffer(g_framebuffers[g_backBufferIndex].get());
       g_activeRtKey = 0;
+      g_activeRtSamples = 1;
       g_activeRtFormat = kColorFormat;
       for (uint32_t i = 0; i < kMrtCount; i++) g_activeRtFormats[i] = kColorFormat;
       g_activeRtGrown = false;
@@ -2746,6 +2795,7 @@ void ApplyRenderTargetState() {
   }
   commandList->setFramebuffer(rt->framebuffer.get());
   g_activeRtKey = key;
+  g_activeRtSamples = rt->samples;
   g_activeRt = rt;
   g_activeRtLayoutsDirty = false;  // the block above restored write states
   g_activeRtFormat = format;
@@ -2785,6 +2835,7 @@ struct PipelineKey {
   // bakes the ref into the PSO. Zeroed while stencil is disabled so plain
   // draws never fork pipelines on a stale refmask register.
   uint32_t stencil_ref_mask;
+  uint32_t samples;     // framebuffer sample count (MSAA scene passes)
   bool operator==(const PipelineKey& o) const {
     return !std::memcmp(this, &o, sizeof(o));
   }
@@ -2958,6 +3009,7 @@ const CachedPipeline* GetOrCreatePipeline(const ResolvedShader* vs,
   key.color_mask = color_mask & 0xFFFF;
   key.stencil_ref_mask =
       (depth_control & 1u) ? (stencil_ref_mask & 0xFFFFFFu) : 0u;
+  key.samples = g_activeRtSamples;
   auto it = g_pipelines.find(key);
   if (it != g_pipelines.end()) return &it->second;
 
@@ -2981,6 +3033,7 @@ const CachedPipeline* GetOrCreatePipeline(const ResolvedShader* vs,
   }
   desc.renderTargetCount = key.rt_count;
   desc.depthTargetFormat = kDepthFormat;
+  desc.multisampling = RenderMultisampling(key.samples);
   desc.primitiveTopology = topology;
 
   // RB_DEPTHCONTROL: bit1 z_enable, bit2 z_write, func bits 4..6.
@@ -3797,17 +3850,6 @@ void FlushResolveWritebacksInline() {
   // Mid-frame delivery is required: the guest CPU-copies resolve pages
   // into its display arrays right after the resolve call, and bakes run
   // once, so present-time delivery is a frame too late.
-  if (Scaled()) {
-    static uint64_t scale_logs = 2;
-    if (scale_logs) {
-      scale_logs--;
-      REXGPU_WARN(
-          "videonative: [writeback] skipped under resolution_scale "
-          "(host rects are scaled; guest bytes would be wrong)");
-    }
-    drop_all();
-    return;
-  }
   auto& commandList = g_commandLists[g_frame];
   const bool frame_open = g_frameOpen;
   if (!frame_open) {
@@ -5430,6 +5472,31 @@ void ResolveRegion(uint32_t dest_texture_header, bool depth, uint32_t source,
   if (copy_w <= 0 || copy_h <= 0) return;
 
 
+  // A multisampled source resolves instead of copying. Depth has no host
+  // resolve op, and this title never resolves depth off its 4x surfaces.
+  const bool msaa_src = rt && rt->samples > 1;
+  if (msaa_src && depth) {
+    static uint64_t msaa_depth_logs = 4;
+    if (msaa_depth_logs) {
+      msaa_depth_logs--;
+      REXGPU_WARN("videonative: depth resolve from a {}x surface skipped", rt->samples);
+    }
+    return;
+  }
+  if (msaa_src && dest->host_format != rt->formats[rt_index]) {
+    static uint64_t msaa_fmt_logs = 4;
+    if (msaa_fmt_logs) {
+      msaa_fmt_logs--;
+      REXGPU_WARN("videonative: {}x resolve skipped, formats differ (rt {} dest {})",
+                  rt->samples, uint32_t(rt->formats[rt_index]),
+                  uint32_t(dest->host_format));
+    }
+    return;
+  }
+  const RenderTextureLayout src_want =
+      msaa_src ? RenderTextureLayout::RESOLVE_SOURCE : RenderTextureLayout::COPY_SOURCE;
+  const RenderTextureLayout dest_want =
+      msaa_src ? RenderTextureLayout::RESOLVE_DEST : RenderTextureLayout::COPY_DEST;
   // Entry transitions. Lazy mode consults the tracked layouts so a chain
   // of resolves from one source RT pays a single source transition; eager
   // mode transitions unconditionally.
@@ -5439,14 +5506,12 @@ void ResolveRegion(uint32_t dest_texture_header, bool depth, uint32_t source,
          : RenderTextureLayout::UNKNOWN;
   uint32_t entry_count = 0;
   RenderTextureBarrier entry[2];
-  if (!lazy || src_now != RenderTextureLayout::COPY_SOURCE) {
-    entry[entry_count++] =
-        RenderTextureBarrier(src, RenderTextureLayout::COPY_SOURCE);
+  if (!lazy || src_now != src_want) {
+    entry[entry_count++] = RenderTextureBarrier(src, src_want);
     g_resolveBarriersEmitted++;
   }
-  if (!lazy || dest->layout != RenderTextureLayout::COPY_DEST) {
-    entry[entry_count++] = RenderTextureBarrier(
-        dest->texture.get(), RenderTextureLayout::COPY_DEST);
+  if (!lazy || dest->layout != dest_want) {
+    entry[entry_count++] = RenderTextureBarrier(dest->texture.get(), dest_want);
     g_resolveBarriersEmitted++;
   }
   if (entry_count) {
@@ -5454,12 +5519,12 @@ void ResolveRegion(uint32_t dest_texture_header, bool depth, uint32_t source,
   }
   if (rt) {
     if (depth) {
-      rt->depth_layout = RenderTextureLayout::COPY_SOURCE;
+      rt->depth_layout = src_want;
     } else {
-      rt->color_layout[rt_index] = RenderTextureLayout::COPY_SOURCE;
+      rt->color_layout[rt_index] = src_want;
     }
   }
-  dest->layout = RenderTextureLayout::COPY_DEST;
+  dest->layout = dest_want;
 
   if (depth) {
     // Whole depth plane -> staging buffer (whole-subresource, satisfies the
@@ -5633,10 +5698,16 @@ void ResolveRegion(uint32_t dest_texture_header, bool depth, uint32_t source,
     RenderBox box(rc(src_left), rc(src_top), rc(src_left + copy_w),
                   rc(src_top + copy_h));
     if (box.right > box.left && box.bottom > box.top) {
-      commandList->copyTextureRegion(
-          RenderTextureCopyLocation::Subresource(dest->texture.get(), 0),
-          RenderTextureCopyLocation::Subresource(src, 0),
-          uint32_t(rc(dest_x)), uint32_t(rc(dest_y)), 0, &box);
+      if (msaa_src) {
+        const RenderRect rect(box.left, box.top, box.right, box.bottom);
+        commandList->resolveTextureRegion(dest->texture.get(), uint32_t(rc(dest_x)),
+                                          uint32_t(rc(dest_y)), src, &rect);
+      } else {
+        commandList->copyTextureRegion(
+            RenderTextureCopyLocation::Subresource(dest->texture.get(), 0),
+            RenderTextureCopyLocation::Subresource(src, 0),
+            uint32_t(rc(dest_x)), uint32_t(rc(dest_y)), 0, &box);
+      }
     }
   }
 
@@ -5682,7 +5753,7 @@ void ResolveRegion(uint32_t dest_texture_header, bool depth, uint32_t source,
   const int32_t wb_max_dim = REXCVAR_GET(native_video_writeback_max_dim);
   if ((wb_color || wb_depth) &&
       REXCVAR_GET(native_video_resolve_writeback) && copy_w > 0 &&
-      copy_h > 0 && g_resolveWritebacks.size() < 512 && !Scaled() &&
+      copy_h > 0 && g_resolveWritebacks.size() < 512 &&
       (wb_max_dim == 0 || (int32_t(dest->width) <= wb_max_dim &&
                            int32_t(dest->height) <= wb_max_dim))) {
     const uint32_t dw0 = LoadGuestU32(dest_texture_header + 0);
@@ -5729,26 +5800,121 @@ void ResolveRegion(uint32_t dest_texture_header, bool depth, uint32_t source,
         }
       }
     }
+    // A host-scaled resolve texture holds more (or fewer) texels than the
+    // guest expects: box-filter the region into a guest-sized staging
+    // target first, and copy from there.
+    const bool dest_scaled = Scaled() && dest->host_scale != 0x11;
+    RenderPipeline* ds_pipeline = nullptr;
+    if (arena_ok && dest_scaled) {
+      if (!g_downsamplePs) {
+        g_downsamplePs = g_device->createShader(kDownsamplePsDxil, sizeof(kDownsamplePsDxil),
+                                                "main", RenderShaderFormat::DXIL);
+      }
+      // The first write-backs land before the present path has built the
+      // fullscreen VS; build it here, the present path reuses or replaces it.
+      if (!g_blitVs) {
+        const auto& vs = detail::BlitVsDxil();
+        if (!vs.empty()) {
+          g_blitVs = g_device->createShader(vs.data(), vs.size(), "main",
+                                            RenderShaderFormat::DXIL);
+        }
+      }
+      auto& pipeline = g_downsamplePipelines[uint32_t(required)];
+      if (!pipeline && g_downsamplePs && g_blitVs) {
+        RenderGraphicsPipelineDesc pd;
+        pd.pipelineLayout = g_pipelineLayout.get();
+        pd.vertexShader = g_blitVs.get();
+        pd.pixelShader = g_downsamplePs.get();
+        pd.renderTargetFormat[0] = required;
+        pd.renderTargetCount = 1;
+        pd.depthTargetFormat = RenderFormat::UNKNOWN;
+        pd.primitiveTopology = RenderPrimitiveTopology::TRIANGLE_LIST;
+        pd.depthEnabled = false;
+        pd.depthWriteEnabled = false;
+        pd.cullMode = RenderCullMode::NONE;
+        pipeline = g_device->createGraphicsPipeline(pd);
+      }
+      ds_pipeline = pipeline.get();
+      if (!dest->descriptor_index || !ds_pipeline) {
+        arena_ok = false;
+        static uint64_t ds_skip_logs = 4;
+        if (ds_skip_logs) {
+          ds_skip_logs--;
+          REXGPU_WARN("videonative: [writeback] scaled resolve cannot be downsampled "
+                      "(descriptor {} pipeline {}), record dropped",
+                      dest->descriptor_index, ds_pipeline ? "ok" : "none");
+        }
+      }
+    }
     if (arena_ok) {
     const uint32_t snap_base =
         g_frame * ((g_wbSnapCap / kNumFrames) & ~511u) +
         g_wbSnapUsedSlot[g_frame];
-    commandList->barriers(RenderBarrierStage::COPY,
-                          RenderTextureBarrier(
-                              dest->texture.get(),
-                              RenderTextureLayout::COPY_SOURCE));
+    const RenderTexture* snap_src = dest->texture.get();
     RenderBox snap_box(int32_t(dest_x), int32_t(dest_y),
                        int32_t(dest_x + copy_w), int32_t(dest_y + copy_h));
+    if (dest_scaled) {
+      const uint64_t staging_key =
+          (uint64_t(required) << 40) | (uint64_t(copy_w) << 20) | uint64_t(copy_h);
+      DownsampleStaging& staging = g_downsampleStaging[staging_key];
+      if (!staging.texture) {
+        staging.texture = g_device->createTexture(
+            RenderTextureDesc::ColorTarget(uint32_t(copy_w), uint32_t(copy_h), required));
+        staging.texture->setName(fmt::format("writeback staging {}x{}", copy_w, copy_h));
+        const RenderTexture* color = staging.texture.get();
+        RenderFramebufferDesc fbDesc;
+        fbDesc.colorAttachments = &color;
+        fbDesc.colorAttachmentsCount = 1;
+        staging.framebuffer = g_device->createFramebuffer(fbDesc);
+      }
+      if (staging.layout != RenderTextureLayout::COLOR_WRITE) {
+        commandList->barriers(RenderBarrierStage::GRAPHICS,
+                              RenderTextureBarrier(staging.texture.get(),
+                                                   RenderTextureLayout::COLOR_WRITE));
+        staging.layout = RenderTextureLayout::COLOR_WRITE;
+      }
+      commandList->setFramebuffer(staging.framebuffer.get());
+      commandList->setViewports(RenderViewport(0.0f, 0.0f, float(copy_w), float(copy_h), 0.0f, 1.0f));
+      commandList->setScissors(RenderRect(0, 0, int32_t(copy_w), int32_t(copy_h)));
+      commandList->setPipeline(ds_pipeline);
+      commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
+      uint32_t idx[32] = {};
+      idx[0] = dest->descriptor_index;
+      idx[4] = uint32_t(HostCoord(int32_t(dest_x)));
+      idx[5] = uint32_t(HostCoord(int32_t(dest_y)));
+      idx[8] = HostDim(dest->width);
+      idx[9] = HostDim(dest->height);
+      idx[12] = g_hsNum;
+      idx[13] = g_hsDen;
+      UploadAllocation b4 = g_upload[g_frame].Allocate(sizeof(idx), 256);
+      std::memcpy(b4.memory, idx, sizeof(idx));
+      commandList->setGraphicsRootDescriptor(b4.buffer->at(b4.offset), kRootB4IndicesPs);
+      commandList->drawInstanced(3, 1, 0, 0);
+      commandList->barriers(RenderBarrierStage::COPY,
+                            RenderTextureBarrier(staging.texture.get(),
+                                                 RenderTextureLayout::COPY_SOURCE));
+      staging.layout = RenderTextureLayout::COPY_SOURCE;
+      snap_src = staging.texture.get();
+      snap_box = RenderBox(0, 0, int32_t(copy_w), int32_t(copy_h));
+      g_activeRtKey = ~0ull;  // force a framebuffer rebind before drawing
+    } else {
+      commandList->barriers(RenderBarrierStage::COPY,
+                            RenderTextureBarrier(
+                                dest->texture.get(),
+                                RenderTextureLayout::COPY_SOURCE));
+    }
     commandList->copyTextureRegion(
         RenderTextureCopyLocation::PlacedFootprint(
             g_wbSnapBuffer.get(), required, uint32_t(copy_w),
             uint32_t(copy_h), 1, snap_pitch / 4, snap_base),
-        RenderTextureCopyLocation::Subresource(dest->texture.get(), 0), 0, 0,
+        RenderTextureCopyLocation::Subresource(snap_src, 0), 0, 0,
         0, &snap_box);
-    commandList->barriers(RenderBarrierStage::GRAPHICS,
-                          RenderTextureBarrier(
-                              dest->texture.get(),
-                              RenderTextureLayout::SHADER_READ));
+    if (!dest_scaled) {
+      commandList->barriers(RenderBarrierStage::GRAPHICS,
+                            RenderTextureBarrier(
+                                dest->texture.get(),
+                                RenderTextureLayout::SHADER_READ));
+    }
     g_resolveWritebacks.push_back(ResolveWriteback{
         required, dw1 & 0xFFFFF000u, ((dw0 >> 22) & 0x1FFu) * 32u,
         (dw1 >> 6) & 3u, ((dw0 >> 31) & 1u) != 0, dest->width, dest->height,
