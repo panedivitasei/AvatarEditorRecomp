@@ -17,6 +17,8 @@ class Controller : public rex::ui::WindowInputListener {
   void Detach();
 
   bool open() const { return open_; }
+  // Re-post the overlay; the tick calls it when a store match count arrives.
+  void Refresh() { Push(); }
 
   void OnKeyDown(rex::ui::KeyEvent& e) override;
   void OnKeyUp(rex::ui::KeyEvent& e) override;
@@ -30,16 +32,19 @@ class Controller : public rex::ui::WindowInputListener {
   rex::ui::Window* window_ = nullptr;
   bool open_ = false;
   bool applied_ = false;
-  bool games_mode_ = false;  // the box was opened on the Game Styles list
+  bool store_mode_ = false;  // the box was opened on a store page
+  bool games_list_ = false;  // ...and that page is the Game Styles list
   std::string query_;
 };
 
 Controller& Get();
 
-// The store's Game Styles list, reported per frame by the title tick. Its
-// filter rides on the FindGames query and Enter has the tick re-enter the page.
-void SetGamesListOpen(bool open);
-bool GamesListOpen();
+// The open store page, reported per frame by the title tick: the Game Styles
+// list filters through FindGames, an item page through FindGameOffers, and
+// Enter has the tick re-enter the page so the list is fetched again.
+enum class StorePage { kNone, kGamesList, kItems };
+void SetStorePage(StorePage page);
+StorePage CurrentStorePage();
 bool ConsumeGamesReloadRequest();
 
 }  // namespace ae_search

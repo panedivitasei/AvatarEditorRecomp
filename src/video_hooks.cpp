@@ -37,6 +37,7 @@ REXCVAR_DEFINE_BOOL(ae_vn_end_tiling, true, "AE",
                     "Forward D3DDevice_EndTiling (per-tile resolve) natively.");
 
 namespace vn = rex::videonative;
+void MktResetFetchers(const char* prefix);  // patches.cpp: forget cached store queries
 namespace rex::videonative::renderer {
 // Probing memoized guest reader (renderer.h): safe on uncommitted pages.
 const uint8_t* GuestDataPtrProbe(uint32_t addr, size_t bytes);
@@ -236,7 +237,7 @@ void AE_SniffXuiSetText(PPCRegister& r3, PPCRegister& r4) {
     // Nothing open or armed: append the search hint to the
     // catalog's own heading.
     if (len <= 0 && (g_aeCurCatalogScope.load(std::memory_order_relaxed) >= 0 ||
-                     ae_search::GamesListOpen())) {
+                     ae_search::CurrentStorePage() != ae_search::StorePage::kNone)) {
       int i = 0;
       for (; i < 60; i++) {
         const uint8_t hi = p[i * 2], lo = p[i * 2 + 1];
@@ -405,7 +406,7 @@ static void AeXuiSearchTick(PPCContext& ctx, uint8_t* base) {
   struct Repush {
     bool pending;
     int frames;
-    uint32_t slot_ea, title_ea;
+    uint32_t slot_ea, title_ea, kind;
   };
   static Repush s_repush = {};
   const auto wr32 = [&](uint32_t ea, uint32_t v) {
@@ -413,13 +414,14 @@ static void AeXuiSearchTick(PPCContext& ctx, uint8_t* base) {
   };
   // Fetched lists live in the store's ring of eight records (sub_920D3668),
   // and a page with the same slot name reuses one that looks live instead of
-  // querying. Marking the list's records empty makes the next entry ask.
-  const auto drop_game_list_cache = [&]() {
+  // querying. Marking a record empty makes the next entry ask again.
+  const auto drop_store_cache = [&](const char* prefix) {
     constexpr uint32_t kStoreRing = 0x9426CF08u + 4u, kRecordStride = 158372u;
+    const size_t plen = std::strlen(prefix);
     for (uint32_t n = 0; n < 8; ++n) {
       const uint32_t rec = kStoreRing + n * kRecordStride;
       const char* name = reinterpret_cast<const char*>(mem->TranslateVirtual<const uint8_t*>(rec));
-      if (name && std::strncmp(name, "storelist:alltitles", 20) == 0) {
+      if (name && std::strncmp(name, prefix, plen) == 0) {
         wr32(rec + 2432u, 0);
         wr32(rec + 158368u, 0xFFFFFFFFu);
         wr32(rec + 80396u, 0xFFFFFFFFu);
@@ -427,8 +429,44 @@ static void AeXuiSearchTick(PPCContext& ctx, uint8_t* base) {
       }
     }
   };
-  ae_search::SetGamesListOpen(top_kind == kNavGameStyles && !s_repush.pending);
-  if (ae_search::ConsumeGamesReloadRequest() && top_kind == kNavGameStyles) {
+  const auto drop_game_list_cache = [&]() { drop_store_cache("storelist:alltitles"); };
+  // Item pages keep their results in the registry's category records (8 of
+  // them at +1266984, stride 166496, named): per subcategory a 13864-byte
+  // page record holding two cached 32-item ranges (count at +6920 of each
+  // 6928-byte range) and the stamped total at +13860. A page whose total is
+  // stamped never asks the server again, so a filter change unstamps them.
+  const auto drop_item_pages = [&](const char* prefix) {
+    const size_t plen = std::strlen(prefix);
+    for (uint32_t n = 0; n < 8; ++n) {
+      const uint32_t base = 0x9426CF08u + 1266984u + 166496u * n;
+      const char* name = reinterpret_cast<const char*>(mem->TranslateVirtual<const uint8_t*>(base));
+      if (!name || std::strncmp(name, prefix, plen) != 0) continue;
+      for (uint32_t slot = 0; slot < 11; ++slot) {
+        const uint32_t page = base + 128u + 13864u * slot;
+        wr32(page + 13860u, 0xFFFFFFFFu);
+        wr32(page + 6920u, 0xFFFFFFFFu);
+        wr32(page + 6928u + 6920u, 0xFFFFFFFFu);
+      }
+    }
+  };
+  // The open store page: the Game Styles list, or an item page, whose record
+  // is named by its slot ("items:..." sections, "title:urn:uuid:..." games).
+  const char* top_slot = "";
+  {
+    const int top = int(rd32(0x922E7604u));
+    if (top >= 0 && top < 16) {
+      const uint8_t* s = mem->TranslateVirtual<const uint8_t*>(0x922E7604u + 2188u * uint32_t(top) + 8u);
+      if (s) top_slot = reinterpret_cast<const char*>(s);
+    }
+  }
+  const bool item_page =
+      !s_repush.pending && top_kind != kNavGameStyles && top_kind != kNavGameOpening &&
+      top_kind != 68u && top_kind != 71u &&
+      (std::strncmp(top_slot, "items:", 6) == 0 || std::strncmp(top_slot, "title:urn:uuid:", 15) == 0);
+  ae_search::SetStorePage(top_kind == kNavGameStyles && !s_repush.pending
+                              ? ae_search::StorePage::kGamesList
+                              : item_page ? ae_search::StorePage::kItems : ae_search::StorePage::kNone);
+  if (ae_search::ConsumeGamesReloadRequest() && (top_kind == kNavGameStyles || item_page)) {
     // Re-enter the page the way a tile press does: pop to the storefront,
     // then push the loading page with the slot name, whose router fetches the
     // list and swaps the real page in. The slot and title strings come from
@@ -462,16 +500,52 @@ static void AeXuiSearchTick(PPCContext& ctx, uint8_t* base) {
       slot_ea = s_navScratch;
       title_ea = out[0x80] ? s_navScratch + 0x80u : 0u;
     }
-    drop_game_list_cache();
+    // Every store page enters through the loading page with its scene name,
+    // the way a tile press does. A game page's scene is its slot; a section
+    // page (kind 30 + n) has its scene in the registry's items table, where
+    // slot n holds the name ("items:shoes"), the slot itself only naming the
+    // shared "items:all" query.
+    const bool game_page = std::strncmp(top_slot, "title:urn:uuid:", 15) == 0;
+    // A section page (the All categories) enters through the loading page
+    // with its scene name, which its nav record does not carry: the slot only
+    // names the shared "items:all" query. The router maps the scene to a
+    // category id (sub_920E1CA8) and that to the page kind (dword_92011040),
+    // which is this table read backwards.
+    if (!game_page && top_kind != kNavGameStyles && slot_ea) {
+      static const struct { uint32_t kind; const char* scene; } kSections[] = {
+          {37, "items:shirt"},    {38, "items:trouser"}, {39, "items:shoes"},
+          {40, "items:hat"},      {41, "items:carryable"}, {42, "items:costume"},
+          {43, "items:glasses"},  {44, "items:earrings"}, {45, "items:wristwear"},
+          {46, "items:rings"},    {47, "items:gloves"},
+      };
+      const char* scene_name = nullptr;
+      for (const auto& s : kSections) {
+        if (s.kind == top_kind) scene_name = s.scene;
+      }
+      uint8_t* out = mem->TranslateVirtual<uint8_t*>(slot_ea);
+      if (scene_name && out) {
+        std::memset(out, 0, 0x7F);
+        for (int i = 0; scene_name[i]; ++i) out[i] = uint8_t(scene_name[i]);
+      }
+    }
+    const uint32_t push_kind = kNavGameOpening;
+    if (top_kind == kNavGameStyles) {
+      drop_game_list_cache();
+    } else {
+      // Both caches would otherwise answer the repeat without the server.
+      drop_item_pages(game_page ? "title:urn:uuid:" : "items:");
+      MktResetFetchers(game_page ? "title:urn:uuid:" : "items:");
+    }
     PPCContext c = ctx;
     c.r3.u32 = 0x922E7604u;
     c.r4.u32 = prev;
     c.r5.u32 = 2;
     c.r6.u32 = 1;
     sub_920EDA10(c, base);
-    s_repush = Repush{true, 0, slot_ea, title_ea};
-    REXKRNL_INFO("[xuisearch] game list reloading with filter '{}'",
-                 rex::kernel::xam::MarketplaceGamesFilter());
+    s_repush = Repush{true, 0, slot_ea, title_ea, push_kind};
+    REXKRNL_INFO("[xuisearch] store page reloading with filter '{}'",
+                 top_kind == kNavGameStyles ? rex::kernel::xam::MarketplaceGamesFilter()
+                                            : rex::kernel::xam::MarketplaceItemFilter());
   }
   // The push waits a frame for the pop to settle.
   bool just_pushed = false;
@@ -480,7 +554,7 @@ static void AeXuiSearchTick(PPCContext& ctx, uint8_t* base) {
     just_pushed = true;
     PPCContext c = ctx;
     c.r3.u32 = 0x922E7604u;
-    c.r4.u32 = kNavGameOpening;
+    c.r4.u32 = s_repush.kind;
     c.r5.u32 = s_repush.slot_ea;
     c.r6.u32 = s_repush.title_ea;
     c.r7.u32 = 0xFFFFFFFFu;
@@ -496,6 +570,29 @@ static void AeXuiSearchTick(PPCContext& ctx, uint8_t* base) {
     drop_game_list_cache();
     if (rex::kernel::xam::GetAvatarCatalogSearch().empty()) {
       rex::videonative::fps::SetSearchApplied(false);
+    }
+  }
+  // An item filter belongs to the page it was applied in: leaving it drops
+  // the filter and the filtered lists it cached.
+  if (!rex::kernel::xam::MarketplaceItemFilter().empty() && !s_repush.pending && !just_pushed &&
+      !item_page && top_kind != kNavGameOpening) {
+    rex::kernel::xam::SetMarketplaceItemFilter("");
+    drop_item_pages("items:");
+    drop_item_pages("title:urn:uuid:");
+    MktResetFetchers("items:");
+    MktResetFetchers("title:urn:uuid:");
+    if (rex::kernel::xam::GetAvatarCatalogSearch().empty()) {
+      rex::videonative::fps::SetSearchApplied(false);
+    }
+  }
+
+  // A store match count arrives with the filtered response; re-post the box.
+  {
+    static int s_lastMatches = -2;
+    const int matches = rex::kernel::xam::MarketplaceFilterMatches();
+    if (matches != s_lastMatches) {
+      s_lastMatches = matches;
+      ae_search::Get().Refresh();
     }
   }
 

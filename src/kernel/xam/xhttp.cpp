@@ -259,15 +259,32 @@ MarketplaceServer GetMarketplaceServer() {
 
 static std::mutex g_games_filter_mutex;
 static std::string g_games_filter;
+static int g_filter_matches = -1;
 
 void SetMarketplaceGamesFilter(const std::string& needle) {
   std::lock_guard<std::mutex> lock(g_games_filter_mutex);
   g_games_filter = needle;
+  g_filter_matches = -1;
 }
 
 std::string MarketplaceGamesFilter() {
   std::lock_guard<std::mutex> lock(g_games_filter_mutex);
   return g_games_filter;
+}
+
+static std::string g_item_filter;
+void SetMarketplaceItemFilter(const std::string& needle) {
+  std::lock_guard<std::mutex> lock(g_games_filter_mutex);
+  g_item_filter = needle;
+  g_filter_matches = -1;
+}
+int MarketplaceFilterMatches() {
+  std::lock_guard<std::mutex> lock(g_games_filter_mutex);
+  return g_filter_matches;
+}
+std::string MarketplaceItemFilter() {
+  std::lock_guard<std::mutex> lock(g_games_filter_mutex);
+  return g_item_filter;
 }
 
 static std::string PercentEncode(const std::string& text) {
@@ -285,13 +302,16 @@ static std::string PercentEncode(const std::string& text) {
   return out;
 }
 
-// The Game Styles list is FindGames; while its filter is set the needle
-// goes along as one more Names/Values pair.
+// The Game Styles list is FindGames and item pages are FindGameOffers; while
+// the matching filter is set the needle goes along as one more Names/Values
+// pair.
 static std::string WithGamesFilter(const std::string& path) {
-  if (path.find("methodName=FindGames&") == std::string::npos) {
-    return path;
+  std::string needle;
+  if (path.find("methodName=FindGames&") != std::string::npos) {
+    needle = MarketplaceGamesFilter();
+  } else if (path.find("methodName=FindGameOffers&") != std::string::npos) {
+    needle = MarketplaceItemFilter();
   }
-  const std::string needle = MarketplaceGamesFilter();
   if (needle.empty()) {
     return path;
   }
@@ -551,6 +571,14 @@ u32 NetDll_XHttpSendRequest_entry(u32 caller, u32 request_handle, mapped_string 
     if (fetched) {
       REXKRNL_INFO("[xhttp] {} http://{}:{}{} -> {} ({} bytes)", verb, host, port, request_path,
                    status, body.size());
+    }
+    // A filtered list answers with the match count the search box shows.
+    if (fetched && status == 200 && request_path.find("&Names=NameFilter&") != std::string::npos) {
+      const size_t at = body.find("<totalItems>");
+      if (at != std::string::npos) {
+        std::lock_guard<std::mutex> lock(g_games_filter_mutex);
+        g_filter_matches = std::atoi(body.c_str() + at + 12);
+      }
     }
     // A catalog page lists its items as urn:uuid entries. Their art is fetched
     // before the page is handed over, the packages after, in the background.
