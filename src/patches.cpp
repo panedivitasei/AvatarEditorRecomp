@@ -3,6 +3,8 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <string>
 
 #include <fmt/format.h>
@@ -183,9 +185,29 @@ void AE_MktPreviewLoad(PPCRegister& r3) {
 // sub_920D4970: the item-metadata fetch state machine. Its first argument is
 // the fetcher object taken from the registry's own first field, and state 0
 // calls straight through that object's vtable+8.
+// The fetchers seen so far, by request name: a fetcher caches its last result
+// (state 2 at +12) and answers a repeat of the same name and dims from it, so
+// a re-entered page never asks the server again. Resetting the state makes it.
+static std::mutex g_mkt_fetcher_mu;
+static std::map<std::string, uint32_t> g_mkt_fetchers;
+
+void MktResetFetchers(const char* prefix) {
+  std::lock_guard<std::mutex> lock(g_mkt_fetcher_mu);
+  for (const auto& [name, fetcher] : g_mkt_fetchers) {
+    if (name.compare(0, std::strlen(prefix), prefix) != 0 || !MktPlausible(fetcher)) continue;
+    if (MktGuestU32(fetcher + 12) == 1) continue;  // in flight, leave it
+    MktGuestWriteU32(fetcher + 12, 0);
+    REXKRNL_INFO("[xuisearch] fetcher '{}' reset", name);
+  }
+}
+
 void AE_MktItemFetch(PPCRegister& r3, PPCRegister& r4) {
   const uint32_t fetcher = r3.u32;
   const uint32_t vtable = MktGuestU32Safe(fetcher);
+  if (MktPlausible(fetcher) && MktPlausible(r4.u32)) {
+    std::lock_guard<std::mutex> lock(g_mkt_fetcher_mu);
+    g_mkt_fetchers[MktGuestAnsi(r4.u32, 96)] = fetcher;
+  }
   REXKRNL_INFO("[mkt-fetch] fetcher={:#x} plausible={} vtable={:#x} vtable+8={:#x} state={} name='{}'",
                fetcher, MktPlausible(fetcher), vtable, MktGuestU32Safe(vtable + 8),
                MktPlausible(fetcher) ? MktGuestU32(fetcher + 12) : 0xBADF00Du,
