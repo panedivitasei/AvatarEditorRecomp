@@ -5126,6 +5126,15 @@ void DrawFpsOverlay(std::unique_ptr<RenderCommandList>& commandList) {
 // never draws to the real backbuffer; it Swaps its own resolved texture).
 void UpdateGammaRamp(const uint16_t* rgb768) {
   if (rq::Active()) { rq::EnqUpdateGammaRamp(rgb768); return; }
+  {
+    // Once: the shape of the ramp the title keeps (identity = 0, 16448, 32896, 49344, 65535).
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      REXGPU_INFO("videonative: display gamma ramp R[0,64,128,192,255] = {} {} {} {} {}", rgb768[0],
+                  rgb768[64], rgb768[128], rgb768[192], rgb768[255]);
+    }
+  }
   EnsureFrameOpen();
   if (!g_frameOpen || !g_device) return;
   if (!g_gammaRampTexture) {

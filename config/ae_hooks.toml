@@ -413,3 +413,11 @@ return_on_true = true
 address = 0x920DB768        # sub_920DB768 entry: marketplace UI launch for a tile, r3 = tile
 name = "AE_MktPurchase"
 registers = ["r3"]
+
+# D3D::SetRawGammaRamp (0x9212A0F8): the XDK uploads the display-corrected
+# gamma ramp to the DC_LUT from here, straight off the stack at device setup,
+# so the device block never holds the table the hardware applies. r4 = ramp.
+[[midasm_hook]]
+address = 0x9212A0F8
+name = "AE_HookRawGammaRamp"
+registers = ["r4"]

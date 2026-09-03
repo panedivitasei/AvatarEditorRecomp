@@ -19,6 +19,7 @@
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
+#include <renderer.h>
 #include <video_native.h>
 
 // A missed draw path means absent geometry, not a crash; ae_vn_strict
@@ -619,6 +620,21 @@ static void AeXuiSearchTick(PPCContext& ctx, uint8_t* base) {
 
 // D3DTexture LockRect (0x9211B6A0): the gate before any CPU texture
 // read. Deliver pending writeback now so the compose reads resolved art.
+// D3D::SetRawGammaRamp: the display ramp original hardware applies. The
+// XDK corrects the title's ramp for the reported display and uploads it to
+// the DC_LUT from a stack copy, so the present blit's LUT takes it here.
+void AE_HookRawGammaRamp(PPCRegister& r4) {
+  if (!vn::IsActive() || !r4.u32) return;
+  auto* mem = rex::system::kernel_memory();
+  const uint8_t* p = mem->TranslateVirtual<const uint8_t*>(r4.u32);
+  if (!p) return;
+  uint16_t host[768];
+  for (uint32_t i = 0; i < 768; i++) {
+    host[i] = uint16_t((p[i * 2] << 8) | p[i * 2 + 1]);
+  }
+  vn::renderer::UpdateGammaRamp(host);
+}
+
 void AE_HookTextureLock(PPCRegister& r3) {
   const uint32_t tex = r3.u32;
   if (!tex) return;
