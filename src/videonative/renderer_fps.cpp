@@ -232,9 +232,11 @@ int GetSearchStatusLine(char* utf8, int cap) {
   // so. Ctrl+F reopens the box prefilled; leaving the catalog clears the
   // filter. Esc clears it as well. 
   if (!g_srchOpen && g_srchApplied && !g_srchQuery.empty()) {
-    const int m = std::snprintf(utf8, size_t(cap),
-                                "Filter: %s  (Ctrl+F to edit)",
-                                g_srchQuery.c_str());
+    const int m = g_srchLines.empty()
+                      ? std::snprintf(utf8, size_t(cap), "Filter: %s  (Ctrl+F to edit)",
+                                      g_srchQuery.c_str())
+                      : std::snprintf(utf8, size_t(cap), "Filter: %s  (%s, Ctrl+F to edit)",
+                                      g_srchQuery.c_str(), g_srchLines[0].c_str());
     return (m > 0 && m < cap) ? m : (m > 0 ? cap - 1 : 0);
   }
   if (!g_srchOpen) return 0;

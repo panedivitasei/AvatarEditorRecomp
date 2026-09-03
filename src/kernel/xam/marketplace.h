@@ -55,6 +55,12 @@ void MarketplacePrefetchItems(const std::vector<std::string>& guids);
 // query as NameFilter, which the server applies before paging.
 void SetMarketplaceGamesFilter(const std::string& needle);
 std::string MarketplaceGamesFilter();
+// Same for item pages: the needle rides on FindGameOffers queries.
+void SetMarketplaceItemFilter(const std::string& needle);
+std::string MarketplaceItemFilter();
+// totalItems of the last filtered store response (games or items); -1 until
+// one arrives after the filter last changed.
+int MarketplaceFilterMatches();
 
 }  // namespace xam
 }  // namespace kernel

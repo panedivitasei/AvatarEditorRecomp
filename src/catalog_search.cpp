@@ -18,12 +18,12 @@ namespace {
 // Above the ImGui drawer and the input drivers, which register low.
 constexpr size_t kTopmost = ~size_t(0);
 constexpr size_t kMaxQuery = 96;
-std::atomic<bool> g_games_list_open{false};
+std::atomic<int> g_store_page{0};
 std::atomic<bool> g_games_reload{false};
 }  // namespace
 
-void SetGamesListOpen(bool open) { g_games_list_open.store(open, std::memory_order_relaxed); }
-bool GamesListOpen() { return g_games_list_open.load(std::memory_order_relaxed); }
+void SetStorePage(StorePage page) { g_store_page.store(int(page), std::memory_order_relaxed); }
+StorePage CurrentStorePage() { return StorePage(g_store_page.load(std::memory_order_relaxed)); }
 bool ConsumeGamesReloadRequest() { return g_games_reload.exchange(false); }
 
 Controller& Get() {
@@ -53,7 +53,15 @@ void Controller::Detach() {
 void Controller::Push() {
   std::vector<std::string> lines;
   // The game list lives on the server, so there is no local match list.
-  if (!query_.empty() && !games_mode_) {
+  if (!query_.empty() && store_mode_) {
+    // The server counts store matches; nothing to show until it has answered.
+    const int total = rex::kernel::xam::MarketplaceFilterMatches();
+    if (applied_ && total >= 0) {
+      char head[64];
+      std::snprintf(head, sizeof(head), "%d match%s", total, total == 1 ? "" : "es");
+      lines.emplace_back(head);
+    }
+  } else if (!query_.empty()) {
     std::vector<rex::kernel::xam::AvatarCatalogMatch> matches;
     const uint32_t total = rex::kernel::xam::QueryAvatarCatalog(query_, 8, matches);
     char head[64];
@@ -74,20 +82,24 @@ void Controller::Push() {
 }
 
 void Controller::Toggle() {
-  // A catalog grid or the Game Styles list can be searched; elsewhere the
-  // key does nothing.
+  // A catalog grid or a store page can be searched; elsewhere the key does
+  // nothing. A store page filters on the server, a grid in the local catalog.
   if (!open_) {
+    const StorePage page = CurrentStorePage();
     const bool items = rex::kernel::xam::GetAvatarCatalogSearchScope() >= 0;
-    if (!items && !GamesListOpen()) {
+    if (!items && page == StorePage::kNone) {
       return;
     }
-    games_mode_ = !items;
+    store_mode_ = page != StorePage::kNone;
+    games_list_ = page == StorePage::kGamesList;
   }
   open_ = !open_;
   // The title tick clears an applied filter when the user leaves the page it
   // was applied in; pick that up here.
-  const bool live = games_mode_ ? !rex::kernel::xam::MarketplaceGamesFilter().empty()
-                                : !rex::kernel::xam::GetAvatarCatalogSearch().empty();
+  const bool live =
+      store_mode_ ? !(games_list_ ? rex::kernel::xam::MarketplaceGamesFilter()
+                                  : rex::kernel::xam::MarketplaceItemFilter()).empty()
+                  : !rex::kernel::xam::GetAvatarCatalogSearch().empty();
   if (applied_ && !live) {
     applied_ = false;
   }
@@ -111,8 +123,12 @@ void Controller::Apply(bool clear) {
   const bool was_armed = applied_;
   applied_ = arming;
   rex::videonative::fps::SetSearchApplied(arming);
-  if (games_mode_) {
-    rex::kernel::xam::SetMarketplaceGamesFilter(query_);
+  if (store_mode_) {
+    if (games_list_) {
+      rex::kernel::xam::SetMarketplaceGamesFilter(query_);
+    } else {
+      rex::kernel::xam::SetMarketplaceItemFilter(query_);
+    }
     if (arming || was_armed) {
       g_games_reload.store(true);
     }
