@@ -329,6 +329,28 @@ address = 0x920D4970        # sub_920D4970(fetcher, name, ...): item metadata fe
 name = "AE_MktItemFetch"
 registers = ["r3", "r4"]
 
+# The store page loader's three error sites and the category fetcher the
+# pages share, enough to say why a store page gave up.
+[[midasm_hook]]
+address = 0x920E21AC        # sub_920E2080: error 11, LIVE session check timed out
+name = "AE_MktPageError"
+registers = ["r11", "r30"]
+
+[[midasm_hook]]
+address = 0x920E2340        # sub_920E2080: error 17, store list with no categories
+name = "AE_MktPageError"
+registers = ["r11", "r30"]
+
+[[midasm_hook]]
+address = 0x920E2400        # sub_920E2080: error 17, page with no items after a second
+name = "AE_MktPageError"
+registers = ["r11", "r30"]
+
+[[midasm_hook]]
+address = 0x920D4760        # sub_920D4760(fetcher, name, page, size, ...): category fetch step
+name = "AE_MktCatFetch"
+registers = ["r3", "r4", "r5", "r6"]
+
 [[midasm_hook]]
 address = 0x920D4C70        # sub_920D4C70(fetcher, request): issues the query
 name = "AE_MktQueryIssue"

@@ -214,6 +214,36 @@ void AE_MktItemFetch(PPCRegister& r3, PPCRegister& r4) {
                MktPlausible(r4.u32) ? MktGuestAnsi(r4.u32, 96) : "?");
 }
 
+// sub_920E2080 is the store page loader. It has three ways to give a page
+// up: the LIVE check timing out (11), a store list with no categories (17)
+// and a page still without items after a second (17). The word lands in
+// unk_94249EC0 and the page shows "Can't retrieve Avatar Marketplace data".
+void AE_MktPageError(PPCRegister& r11, PPCRegister& r30) {
+  REXKRNL_INFO("[mkt-page] error {} raised for '{}'", r11.u32,
+               MktPlausible(r30.u32) ? MktGuestAnsi(r30.u32, 96) : "?");
+}
+
+// sub_920D4760(fetcher, name, page, size, ...): the single-slot category
+// fetch state machine the store pages share. State lives at +12 (1 in flight,
+// 2 done, 3 failed, back to 0 a tick later), the name it is serving at +20
+// and its page/size at +148/+152. A FindCategories answer the parser refuses
+// shows up here as state 3 with the page's name.
+void AE_MktCatFetch(PPCRegister& r3, PPCRegister& r4, PPCRegister& r5, PPCRegister& r6) {
+  static std::string last;
+  const uint32_t f = r3.u32;
+  const std::string line = (MktPlausible(r4.u32) ? MktGuestAnsi(r4.u32, 96) : "?") + " page=" +
+                           std::to_string(r5.u32) + " size=" + std::to_string(r6.u32) +
+                           " | state=" + std::to_string(MktGuestU32Safe(f + 12)) + " dirty=" +
+                           std::to_string(MktGuestU32Safe(f + 16)) + " serving='" +
+                           (MktPlausible(f) ? MktGuestAnsi(f + 20, 96) : "?") + "' page=" +
+                           std::to_string(MktGuestU32Safe(f + 148)) + " size=" +
+                           std::to_string(MktGuestU32Safe(f + 152)) + " count=" +
+                           std::to_string(MktGuestU32Safe(f + 2600));
+  if (line == last) return;
+  last = line;
+  REXKRNL_INFO("[mkt-cat] fetch {:#x} name='{}'", f, line);
+}
+
 // sub_920D4C70(fetcher, request): the request's scene kind lives at +136 and
 // selects a query descriptor; the inner handle it dispatches through is at
 // fetcher[2].
