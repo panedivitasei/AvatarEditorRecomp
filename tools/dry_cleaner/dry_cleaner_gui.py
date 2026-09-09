@@ -625,6 +625,9 @@ def find_avatarextract():
     for c in (os.path.join(_exe_dir(), "avatarextract.exe"),
               os.path.join(_bundle_dir(), "avatarextract.exe"),
               os.path.join(HERE, "avatarextract.exe"),
+              # the title build (Ninja, single config) since the decoupling
+              os.path.normpath(os.path.join(HERE, "..", "..", "out", "build", "win-amd64-release",
+                                            "tools", "avatarextract", "avatarextract.exe")),
               os.path.normpath(os.path.join(HERE, "..", "..", "sdk", "out", "build", "win-amd64",
                                             "tools", "avatarextract", "RelWithDebInfo", "avatarextract.exe")),
               os.path.normpath(os.path.join(HERE, "..", "..", "sdk", "out", "build", "win-amd64",
