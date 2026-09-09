@@ -69,11 +69,14 @@ target_include_directories(avatareditor BEFORE PRIVATE
 target_include_directories(avatareditor PRIVATE
     $<TARGET_PROPERTY:imgui,INTERFACE_INCLUDE_DIRECTORIES>)
 
-# Native video layer: plume RHI + rexvideonative, both title-owned
+# Native video layer: plume RHI + rexvideonative
 # (hook table in src/video_hooks.cpp).
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/plume" plume)
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/src/videonative" videonative)
 target_link_libraries(avatareditor PRIVATE rex::videonative)
+
+# Standalone avatar extractor
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/tools/avatarextract" avatarextract)
 
 # XAudio2 system library for the title audio backend.
 if(WIN32)

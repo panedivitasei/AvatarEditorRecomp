@@ -75,6 +75,9 @@ def find_avatarextract():
         os.path.join(exe_dir(), "avatarextract.exe"),
         os.path.join(bundle_dir(), "avatarextract.exe"),
         os.path.join(HERE, "avatarextract.exe"),
+        # the title build (Ninja, single config)
+        os.path.normpath(os.path.join(HERE, "..", "..", "out", "build", "win-amd64-release",
+                                      "tools", "avatarextract", "avatarextract.exe")),
         os.path.normpath(os.path.join(HERE, "..", "..", "sdk", "out", "build", "win-amd64",
                                       "tools", "avatarextract", "RelWithDebInfo", "avatarextract.exe")),
         os.path.normpath(os.path.join(HERE, "..", "..", "sdk", "out", "build", "win-amd64",
