@@ -2,8 +2,13 @@
 #include "shader_recompiler.h"
 #include "dxc_compiler.h"
 #include "ucode_fingerprint.h"
+#include "xenosrecomp.h"
 
+#include <chrono>
 #include <cstring>
+
+#include <mutex>
+#include <vector>
 
 static std::unique_ptr<uint8_t[]> readAllBytes(const char* filePath, size_t& fileSize)
 {
@@ -32,7 +37,18 @@ struct RecompiledShader
     IDxcBlob* dxil = nullptr;
     std::vector<uint8_t> spirv;
     uint32_t specConstantsMask = 0;
+    std::string sourceName;
 };
+
+// Per-shader recompile failures, collected from the parallel loop and reported before exit.
+struct ShaderFailure
+{
+    XXH64_hash_t hash;
+    std::string reason;
+};
+
+static std::mutex g_failureMutex;
+static std::vector<ShaderFailure> g_failures;
 
 // --coverage mode: recompile every container found under the input path and
 // write a per-shader CSV report instead of a shader cache. Nothing aborts;
@@ -290,55 +306,6 @@ static int runCoverage(const char* input, const char* reportPath, std::string_vi
     return 0;
 }
 
-// Minimal in-memory ShaderContainer for runtime shaders with no matching
-// container in the corpus (XDK runtime-built / composited shaders). In
-// rexglue mode the container contributes metadata only: an empty constant
-// table makes codegen fall back to xe_fc{reg}/s{n} names and raw g_Booleans
-// bits; PS interpolators are identity-wired (r{i} = iVar{i}, the rexglue
-// index-wired varying contract); the PS outputs mask is scanned from ucode.
-// No definition table, embedded def constants read b1 like any register.
-static std::vector<uint8_t> buildSyntheticContainer(bool isPixelShader, uint32_t psExportMask)
-{
-    constexpr uint32_t containerSize = sizeof(ShaderContainer);           // 36
-    constexpr uint32_t constantTableOffset = containerSize;
-    constexpr uint32_t constantTableSize = sizeof(ConstantTableContainer); // 32
-    constexpr uint32_t shaderOffset = constantTableOffset + constantTableSize;
-    constexpr uint32_t psInterpolatorCount = 16;
-
-    const uint32_t shaderSize = isPixelShader
-        ? sizeof(PixelShader) + psInterpolatorCount * sizeof(uint32_t)
-        : sizeof(VertexShader);
-
-    std::vector<uint8_t> data(shaderOffset + shaderSize);
-    auto put32 = [&](uint32_t offset, uint32_t value)
-        {
-            value = byteSwap(value);
-            memcpy(data.data() + offset, &value, sizeof(value));
-        };
-
-    put32(offsetof(ShaderContainer, flags), 0x102A1100 | (isPixelShader ? 0 : 1));
-    put32(offsetof(ShaderContainer, virtualSize), uint32_t(data.size()));
-    put32(offsetof(ShaderContainer, constantTableOffset), constantTableOffset);
-    put32(offsetof(ShaderContainer, shaderOffset), shaderOffset);
-
-    put32(constantTableOffset + offsetof(ConstantTableContainer, size), constantTableSize);
-    put32(constantTableOffset + offsetof(ConstantTableContainer, constantTable) +
-        offsetof(ConstantTable, size), sizeof(ConstantTable));
-
-    if (isPixelShader)
-    {
-        // svPos register 0xFF: never matches a GPR (no vPos convention known
-        // without a container). 16 identity interpolators: reg in bits 8-11.
-        put32(shaderOffset + offsetof(Shader, fieldC), 0xFF << 8);
-        put32(shaderOffset + offsetof(Shader, interpolatorInfo), psInterpolatorCount << 5);
-        put32(shaderOffset + offsetof(PixelShader, outputs), psExportMask);
-        for (uint32_t i = 0; i < psInterpolatorCount; i++)
-            put32(shaderOffset + sizeof(PixelShader) + i * sizeof(uint32_t), i << 8);
-    }
-
-    return data;
-}
-
 // Records, for every mapped runtime dump, the word-level difference between
 // the container ucode and the bind-time-patched runtime bytes (the guest's
 // vfetch patch). The output CSV replaces the dumps directory as pack input:
@@ -460,23 +427,15 @@ static int runMakeDeltas(const char* containersPath, const char* dumpsPath, cons
     return 0;
 }
 
-// Builds the per-title native shader pack: for every runtime-seen shader in
-// the map CSV that resolves to a recompilable container, generates HLSL from
-// (container metadata + bind-time-patched runtime ucode), compiles DXIL, and
-// writes <hash>.<vs|ps>.dxil plus a manifest the runtime consumes.
-static int runRexgluePack(const char* containersPath, const char* dumpsPath, const char* mapPath,
-    const char* outPath, std::string_view include, bool deltasMode = false)
+// Every container in a file or directory, keyed by XXH3 of its bytes (the map CSV's container_hash column).
+// Containers sit at unaligned offsets in the CC2 precache, so the scan steps by one byte.
+static void scanContainers(const char* path, std::vector<std::unique_ptr<uint8_t[]>>& files,
+    std::map<uint64_t, std::pair<const uint8_t*, size_t>>& containers)
 {
-    fprintf(stderr, "[pack] enter\n"); fflush(stderr);
-
-    // Containers by XXH3 hash (matches the map CSV's container_hash column).
-    std::vector<std::unique_ptr<uint8_t[]>> files;
-    std::map<uint64_t, const uint8_t*> containers;
-
-    auto scanFile = [&](const std::string& path)
+    auto scanFile = [&](const std::string& filePath)
         {
             size_t fileSize = 0;
-            auto fileData = readAllBytes(path.c_str(), fileSize);
+            auto fileData = readAllBytes(filePath.c_str(), fileSize);
             bool foundAny = false;
 
             for (size_t i = 0; fileSize > sizeof(ShaderContainer) && i < fileSize - sizeof(ShaderContainer) - 1;)
@@ -491,7 +450,8 @@ static int runRexgluePack(const char* containersPath, const char* dumpsPath, con
                 {
                     if (validateContainer(fileData.get() + i) == nullptr)
                     {
-                        containers.try_emplace(XXH3_64bits(fileData.get() + i, dataSize), fileData.get() + i);
+                        containers.try_emplace(XXH3_64bits(fileData.get() + i, dataSize),
+                            std::make_pair(fileData.get() + i, dataSize));
                         foundAny = true;
                     }
                     i += dataSize;
@@ -506,9 +466,9 @@ static int runRexgluePack(const char* containersPath, const char* dumpsPath, con
                 files.emplace_back(std::move(fileData));
         };
 
-    if (std::filesystem::is_directory(containersPath))
+    if (std::filesystem::is_directory(path))
     {
-        for (auto& file : std::filesystem::recursive_directory_iterator(containersPath))
+        for (auto& file : std::filesystem::recursive_directory_iterator(path))
         {
             if (!std::filesystem::is_directory(file))
                 scanFile(file.path().string());
@@ -516,721 +476,809 @@ static int runRexgluePack(const char* containersPath, const char* dumpsPath, con
     }
     else
     {
-        scanFile(containersPath);
+        scanFile(path);
+    }
+}
+
+// Splits a CSV line into at most maxColumns fields.
+static std::vector<std::string> splitCsv(std::string_view line, size_t maxColumns)
+{
+    std::vector<std::string> cols;
+    size_t start = 0;
+    while (cols.size() < maxColumns && start <= line.size())
+    {
+        size_t comma = line.find(',', start);
+        if (comma == std::string_view::npos || cols.size() + 1 == maxColumns)
+            comma = line.size();
+        cols.emplace_back(line.substr(start, comma - start));
+        start = comma + 1;
+    }
+    return cols;
+}
+
+static std::vector<std::vector<std::string>> readCsv(const char* path, size_t maxColumns)
+{
+    size_t size = 0;
+    auto data = readAllBytes(path, size);
+    std::string_view text(reinterpret_cast<const char*>(data.get()), size);
+    std::vector<std::vector<std::string>> rows;
+    size_t pos = 0;
+    bool header = true;
+    while (pos < text.size())
+    {
+        size_t eol = text.find('\n', pos);
+        std::string_view line = text.substr(pos, (eol == std::string_view::npos ? text.size() : eol) - pos);
+        pos = (eol == std::string_view::npos) ? text.size() : eol + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+        if (header)
+        {
+            header = false;
+            continue;
+        }
+        if (!line.empty())
+            rows.push_back(splitCsv(line, maxColumns));
+    }
+    return rows;
+}
+
+static std::string bindingsText(const xenosrecomp::ReflectionView& view)
+{
+    std::string text;
+    for (auto& b : view.bindings)
+    {
+        if (!text.empty())
+            text += ';';
+        text += fmt::format("{}:{}:{}:{}", b.kind ? 's' : 't', b.fetch_constant, b.dimension, b.is_signed);
+    }
+    return text;
+}
+
+static std::string floatBitmapText(const xenosrecomp::ReflectionView& view)
+{
+    // Four u64 printed high to low, the old manifest's float_bitmap column.
+    std::string text;
+    for (int i = 3; i >= 0; i--)
+    {
+        uint64_t v = uint64_t(view.header->float_bitmap[i * 2]) | (uint64_t(view.header->float_bitmap[i * 2 + 1]) << 32);
+        text += fmt::format("{:016X}", v);
+    }
+    return text;
+}
+
+// --cc2-pack <corpus> <map.csv> <out.pack>: builds the X4 single-file pack keyed by (stage, fp2), one entry per
+// runtime shader the map lists. A containerless row translates its rebuilt code the way the runtime fallback does.
+static int runCc2Pack(const char* corpusPath, const char* mapPath, const char* outPath)
+{
+    using namespace xenosrecomp;
+    const auto startTime = std::chrono::steady_clock::now();
+
+    std::vector<std::unique_ptr<uint8_t[]>> files;
+    std::map<uint64_t, std::pair<const uint8_t*, size_t>> containers;
+    scanContainers(corpusPath, files, containers);
+    fmt::println("[pack] {} containers indexed", containers.size());
+
+    std::vector<std::string> errors;
+    auto fail = [&](std::string message) { errors.push_back(std::move(message)); };
+
+    struct Row
+    {
+        uint64_t runtimeHash = 0;
+        bool isPixel = false;
+        uint64_t containerHash = 0;
+        std::span<const uint8_t> container;
+        std::vector<uint32_t> code;   // runtime ucode, guest byte order
+        bool patched = false;
+        bool containerless = false;
+        uint64_t fp2 = 0;
+    };
+    std::vector<Row> rows;
+
+    for (auto& cols : readCsv(mapPath, 7))
+    {
+        if (cols.size() < 6)
+        {
+            fail("map row with fewer than 6 columns");
+            continue;
+        }
+        Row row;
+        row.runtimeHash = strtoull(cols[0].c_str(), nullptr, 16);
+        row.isPixel = cols[1] == "ps";
+        row.containerless = cols[2] == "containerless";
+        row.containerHash = strtoull(cols[3].c_str(), nullptr, 16);
+        auto it = cols[3].empty() ? containers.end() : containers.find(row.containerHash);
+        if (it == containers.end())
+        {
+            fail(fmt::format("FAILED {}.{}: no container {} in the corpus", cols[0], cols[1], cols[3]));
+            continue;
+        }
+        row.container = { it->second.first, it->second.second };
+        auto c = reinterpret_cast<const ShaderContainer*>(row.container.data());
+        auto sh = reinterpret_cast<const Shader*>(row.container.data() + c->shaderOffset);
+        const uint8_t* codeBytes = row.container.data() + c->virtualSize + sh->physicalOffset;
+        row.code.resize(sh->size / sizeof(uint32_t));
+        memcpy(row.code.data(), codeBytes, row.code.size() * sizeof(uint32_t));
+
+        // Patches are wordIndex:HEXWORD in guest order; they rebuild the runtime bytes the hash names.
+        if (cols.size() >= 7 && !cols[6].empty())
+        {
+            const std::string& s = cols[6];
+            size_t p = 0;
+            while (p < s.size())
+            {
+                size_t colon = s.find(':', p);
+                size_t semi = s.find(';', p);
+                if (semi == std::string::npos)
+                    semi = s.size();
+                if (colon == std::string::npos || colon > semi)
+                    break;
+                uint32_t index = uint32_t(strtoul(s.substr(p, colon - p).c_str(), nullptr, 10));
+                uint32_t value = uint32_t(strtoul(s.substr(colon + 1, semi - colon - 1).c_str(), nullptr, 16));
+                if (index < row.code.size())
+                    row.code[index] = value;
+                p = semi + 1;
+            }
+            row.patched = true;
+        }
+        if (row.patched || row.isPixel || row.containerless)
+        {
+            uint64_t hash = XXH3_64bits(row.code.data(), row.code.size() * sizeof(uint32_t));
+            if (hash != row.runtimeHash)
+            {
+                fail(fmt::format("FAILED {}.{}: rebuilt runtime ucode hashes to {:016X}", cols[0], cols[1], hash));
+                continue;
+            }
+        }
+
+        // fp2 covers the patched declaration fields, so a container serves one entry per declaration variant.
+        row.fp2 = Fingerprint(row.code, true);
+        if (row.containerless)
+            row.container = {};
+        rows.push_back(std::move(row));
     }
 
-    fprintf(stderr, "[pack] %zu containers indexed\n", containers.size()); fflush(stderr);
-
-    struct PackJob
+    // One full translation per (key, container), plus HLSL-only checks for every other input that shares the key.
+    struct Job
     {
-        std::string runtimeHash;
-        std::string fingerprint;
-        bool isPixelShader = false;
-        const uint8_t* container = nullptr; // null = container-less generation
-        std::vector<uint8_t> synthetic;     // backing store for the null case
-        // deltas mode: word index -> value overrides applied to the container
-        // ucode (the bind-time vfetch patches recorded by --make-deltas)
-        std::vector<std::pair<uint32_t, uint32_t>> patches;
-        // results
-        bool ok = false;
-        std::string reason;
-        std::string bindings;
-        std::string floatBitmap; // 4x16 hex chars, matches ConstantRegisterMap::float_bitmap
-        std::vector<uint8_t> dxil;
-        // SPIR-V twin for the Vulkan backend ({hash}.{type}.spirv). Empty on
-        // spirv-compile failure, non-fatal, the D3D12 path is unaffected and
-        // the runtime falls back per shader.
-        std::vector<uint8_t> spirv;
-        std::vector<uint8_t> spirvTrim;
-        std::string hlsl;
-        // VS trim: same body with unwritten oVar/oPts outputs removed
-        // from the signature. Loaded as {hash}.vst.dxil; the runtime prefers
-        // it except when an expansion GS (which links the full signature) is
-        // attached. Empty when the shader writes everything or trim failed.
-        std::vector<uint8_t> dxilTrim;
-        std::string hlslTrim;
+        uint8_t stage = 0;
+        uint64_t fp2 = 0;
+        uint64_t containerHash = 0;
+        std::span<const uint8_t> container;
+        std::vector<uint32_t> code;
+        std::string label;
+        bool full = false;
+        bool containerless = false;
+        size_t fullJob = SIZE_MAX;     // HLSL-only jobs compare against this one
+        TranslateResult result;
     };
+    std::vector<Job> jobs;
+    std::map<std::tuple<uint8_t, uint64_t, uint64_t>, size_t> fullJobs;
+    std::map<std::pair<uint8_t, uint64_t>, std::vector<size_t>> groups;   // key -> row indices
 
-    // Remove unwritten output declarations + their zero-inits from a rexglue
-    // VS. The body never references removed vars (the mask says unwritten),
-    // and each parameter carries its own leading comma, so the signature
-    // stays well-formed for any subset.
-    auto trimVsOutputs = [](const std::string& hlsl, uint32_t writtenMask, bool wroteOPts)
+    for (size_t i = 0; i < rows.size(); i++)
     {
-        std::string s = hlsl;
-        auto removeAll = [&s](const std::string& what)
+        const Row& row = rows[i];
+        const uint8_t stage = row.isPixel ? kPackPS : kPackVS;
+        groups[{ stage, row.fp2 }].push_back(i);
+        // A containerless key has no container, so its translations never depend on the byte source.
+        auto key = std::make_tuple(stage, row.fp2, row.containerless ? 0 : row.containerHash);
+        auto label = fmt::format("{:016X}.{}", row.runtimeHash, row.isPixel ? "ps" : "vs");
+        auto found = fullJobs.find(key);
+        if (found == fullJobs.end())
         {
-            size_t pos = 0;
-            while ((pos = s.find(what)) != std::string::npos)
-                s.erase(pos, what.size());
+            Job job;
+            job.stage = stage;
+            job.fp2 = row.fp2;
+            job.containerHash = row.containerHash;
+            job.container = row.container;
+            job.code = row.code;
+            job.label = label;
+            job.full = true;
+            job.containerless = row.containerless;
+            fullJobs.emplace(key, jobs.size());
+            jobs.push_back(std::move(job));
+        }
+        else
+        {
+            Job job;
+            job.stage = stage;
+            job.fp2 = row.fp2;
+            job.containerHash = row.containerHash;
+            job.container = row.container;
+            job.code = row.code;
+            job.label = label;
+            job.fullJob = found->second;
+            jobs.push_back(std::move(job));
+        }
+    }
+    // The container's own ucode must translate like the patched runtime ucode of the same key.
+    for (auto& [key, index] : std::map(fullJobs))
+    {
+        const Job& full = jobs[index];
+        if (full.containerless)
+            continue;
+        auto c = reinterpret_cast<const ShaderContainer*>(full.container.data());
+        auto sh = reinterpret_cast<const Shader*>(full.container.data() + c->shaderOffset);
+        const auto* words = reinterpret_cast<const uint32_t*>(full.container.data() + c->virtualSize + sh->physicalOffset);
+        if (std::equal(full.code.begin(), full.code.end(), words))
+            continue;
+        // A container whose own declaration fields differ from the key's is another variant, not a cross-check.
+        if (Fingerprint({ words, sh->size / sizeof(uint32_t) }, true) != full.fp2)
+            continue;
+        Job job;
+        job.stage = full.stage;
+        job.fp2 = full.fp2;
+        job.containerHash = full.containerHash;
+        job.container = full.container;
+        job.code.assign(words, words + sh->size / sizeof(uint32_t));
+        job.label = fmt::format("container {:016X}", full.containerHash);
+        job.fullJob = index;
+        jobs.push_back(std::move(job));
+    }
+
+    size_t fullCount = 0;
+    for (auto& job : jobs)
+        fullCount += job.full;
+    fmt::println("[pack] {} runtime rows, {} keys, {} full translations, {} cross-check translations",
+        rows.size(), groups.size(), fullCount, jobs.size() - fullCount);
+
+    std::atomic<uint32_t> progress = 0;
+    std::for_each(std::execution::par_unseq, jobs.begin(), jobs.end(), [&](Job& job)
+        {
+            TranslateInput in;
+            in.stage = job.stage == kPackPS ? Stage::kPixel : Stage::kVertex;
+            in.ucode = job.code;
+            in.container = job.container;
+            in.targets = job.full ? (kDxil | kSpirv | kTrim) : kTrim;
+            in.keep_hlsl = true;
+            job.result = Translate(in);
+            uint32_t done = ++progress;
+            if ((done % 200) == 0)
+                fmt::println("[pack] translated {}/{}", done, jobs.size());
+        });
+
+    size_t crossChecks = 0;
+    for (auto& job : jobs)
+    {
+        if (!job.result.ok)
+        {
+            fail(fmt::format("FAILED {}: {}", job.label, job.result.error.substr(0, job.result.error.find('\n'))));
+            continue;
+        }
+        if (job.result.fp2 != job.fp2)
+            fail(fmt::format("FAILED {}: translator fp2 {:016X} differs from the key {:016X}", job.label, job.result.fp2, job.fp2));
+        if (!job.full)
+        {
+            const Job& full = jobs[job.fullJob];
+            if (full.result.ok && (job.result.hlsl != full.result.hlsl || job.result.reflection != full.result.reflection))
+            {
+                fail(fmt::format("FAILED {}: same key and container as {} but a different translation", job.label, full.label));
+                // Both texts go next to the pack for diffing.
+                const auto dir = std::filesystem::path(outPath).parent_path() / "mismatch";
+                std::filesystem::create_directories(dir);
+                const std::string stem = fmt::format("{:016X}", job.fp2);
+                writeAllBytes((dir / (stem + ".a.hlsl")).string().c_str(), full.result.hlsl.data(), full.result.hlsl.size());
+                writeAllBytes((dir / (stem + ".b.hlsl")).string().c_str(), job.result.hlsl.data(), job.result.hlsl.size());
+                writeAllBytes((dir / (stem + ".a.refl")).string().c_str(), full.result.reflection.data(), full.result.reflection.size());
+                writeAllBytes((dir / (stem + ".b.refl")).string().c_str(), job.result.reflection.data(), job.result.reflection.size());
+            }
+            crossChecks++;
+        }
+    }
+
+    // Layout records as the renderer will read them from each runtime VS, checked against the reflection.
+    size_t recordCount = 0, unhandledRecords = 0, rowsWithUnhandled = 0;
+    std::map<uint32_t, uint32_t> recordFormats;
+    for (auto& row : rows)
+    {
+        if (row.isPixel)
+            continue;
+        const Job& full = jobs[fullJobs.at(std::make_tuple(uint8_t(kPackVS), row.fp2, row.containerless ? 0 : row.containerHash))];
+        ReflectionView view;
+        if (!full.result.ok || !ParseReflection(full.result.reflection, view))
+            continue;
+        XeVfetchRecord records[kMaxVfetch * 2];
+        const uint32_t count = ReadVfetchRecords(row.code, true, records);
+        if (count != view.header->vfetch_count)
+        {
+            fail(fmt::format("FAILED {:016X}.vs: {} layout records for {} translated vfetches", row.runtimeHash, count,
+                view.header->vfetch_count));
+            continue;
+        }
+        bool unhandled = false;
+        for (uint32_t i = 0; i < count; i++)
+        {
+            const uint32_t format = (records[i].word0 >> 8) & 0x3F;
+            recordFormats[format]++;
+            static constexpr uint32_t kHandled[] = { 6, 7, 16, 17, 25, 26, 31, 32, 33, 34, 35, 36, 37, 38, 57 };
+            if (std::find(std::begin(kHandled), std::end(kHandled), format) == std::end(kHandled))
+            {
+                unhandledRecords++;
+                unhandled = true;
+            }
+        }
+        recordCount += count;
+        rowsWithUnhandled += unhandled;
+    }
+
+    // Keys spanning several containers must still agree on everything the renderer consumes.
+    size_t multiContainerKeys = 0, benignCollisions = 0, literalCollisions = 0;
+    // Literal values come from the shader object at draw time, so they may differ under one key.
+    auto withoutLiteralValues = [](const std::vector<uint8_t>& reflection)
+        {
+            std::vector<uint8_t> copy = reflection;
+            ReflectionView view;
+            if (ParseReflection(copy, view))
+            {
+                for (auto& literal : view.literals)
+                    memset(const_cast<uint32_t*>(literal.value), 0, sizeof(literal.value));
+            }
+            return copy;
         };
-        for (uint32_t i = 0; i < 16; i++)
+    std::vector<PackInput> inputs;
+    for (auto& [key, rowIndices] : groups)
+    {
+        std::vector<size_t> keyJobs;
+        for (auto& [jobKey, index] : fullJobs)
         {
-            if (writtenMask & (1u << i))
-                continue;
-            removeAll(fmt::format(",\n\tout float4 oVar{0} : TEXCOORD{0}", i));
-            removeAll(fmt::format("\toVar{} = 0.0;\n", i));
+            if (std::get<0>(jobKey) == key.first && std::get<1>(jobKey) == key.second)
+                keyJobs.push_back(index);
         }
-        if (!wroteOPts)
+        const Job& first = jobs[keyJobs.front()];
+        if (keyJobs.size() > 1)
         {
-            removeAll(",\n\tout float4 oPts : TEXCOORD16");
-            removeAll("\toPts = 0.0;\n");
+            multiContainerKeys++;
+            for (size_t k = 1; k < keyJobs.size(); k++)
+            {
+                const Job& other = jobs[keyJobs[k]];
+                if (!first.result.ok || !other.result.ok)
+                    continue;
+                const bool sameBlobs = first.result.dxil == other.result.dxil && first.result.spirv == other.result.spirv &&
+                    first.result.dxil_trim == other.result.dxil_trim && first.result.spirv_trim == other.result.spirv_trim;
+                const bool sameReflection = first.result.reflection == other.result.reflection;
+                if (sameBlobs && !sameReflection &&
+                    withoutLiteralValues(first.result.reflection) == withoutLiteralValues(other.result.reflection))
+                {
+                    literalCollisions++;
+                    continue;
+                }
+                if (first.result.hlsl == other.result.hlsl && sameReflection)
+                    continue;
+                if (sameBlobs && sameReflection)
+                {
+                    benignCollisions++;
+                    continue;
+                }
+                fail(fmt::format("FAILED fp2 collision {:016X}: containers {:016X} and {:016X} translate differently",
+                    key.second, first.containerHash, other.containerHash));
+            }
         }
-        return s;
-    };
+        if (!first.result.ok)
+            continue;
 
-    std::vector<PackJob> jobs;
-    std::set<std::string> mappedHashes;
+        PackInput input;
+        input.stage = key.first;
+        input.fp2 = key.second;
+        ReflectionView view;
+        ParseReflection(first.result.reflection, view);
+        if (view.header->flags & kReflHasTrim)
+            input.flags |= kEntryHasTrim;
+        input.reflection = first.result.reflection;
+        input.dxil = first.result.dxil;
+        input.spirv = first.result.spirv;
+        input.dxil_trim = first.result.dxil_trim;
+        input.spirv_trim = first.result.spirv_trim;
+        for (size_t r : rowIndices)
+            input.aliases.push_back(rows[r].runtimeHash);
+        inputs.push_back(std::move(input));
+    }
+
+    // Built-ins compile with the pack's DXC setup; any failure fails the build.
+    for (auto& builtin : Builtins())
+    {
+        PackInput input;
+        input.stage = builtin.stage;
+        input.fp2 = BuiltinKey(builtin.name);
+        XeReflHeader h{};
+        h.stage = builtin.stage;
+        h.pixel_pos_reg = 0xFF;
+        input.reflection.assign(reinterpret_cast<const uint8_t*>(&h), reinterpret_cast<const uint8_t*>(&h) + sizeof(h));
+        const bool isGs = builtin.stage == kPackGS;
+        const bool isPixel = builtin.stage == kPackBlitPS;
+        DxcCompiler dxc;
+        for (bool spirv : { false, true })
+        {
+            IDxcBlob* blob = dxc.compile(builtin.source, isPixel, false, spirv, isGs ? L"-T gs_6_0" : nullptr);
+            if (blob == nullptr)
+            {
+                fail(fmt::format("FAILED builtin {} ({}): {}", builtin.name, spirv ? "SPIR-V" : "DXIL",
+                    dxc.lastError.substr(0, dxc.lastError.find('\n'))));
+                continue;
+            }
+            auto* p = reinterpret_cast<const uint8_t*>(blob->GetBufferPointer());
+            (spirv ? input.spirv : input.dxil).assign(p, p + blob->GetBufferSize());
+            blob->Release();
+        }
+        inputs.push_back(std::move(input));
+    }
+
+    std::error_code ec;
+    if (!errors.empty())
+    {
+        for (auto& e : errors)
+            fmt::println("{}", e);
+        fmt::println("[pack] {} error(s), no pack written", errors.size());
+        std::filesystem::remove(outPath, ec);
+        return 1;
+    }
+
+    size_t vsCount = 0, psCount = 0, trimCount = 0;
+    size_t dxilBytes[2] = {}, spirvBytes[2] = {};
+    for (auto& input : inputs)
+    {
+        vsCount += input.stage == kPackVS;
+        psCount += input.stage == kPackPS;
+        trimCount += !input.dxil_trim.empty();
+        const int ps = input.stage == kPackPS ? 1 : 0;
+        dxilBytes[ps] += input.dxil.size() + input.dxil_trim.size();
+        spirvBytes[ps] += input.spirv.size() + input.spirv_trim.size();
+    }
+
+    // Debug listing next to the pack; the runtime never reads it.
+    StringBuffer manifest;
+    manifest.println("runtime_ucode_hash,type,fp2,container_hash,bindings,float_bitmap,flags");
+    for (auto& row : rows)
+    {
+        const uint8_t stage = row.isPixel ? kPackPS : kPackVS;
+        const Job& full = jobs[fullJobs.at(std::make_tuple(stage, row.fp2, row.containerless ? 0 : row.containerHash))];
+        ReflectionView view;
+        ParseReflection(full.result.reflection, view);
+        manifest.println("{:016X},{},{:016X},{:016X},{},{},{:04X}", row.runtimeHash, row.isPixel ? "ps" : "vs", row.fp2,
+            row.containerHash, bindingsText(view), floatBitmapText(view), view.header->flags);
+    }
+
+    const size_t inputCount = inputs.size();
+    std::string error;
+    std::vector<uint8_t> pack = BuildPack(std::move(inputs), 19, &error);
+    if (pack.empty())
+    {
+        fmt::println("[pack] write failed: {}", error);
+        std::filesystem::remove(outPath, ec);
+        return 1;
+    }
+
+    const std::filesystem::path out(outPath);
+    std::filesystem::create_directories(out.parent_path(), ec);
+    const std::filesystem::path temp = out.string() + ".tmp";
+    writeAllBytes(temp.string().c_str(), pack.data(), pack.size());
+    std::filesystem::rename(temp, out, ec);
+    if (ec)
+    {
+        fmt::println("[pack] cannot rename {} into place", temp.string());
+        return 1;
+    }
+    writeAllBytes((out.parent_path() / "manifest.csv").string().c_str(), manifest.out.data(), manifest.out.size());
+
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
+    fmt::println("");
+    fmt::println("=== cc2 pack ===");
+    fmt::println("runtime rows:        {}", rows.size());
+    fmt::println("entries:             {} ({} VS, {} PS, {} built-in), {} VS with trim", inputCount, vsCount, psCount,
+        inputCount - vsCount - psCount, trimCount);
+    fmt::println("keys over >1 container: {} ({} differ only in HLSL text, {} only in def literal values, 0 conflicting)",
+        multiContainerKeys, benignCollisions, literalCollisions);
+    fmt::println("cross-checked inputs: {} (identical translation per key)", crossChecks);
+    std::string formats;
+    for (auto& [format, count] : recordFormats)
+        formats += fmt::format(" {}:{}", format, count);
+    fmt::println("runtime layout records: {}, unhandled format {} in {} VS; formats{}", recordCount, unhandledRecords,
+        rowsWithUnhandled, formats);
+    fmt::println("raw DXIL VS {:.1f} MB PS {:.1f} MB, raw SPIR-V VS {:.1f} MB PS {:.1f} MB", dxilBytes[0] / 1048576.0,
+        dxilBytes[1] / 1048576.0, spirvBytes[0] / 1048576.0, spirvBytes[1] / 1048576.0);
+    fmt::println("pack {} bytes ({:.2f} MB), abi {:016X}, {:.1f} s", pack.size(), pack.size() / 1048576.0, AbiHash(), seconds);
+    fmt::println("pack: {}", out.string());
+    return 0;
+}
+
+// --add-misses <corpus> <misses dir> <map.csv>: appends a map row for every runtime miss dump (<rt>.<vs|ps>.ucode,
+// guest byte order), with the patches that rebuild its bytes from a corpus container. Code with a same-fp2 container
+// gets an ordinary row; the rest becomes containerless, sourced from the same-size container with the fewest diffs.
+static int runAddMisses(const char* corpusPath, const char* missesPath, const char* mapPath)
+{
+    using namespace xenosrecomp;
+    std::vector<std::unique_ptr<uint8_t[]>> files;
+    std::map<uint64_t, std::pair<const uint8_t*, size_t>> containers;
+    scanContainers(corpusPath, files, containers);
+
+    // (fp2, dword count) -> container hash; the first container in hash order wins, as fp2 keys never span two.
+    std::map<std::pair<uint64_t, size_t>, uint64_t> byKey;
+    std::multimap<size_t, uint64_t> bySize;
+    for (auto& [hash, span] : containers)
+    {
+        auto c = reinterpret_cast<const ShaderContainer*>(span.first);
+        auto sh = reinterpret_cast<const Shader*>(span.first + c->shaderOffset);
+        const auto* words = reinterpret_cast<const uint32_t*>(span.first + c->virtualSize + sh->physicalOffset);
+        const size_t count = sh->size / sizeof(uint32_t);
+        byKey.try_emplace({ Fingerprint({ words, count }, true), count }, hash);
+        bySize.emplace(count, hash);
+    }
+    auto codeOf = [&](uint64_t hash)
+        {
+            const auto& span = containers.at(hash);
+            auto c = reinterpret_cast<const ShaderContainer*>(span.first);
+            auto sh = reinterpret_cast<const Shader*>(span.first + c->shaderOffset);
+            return reinterpret_cast<const uint32_t*>(span.first + c->virtualSize + sh->physicalOffset);
+        };
+
+    std::set<std::pair<uint64_t, bool>> known;
+    for (auto& cols : readCsv(mapPath, 7))
+    {
+        if (cols.size() >= 2)
+            known.insert({ strtoull(cols[0].c_str(), nullptr, 16), cols[1] == "ps" });
+    }
+
+    StringBuffer out;
+    size_t added = 0, unmatched = 0;
+    for (auto& file : std::filesystem::directory_iterator(missesPath))
+    {
+        const std::string name = file.path().filename().string();
+        const bool isPixel = name.ends_with(".ps.ucode");
+        if (!isPixel && !name.ends_with(".vs.ucode"))
+            continue;
+        size_t size = 0;
+        auto data = readAllBytes(file.path().string().c_str(), size);
+        std::vector<uint32_t> code(size / sizeof(uint32_t));
+        memcpy(code.data(), data.get(), code.size() * sizeof(uint32_t));
+        const uint64_t runtimeHash = XXH3_64bits(code.data(), code.size() * sizeof(uint32_t));
+        if (known.contains({ runtimeHash, isPixel }))
+            continue;
+        const uint64_t fp2 = Fingerprint(code, true);
+        auto it = byKey.find({ fp2, code.size() });
+        uint64_t source = 0;
+        bool containerless = false;
+        if (it != byKey.end())
+        {
+            source = it->second;
+        }
+        else
+        {
+            size_t best = SIZE_MAX;
+            for (auto [s, e] = bySize.equal_range(code.size()); s != e; ++s)
+            {
+                const uint32_t* words = codeOf(s->second);
+                size_t diffs = 0;
+                for (size_t i = 0; i < code.size() && diffs < best; i++)
+                    diffs += words[i] != code[i];
+                if (diffs < best)
+                    best = diffs, source = s->second;
+            }
+            if (best == SIZE_MAX)
+            {
+                fmt::println("[misses] {}: no corpus container of {} dwords", name, code.size());
+                unmatched++;
+                continue;
+            }
+            containerless = true;
+            fmt::println("[misses] {}: fp2 {:016X} has no container; containerless, {} of {} words patched from {:016X}",
+                name, fp2, best, code.size(), source);
+        }
+        const uint32_t* words = codeOf(source);
+        std::string patches;
+        for (size_t i = 0; i < code.size(); i++)
+        {
+            // Patch values are the words as a host load reads guest memory, like the deltas mode writes them.
+            const uint32_t word = code[i];
+            if (word != words[i])
+                patches += fmt::format("{}{}:{:08X}", patches.empty() ? "" : ";", i, word);
+        }
+        out.println("{:016X},{},{},{:016X},{:016X},1,{}", runtimeHash, isPixel ? "ps" : "vs",
+            containerless ? "containerless" : patches.empty() ? "exact" : "fingerprint", source,
+            ucodeFingerprint(code.data(), code.size(), true), patches);
+        known.insert({ runtimeHash, isPixel });
+        added++;
+    }
+
+    if (added != 0)
     {
         size_t mapSize = 0;
         auto mapData = readAllBytes(mapPath, mapSize);
-        std::string_view map(reinterpret_cast<const char*>(mapData.get()), mapSize);
+        std::string text(reinterpret_cast<const char*>(mapData.get()), mapSize);
+        if (!text.empty() && text.back() != '\n')
+            text += '\n';
+        text.append(out.out.data(), out.out.size());
+        writeAllBytes(mapPath, text.data(), text.size());
+    }
+    fmt::println("[misses] {} rows added to {}, {} without a corpus container", added, mapPath, unmatched);
+    return unmatched == 0 ? 0 : 1;
+}
 
-        size_t pos = 0;
-        bool header = true;
-        while (pos < map.size())
+// --translate <corpus> <container hash> <out prefix> [nocontainer]: one shader through the library, every output
+// on disk, then a disk cache round trip. nocontainer takes the container-less path the fallback uses for unknown code.
+static int runTranslateOne(const char* corpusPath, const char* containerHash, const char* outPrefix, bool withContainer)
+{
+    using namespace xenosrecomp;
+    std::vector<std::unique_ptr<uint8_t[]>> files;
+    std::map<uint64_t, std::pair<const uint8_t*, size_t>> containers;
+    scanContainers(corpusPath, files, containers);
+    auto it = containers.find(strtoull(containerHash, nullptr, 16));
+    if (it == containers.end())
+    {
+        fmt::println("container {} not found", containerHash);
+        return 1;
+    }
+    std::span<const uint8_t> container(it->second.first, it->second.second);
+    auto c = reinterpret_cast<const ShaderContainer*>(container.data());
+    auto sh = reinterpret_cast<const Shader*>(container.data() + c->shaderOffset);
+    TranslateInput in;
+    in.stage = (c->flags & 0x1) == 0 ? Stage::kPixel : Stage::kVertex;
+    in.ucode = { reinterpret_cast<const uint32_t*>(container.data() + c->virtualSize + sh->physicalOffset), sh->size / 4u };
+    if (withContainer)
+        in.container = container;
+    in.keep_hlsl = true;
+    TranslateResult r = Translate(in);
+    if (!r.ok)
+    {
+        fmt::println("FAILED: {}", r.error);
+        return 1;
+    }
+    const std::string prefix = outPrefix;
+    const char* type = in.stage == Stage::kPixel ? "ps" : "vs";
+    writeAllBytes((prefix + "." + type + ".hlsl").c_str(), r.hlsl.data(), r.hlsl.size());
+    writeAllBytes((prefix + "." + type + ".dxil").c_str(), r.dxil.data(), r.dxil.size());
+    writeAllBytes((prefix + "." + type + ".spirv").c_str(), r.spirv.data(), r.spirv.size());
+    writeAllBytes((prefix + "." + type + ".refl").c_str(), r.reflection.data(), r.reflection.size());
+    if (!r.hlsl_trim.empty())
+    {
+        writeAllBytes((prefix + ".vst.hlsl").c_str(), r.hlsl_trim.data(), r.hlsl_trim.size());
+        writeAllBytes((prefix + ".vst.dxil").c_str(), r.dxil_trim.data(), r.dxil_trim.size());
+        writeAllBytes((prefix + ".vst.spirv").c_str(), r.spirv_trim.data(), r.spirv_trim.size());
+    }
+    fmt::println("fp2 {:016X}, dxil {} B, spirv {} B, trim {} / {} B", r.fp2, r.dxil.size(), r.spirv.size(),
+        r.dxil_trim.size(), r.spirv_trim.size());
+
+    // Disk cache round trip through the same loader the pack uses.
+    const std::filesystem::path cacheDir = CacheDirectory(prefix + "_cache");
+    std::string error;
+    Pack cached;
+    if (!CacheStore(cacheDir, in.stage, r, &error) || !CacheLoad(cacheDir, in.stage, r.fp2, cached, &error))
+    {
+        fmt::println("cache round trip failed: {}", error);
+        return 1;
+    }
+    const PackEntry* entry = cached.Find(uint8_t(in.stage), r.fp2);
+    std::vector<uint8_t> dxil, spirv, dxilTrim, spirvTrim;
+    const bool same = entry != nullptr && cached.Decompress(*entry, BlobKind::kDxil, dxil, &error) &&
+        cached.Decompress(*entry, BlobKind::kSpirv, spirv, &error) &&
+        cached.Decompress(*entry, BlobKind::kDxilTrim, dxilTrim, &error) &&
+        cached.Decompress(*entry, BlobKind::kSpirvTrim, spirvTrim, &error) &&
+        dxil == r.dxil && spirv == r.spirv && dxilTrim == r.dxil_trim && spirvTrim == r.spirv_trim &&
+        std::ranges::equal(cached.Reflection(*entry), r.reflection) && cached.FindAlias(r.runtime_ucode_hash) == entry;
+    fmt::println("cache round trip {}: {}", same ? "ok" : "MISMATCH", CacheFile(cacheDir, in.stage, r.fp2).string());
+    return same ? 0 : 1;
+}
+
+static bool validDxil(const std::vector<uint8_t>& blob)
+{
+    if (blob.size() < 32 || memcmp(blob.data(), "DXBC", 4) != 0)
+        return false;
+    uint32_t size;
+    memcpy(&size, blob.data() + 24, sizeof(size));
+    bool signedDigest = false;
+    for (size_t i = 4; i < 20; i++)
+        signedDigest |= blob[i] != 0;
+    return size == blob.size() && signedDigest;
+}
+
+static bool validSpirv(const std::vector<uint8_t>& blob)
+{
+    if (blob.size() < 20 || (blob.size() & 3) != 0)
+        return false;
+    uint32_t magic, version;
+    memcpy(&magic, blob.data(), 4);
+    memcpy(&version, blob.data() + 4, 4);
+    return magic == 0x07230203 && (version >> 16) == 1;
+}
+
+// --pack-check <pack> <old manifest.csv> [N]: loads the pack as the renderer would, resolves N manifest rows
+// (0 = all) through the alias table and the key index, decompresses every blob and validates its header.
+static int runPackCheck(const char* packPath, const char* manifestPath, size_t limit)
+{
+    using namespace xenosrecomp;
+    Pack pack;
+    std::string error;
+    if (!pack.OpenFile(packPath, &error))
+    {
+        fmt::println("pack refused: {}", error);
+        return 1;
+    }
+    const PackHeader& h = pack.header();
+    fmt::println("pack v{} fp{} abi {:016X}: {} entries ({} built-in), {} aliases, refl {} B, blobs {} B",
+        h.version, h.fingerprint_ver, h.abi_hash, h.entry_count, h.builtin_count, h.alias_count, h.refl_size, h.blob_size);
+
+    size_t looked = 0, found = 0, missing = 0, bad = 0, blobsChecked = 0, bindingDiffs = 0, bitmapDiffs = 0;
+    auto rows = readCsv(manifestPath, 7);
+    for (auto& cols : rows)
+    {
+        if (limit != 0 && looked >= limit)
+            break;
+        if (cols.size() < 2)
+            continue;
+        looked++;
+        const uint64_t hash = strtoull(cols[0].c_str(), nullptr, 16);
+        const uint8_t stage = cols[1] == "ps" ? kPackPS : kPackVS;
+        const PackEntry* entry = pack.FindAlias(hash);
+        if (entry == nullptr)
         {
-            size_t eol = map.find('\n', pos);
-            std::string_view line = map.substr(pos, (eol == std::string_view::npos ? map.size() : eol) - pos);
-            pos = (eol == std::string_view::npos) ? map.size() : eol + 1;
+            missing++;
+            continue;
+        }
+        found++;
+        bool ok = entry->stage == stage && pack.Find(entry->stage, entry->fp2) == entry;
 
-            if (header) { header = false; continue; }
-            if (!line.empty() && line.back() == '\r')
-                line.remove_suffix(1);
-            if (line.empty())
+        ReflectionView view;
+        ok &= ParseReflection(pack.Reflection(*entry), view) && view.header->stage == stage;
+        if (ok && cols.size() >= 6)
+        {
+            // Old manifest columns: runtime_ucode_hash,type,fingerprint,dxil,bindings,float_bitmap,reason.
+            bindingDiffs += bindingsText(view) != cols[4];
+            bitmapDiffs += floatBitmapText(view) != cols[5];
+        }
+
+        std::vector<uint8_t> blob;
+        for (BlobKind kind : { BlobKind::kDxil, BlobKind::kSpirv, BlobKind::kDxilTrim, BlobKind::kSpirvTrim })
+        {
+            if (!pack.Decompress(*entry, kind, blob, &error))
+            {
+                ok = false;
                 continue;
-
-            // runtime_ucode_hash,type,match,container_hash,fingerprint,recompiles_ok[,patches]
-            std::string cols[7];
-            size_t colStart = 0;
-            for (uint32_t c = 0; c < 7 && colStart <= line.size(); c++)
-            {
-                size_t comma = line.find(',', colStart);
-                cols[c] = std::string(line.substr(colStart, (comma == std::string_view::npos ? line.size() : comma) - colStart));
-                colStart = (comma == std::string_view::npos) ? line.size() + 1 : comma + 1;
             }
-
-            PackJob job;
-            job.runtimeHash = cols[0];
-            job.fingerprint = cols[4];
-            job.isPixelShader = (cols[1] == "ps");
-
-            // Rows without a recompilable container (match=none, composited
-            // VS, patched-beyond-vfetch PS, non-recompiling containers) fall
-            // back to container-less generation from the raw runtime ucode.
-            if (cols[5] == "1" && !cols[3].empty())
+            const bool trim = kind == BlobKind::kDxilTrim || kind == BlobKind::kSpirvTrim;
+            if (blob.empty())
             {
-                auto it = containers.find(strtoull(cols[3].c_str(), nullptr, 16));
-                if (it != containers.end())
-                    job.container = it->second;
+                ok &= trim && (view.header == nullptr || !(view.header->flags & kReflHasTrim));
+                continue;
             }
-
-            if (deltasMode)
-            {
-                // patches column: semicolon list of wordIndex:HEXWORD
-                size_t p = 0;
-                const std::string& s = cols[6];
-                while (p < s.size())
-                {
-                    size_t colon = s.find(':', p);
-                    size_t semi = s.find(';', p);
-                    if (semi == std::string::npos)
-                        semi = s.size();
-                    if (colon == std::string::npos || colon > semi)
-                        break;
-                    job.patches.emplace_back(
-                        uint32_t(strtoul(s.substr(p, colon - p).c_str(), nullptr, 10)),
-                        uint32_t(strtoul(s.substr(colon + 1, semi - colon - 1).c_str(), nullptr, 16)));
-                    p = semi + 1;
-                }
-            }
-
-            mappedHashes.insert(job.runtimeHash);
-            jobs.emplace_back(std::move(job));
+            blobsChecked++;
+            ok &= (kind == BlobKind::kDxil || kind == BlobKind::kDxilTrim) ? validDxil(blob) : validSpirv(blob);
+        }
+        if (!ok)
+        {
+            bad++;
+            fmt::println("BAD {}.{}", cols[0], cols[1]);
         }
     }
 
-    // Runtime dumps the map has never seen (e.g. native-video-layer pack-miss
-    // dumps collected after the corpus capture): container-less jobs too.
-    if (!deltasMode)
-    for (auto& file : std::filesystem::directory_iterator(dumpsPath))
+    size_t builtinsOk = 0;
+    for (auto& builtin : Builtins())
     {
-        if (std::filesystem::is_directory(file))
+        const PackEntry* entry = pack.FindBuiltin(builtin.stage, builtin.name);
+        std::vector<uint8_t> dxil, spirv;
+        if (entry != nullptr && pack.Decompress(*entry, BlobKind::kDxil, dxil, &error) &&
+            pack.Decompress(*entry, BlobKind::kSpirv, spirv, &error) && validDxil(dxil) && validSpirv(spirv))
+            builtinsOk++;
+        else
+            bad++;
+    }
+
+    fmt::println("manifest rows looked up: {}, found {}, not in pack set {}, bad {}", looked, found, missing, bad);
+    fmt::println("blobs decompressed and validated: {}, built-ins ok {}/{}", blobsChecked, builtinsOk, Builtins().size());
+    fmt::println("reflection vs old manifest: {} binding lists differ, {} float bitmaps differ", bindingDiffs, bitmapDiffs);
+
+    size_t literalShaders = 0, literals = 0, literalsRead = 0, dynamicFloats = 0;
+    for (auto& entry : pack.entries())
+    {
+        ReflectionView view;
+        if (entry.stage > kPackPS || !ParseReflection(pack.Reflection(entry), view))
             continue;
-        std::string name = file.path().filename().string();
-        size_t marker = name.find(".ucode.bin.");
-        if (name.rfind("shader_", 0) != 0 || marker == std::string::npos)
-            continue;
-
-        PackJob job;
-        job.runtimeHash = name.substr(7, marker - 7);
-        job.isPixelShader = name.compare(name.size() - 5, 5, ".frag") == 0;
-        if (job.runtimeHash.size() != 16 || !mappedHashes.insert(job.runtimeHash).second)
-            continue;
-        jobs.emplace_back(std::move(job));
+        literalShaders += !view.literals.empty();
+        literals += view.literals.size();
+        for (auto& l : view.literals)
+            literalsRead += (l.flags & kLiteralRead) != 0;
+        dynamicFloats += view.header->float_mode;
     }
-
-    size_t containerless = 0;
-    for (auto& job : jobs)
-        containerless += job.container == nullptr;
-    fprintf(stderr, "[pack] %zu shaders to generate (%zu container-less)\n", jobs.size(), containerless); fflush(stderr);
-    std::filesystem::create_directories(outPath);
-
-    std::atomic<uint32_t> progress = 0;
-
-    std::for_each(std::execution::par_unseq, jobs.begin(), jobs.end(), [&](PackJob& job)
-        {
-            try
-            {
-                size_t dumpSize = 0;
-                std::unique_ptr<uint8_t[]> dumpData;
-                std::unique_ptr<uint8_t[]> swapped;
-                const uint32_t* src = nullptr;
-
-                if (deltasMode)
-                {
-                    // Code source = container ucode + recorded bind-time
-                    // patches; byte-identical to the runtime dump the deltas
-                    // were extracted from.
-                    if (job.container == nullptr)
-                        throw std::runtime_error("deltas row without container");
-                    auto c = reinterpret_cast<const ShaderContainer*>(job.container);
-                    auto sh = reinterpret_cast<const Shader*>(job.container + c->shaderOffset);
-                    dumpSize = sh->size;
-                    swapped = std::make_unique<uint8_t[]>(dumpSize);
-                    std::memcpy(swapped.get(), job.container + c->virtualSize + sh->physicalOffset, dumpSize);
-                    auto words = reinterpret_cast<uint32_t*>(swapped.get());
-                    for (auto& [idx, value] : job.patches)
-                    {
-                        if (idx >= dumpSize / sizeof(uint32_t))
-                            throw std::runtime_error("patch index out of range");
-                        words[idx] = value;
-                    }
-                }
-                else
-                {
-                    std::string dumpFile = fmt::format("{}/shader_{}.ucode.bin.{}", dumpsPath, job.runtimeHash,
-                        job.isPixelShader ? "frag" : "vert");
-
-                    dumpData = readAllBytes(dumpFile.c_str(), dumpSize);
-
-                    // Runtime dumps are LE words; the recompiler parses BE.
-                    swapped = std::make_unique<uint8_t[]>(dumpSize);
-                    src = reinterpret_cast<const uint32_t*>(dumpData.get());
-                    auto dst = reinterpret_cast<uint32_t*>(swapped.get());
-                    for (size_t i = 0; i < dumpSize / sizeof(uint32_t); i++)
-                        dst[i] = __builtin_bswap32(src[i]);
-                }
-
-                if (job.container == nullptr)
-                {
-                    const uint32_t exportMask = job.isPixelShader
-                        ? ucodePsExportMask(src, dumpSize / sizeof(uint32_t), false)
-                        : 0;
-                    job.synthetic = buildSyntheticContainer(job.isPixelShader, exportMask);
-                    job.container = job.synthetic.data();
-                }
-                if (job.fingerprint.empty() && src != nullptr)
-                    job.fingerprint = fmt::format("{:016X}",
-                        ucodeFingerprint(src, dumpSize / sizeof(uint32_t), false));
-
-                thread_local ShaderRecompiler recompiler;
-
-                // Pass 1: discover float-constant usage (output discarded).
-                recompiler = {};
-                recompiler.rexglueMode = true;
-                recompiler.rexAbsoluteFloatFile = !job.synthetic.empty();
-                recompiler.rexCodeOverride = swapped.get();
-                recompiler.rexCodeOverrideSize = uint32_t(dumpSize);
-                recompiler.recompile(job.container, include);
-
-                std::set<uint32_t> usedFloats = std::move(recompiler.rexUsedFloatConstants);
-                bool floatsDynamic = recompiler.rexFloatsDynamic;
-
-                {
-                    uint64_t bitmap[4] = {};
-                    if (floatsDynamic)
-                    {
-                        bitmap[0] = bitmap[1] = bitmap[2] = bitmap[3] = ~0ull;
-                    }
-                    else
-                    {
-                        for (uint32_t reg : usedFloats)
-                            bitmap[reg >> 6] |= 1ull << (reg & 63);
-                    }
-                    job.floatBitmap = fmt::format("{:016X}{:016X}{:016X}{:016X}",
-                        bitmap[3], bitmap[2], bitmap[1], bitmap[0]);
-                }
-
-                // Pass 2: final layout. Static-usage shaders read their float
-                // constants at the compacted ranks the runtime uploads;
-                // dynamically-addressed shaders keep the absolute 256-register
-                // layout (the runtime uploads the full file for those).
-                recompiler = {};
-                recompiler.rexglueMode = true;
-                recompiler.rexAbsoluteFloatFile = !job.synthetic.empty();
-                recompiler.rexCodeOverride = swapped.get();
-                recompiler.rexCodeOverrideSize = uint32_t(dumpSize);
-                if (!floatsDynamic && job.synthetic.empty())
-                {
-                    // Absolute layout for static shaders too: the runtime
-                    // forces float_dynamic_addressing (identity uploads)
-                    // whenever native_shaders is enabled, so compacted ranks
-                    // would read the wrong registers.
-                    for (uint32_t reg : usedFloats)
-                        recompiler.rexFloatRank.emplace(reg, reg);
-                }
-                recompiler.recompile(job.container, include);
-
-                job.hlsl = recompiler.out;
-
-                for (auto& binding : recompiler.rexBindings)
-                {
-                    if (!job.bindings.empty())
-                        job.bindings += ';';
-                    job.bindings += fmt::format("{}:{}:{}:{}", binding.isSampler ? 's' : 't',
-                        binding.fetchConstant, binding.dimension, int(binding.isSigned));
-                }
-
-                thread_local DxcCompiler dxcCompiler;
-                IDxcBlob* dxil = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, false);
-                if (dxil != nullptr)
-                {
-                    job.dxil.assign(reinterpret_cast<uint8_t*>(dxil->GetBufferPointer()),
-                        reinterpret_cast<uint8_t*>(dxil->GetBufferPointer()) + dxil->GetBufferSize());
-                    dxil->Release();
-                    job.ok = true;
-
-                    if (IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true))
-                    {
-                        job.spirv.assign(reinterpret_cast<uint8_t*>(spirv->GetBufferPointer()),
-                            reinterpret_cast<uint8_t*>(spirv->GetBufferPointer()) + spirv->GetBufferSize());
-                        spirv->Release();
-                    }
-
-                    // Trimmed variant: only when the trim removes something.
-                    // A trim-compile failure is non-fatal, the
-                    // full-signature dxil above remains the shader.
-                    // Container-less (synthetic) jobs have no interpolator
-                    // table, so trim safety cannot be established, skip.
-                    if (!recompiler.isPixelShader && job.synthetic.empty() &&
-                        (recompiler.rexWrittenOVarMask != 0xFFFFu || !recompiler.rexWroteOPts))
-                    {
-                        job.hlslTrim = trimVsOutputs(recompiler.out,
-                            recompiler.rexWrittenOVarMask, recompiler.rexWroteOPts);
-                        IDxcBlob* dxilTrim = dxcCompiler.compile(job.hlslTrim, false, false, false);
-                        if (dxilTrim != nullptr)
-                        {
-                            job.dxilTrim.assign(reinterpret_cast<uint8_t*>(dxilTrim->GetBufferPointer()),
-                                reinterpret_cast<uint8_t*>(dxilTrim->GetBufferPointer()) + dxilTrim->GetBufferSize());
-                            dxilTrim->Release();
-                            if (IDxcBlob* spirvTrim = dxcCompiler.compile(job.hlslTrim, false, false, true))
-                            {
-                                job.spirvTrim.assign(reinterpret_cast<uint8_t*>(spirvTrim->GetBufferPointer()),
-                                    reinterpret_cast<uint8_t*>(spirvTrim->GetBufferPointer()) + spirvTrim->GetBufferSize());
-                                spirvTrim->Release();
-                            }
-                        }
-                        else
-                        {
-                            job.hlslTrim.clear();
-                        }
-                    }
-                }
-                else
-                {
-                    job.reason = dxcCompiler.lastError.substr(0, dxcCompiler.lastError.find('\n'));
-                }
-            }
-            catch (const std::exception& e)
-            {
-                job.reason = e.what();
-            }
-
-            uint32_t currentProgress = ++progress;
-            if ((currentProgress % 50) == 0)
-                fmt::println("Generating... {}/{}", currentProgress, jobs.size());
-        });
-
-    StringBuffer manifest;
-    manifest.println("runtime_ucode_hash,type,fingerprint,dxil,bindings,float_bitmap,reason");
-
-    uint32_t okCount = 0;
-    std::map<std::string, uint32_t> failures;
-
-    for (auto& job : jobs)
-    {
-        const char* type = job.isPixelShader ? "ps" : "vs";
-        std::string dxilName;
-
-        if (job.ok)
-        {
-            okCount++;
-            dxilName = fmt::format("{}.{}.dxil", job.runtimeHash, type);
-            writeAllBytes(fmt::format("{}/{}", outPath, dxilName).c_str(), job.dxil.data(), job.dxil.size());
-            writeAllBytes(fmt::format("{}/{}.{}.hlsl", outPath, job.runtimeHash, type).c_str(),
-                job.hlsl.data(), job.hlsl.size());
-            if (!job.spirv.empty())
-                writeAllBytes(fmt::format("{}/{}.{}.spirv", outPath, job.runtimeHash, type).c_str(),
-                    job.spirv.data(), job.spirv.size());
-            if (!job.dxilTrim.empty())
-            {
-                writeAllBytes(fmt::format("{}/{}.vst.dxil", outPath, job.runtimeHash).c_str(),
-                    job.dxilTrim.data(), job.dxilTrim.size());
-                writeAllBytes(fmt::format("{}/{}.vst.hlsl", outPath, job.runtimeHash).c_str(),
-                    job.hlslTrim.data(), job.hlslTrim.size());
-                if (!job.spirvTrim.empty())
-                    writeAllBytes(fmt::format("{}/{}.vst.spirv", outPath, job.runtimeHash).c_str(),
-                        job.spirvTrim.data(), job.spirvTrim.size());
-            }
-        }
-        else
-        {
-            failures[job.reason.substr(0, 120)]++;
-        }
-
-        std::string reason = job.reason;
-        for (auto& c : reason)
-        {
-            if (c == ',' || c == '\n' || c == '\r')
-                c = ' ';
-        }
-
-        manifest.println("{},{},{},{},{},{},{}", job.runtimeHash, type, job.fingerprint, dxilName,
-            job.bindings, job.floatBitmap, reason.substr(0, 160));
-    }
-
-    writeAllBytes(fmt::format("{}/manifest.csv", outPath).c_str(), manifest.out.data(), manifest.out.size());
-
-    // Rectangle-list expansion geometry shader. Xenos RECTLIST primitives
-    // carry three corners of a rectangle; hardware derives the 4th vertex by
-    // parallelogram completion of the shader OUTPUTS. Every rexglue native
-    // VS/PS pair uses the same interpolator signature (SV_Position + 16
-    // float4 TEXCOORDs), so one geometry shader serves every pipeline; the
-    // runtime attaches it to RECTLIST draws.
-    {
-        static const char RECT_GS[] = R"(
-struct XeRectVertex
-{
-    float4 pos : SV_Position;
-    float4 var[16] : TEXCOORD0;
-};
-
-[maxvertexcount(4)]
-void main(triangle XeRectVertex v[3], inout TriangleStream<XeRectVertex> stream)
-{
-    // The right-angle corner is the vertex not on the longest (hypotenuse)
-    // edge; the 4th vertex mirrors it across the hypotenuse midpoint:
-    // v3 = hypA + hypB - corner, for position and every interpolator.
-    float2 p0 = v[0].pos.xy / v[0].pos.w;
-    float2 p1 = v[1].pos.xy / v[1].pos.w;
-    float2 p2 = v[2].pos.xy / v[2].pos.w;
-    float2 e01 = p1 - p0;
-    float2 e02 = p2 - p0;
-    float2 e12 = p2 - p1;
-    float d01 = dot(e01, e01);
-    float d02 = dot(e02, e02);
-    float d12 = dot(e12, e12);
-    uint corner, hypA, hypB;
-    if (d01 >= d02 && d01 >= d12) { corner = 2; hypA = 0; hypB = 1; }
-    else if (d02 >= d12)          { corner = 1; hypA = 0; hypB = 2; }
-    else                          { corner = 0; hypA = 1; hypB = 2; }
-
-    XeRectVertex v3;
-    v3.pos = v[hypA].pos + v[hypB].pos - v[corner].pos;
-    [unroll]
-    for (uint i = 0; i < 16; i++)
-        v3.var[i] = v[hypA].var[i] + v[hypB].var[i] - v[corner].var[i];
-
-    // Strip (corner, hypA, hypB, v3) = the original triangle plus the
-    // mirrored half. Rectangles are never culled on Xenos; the runtime
-    // disables culling on rect pipelines, so winding does not matter.
-    stream.Append(v[corner]);
-    stream.Append(v[hypA]);
-    stream.Append(v[hypB]);
-    stream.Append(v3);
-}
-)";
-        DxcCompiler gsCompiler;
-        IDxcBlob* gs = gsCompiler.compile(RECT_GS, false, false, false, L"-T gs_6_0");
-        if (gs != nullptr)
-        {
-            writeAllBytes(fmt::format("{}/rect_expand.gs.dxil", outPath).c_str(),
-                gs->GetBufferPointer(), gs->GetBufferSize());
-            gs->Release();
-        }
-        else
-        {
-            fmt::println("rect_expand GS compile failed: {}", gsCompiler.lastError);
-        }
-        if (IDxcBlob* gsv = gsCompiler.compile(RECT_GS, false, false, true, L"-T gs_6_0"))
-        {
-            writeAllBytes(fmt::format("{}/rect_expand.gs.spirv", outPath).c_str(),
-                gsv->GetBufferPointer(), gsv->GetBufferSize());
-            gsv->Release();
-        }
-        else
-        {
-            fmt::println("rect_expand GS spirv compile failed: {}", gsCompiler.lastError);
-        }
-    }
-
-    // User-clip-plane geometry shader. Xenos clips against up to 6 planes
-    // (PA_CL_UCP, programmed by D3DDevice_SetClipPlane) by dotting the RAW
-    // clip-space position with each plane. The pack VS applies the b0
-    // ndc_scale/ndc_offset affine to its output position, so the RUNTIME
-    // pre-transforms the planes by that affine's inverse-transpose before
-    // writing them to b0 c2..c7 (xe_user_clip_planes), this GS is then a
-    // pure passthrough that emits the six dots as SV_ClipDistance. Disabled
-    // plane slots are zero: dot = 0, and D3D only clips distances < 0.
-    // Attached by the runtime only when the PA_CL_CLIP_CNTL UCP mask is
-    // nonzero (and no rect/point expansion GS is needed).
-    {
-        static const char CLIP_GS[] = R"(
-#ifdef __spirv__
-struct XePushConstants { uint64_t System; uint64_t FloatsVs; uint64_t FloatsPs; uint64_t BoolLoop; uint64_t Fetch; uint64_t IdxVs; uint64_t IdxPs; uint64_t SharedMem; };
-[[vk::push_constant]] ConstantBuffer<XePushConstants> xe_push;
-#define XE_UCP(i) vk::RawBufferLoad<float4>(xe_push.System + 32 + (i) * 16, 4)
-#else
-cbuffer xe_system_cbuffer : register(b0, space0)
-{
-    float4 xe_user_clip_planes[6] : packoffset(c2);
-};
-#define XE_UCP(i) xe_user_clip_planes[i]
-#endif
-
-struct XeClipVertexIn
-{
-    float4 pos : SV_Position;
-    float4 var[16] : TEXCOORD0;
-};
-
-struct XeClipVertexOut
-{
-    float4 pos : SV_Position;
-    float4 var[16] : TEXCOORD0;
-    float4 clip03 : SV_ClipDistance0;
-    float2 clip45 : SV_ClipDistance1;
-};
-
-[maxvertexcount(3)]
-void main(triangle XeClipVertexIn v[3], inout TriangleStream<XeClipVertexOut> stream)
-{
-    [unroll]
-    for (uint i = 0; i < 3; i++)
-    {
-        XeClipVertexOut o;
-        o.pos = v[i].pos;
-        [unroll]
-        for (uint j = 0; j < 16; j++)
-            o.var[j] = v[i].var[j];
-        o.clip03 = float4(dot(v[i].pos, XE_UCP(0)),
-                          dot(v[i].pos, XE_UCP(1)),
-                          dot(v[i].pos, XE_UCP(2)),
-                          dot(v[i].pos, XE_UCP(3)));
-        o.clip45 = float2(dot(v[i].pos, XE_UCP(4)),
-                          dot(v[i].pos, XE_UCP(5)));
-        stream.Append(o);
-    }
-}
-)";
-        DxcCompiler gsCompiler;
-        IDxcBlob* gs = gsCompiler.compile(CLIP_GS, false, false, false, L"-T gs_6_0");
-        if (gs != nullptr)
-        {
-            writeAllBytes(fmt::format("{}/clip_planes.gs.dxil", outPath).c_str(),
-                gs->GetBufferPointer(), gs->GetBufferSize());
-            gs->Release();
-        }
-        else
-        {
-            fmt::println("clip_planes GS compile failed: {}", gsCompiler.lastError);
-        }
-        if (IDxcBlob* gsv = gsCompiler.compile(CLIP_GS, false, false, true, L"-T gs_6_0"))
-        {
-            writeAllBytes(fmt::format("{}/clip_planes.gs.spirv", outPath).c_str(),
-                gsv->GetBufferPointer(), gsv->GetBufferSize());
-            gsv->Release();
-        }
-        else
-        {
-            fmt::println("clip_planes GS spirv compile failed: {}", gsCompiler.lastError);
-        }
-    }
-
-    // Point-sprite expansion geometry shader. Xenos POINTLIST draws expand
-    // each point into a screen-aligned square sized by the VS point-size
-    // export (register 63 -> the pack-wide oPts : TEXCOORD16 output, size in
-    // pixels). Interpolators are copied flat (the sprite-light pixel shaders
-    // key off SV_Position + per-light interpolators, not sprite UVs). The
-    // pixel->NDC conversion reuses the system CB's half-pixel offsets
-    // (c9.xy = ±1/viewport), whose magnitude is exactly 1 px in NDC/2.
-    {
-        static const char POINT_GS[] = R"(
-#ifdef __spirv__
-struct XePushConstants { uint64_t System; uint64_t FloatsVs; uint64_t FloatsPs; uint64_t BoolLoop; uint64_t Fetch; uint64_t IdxVs; uint64_t IdxPs; uint64_t SharedMem; };
-[[vk::push_constant]] ConstantBuffer<XePushConstants> xe_push;
-#define XE_SYS(i) vk::RawBufferLoad<float4>(xe_push.System + (i) * 16, 4)
-#else
-cbuffer XeSystemCb : register(b0, space0)
-{
-    float4 xe_sys[16];
-};
-#define XE_SYS(i) xe_sys[i]
-#endif
-
-struct XePointVertex
-{
-    float4 pos : SV_Position;
-    float4 var[16] : TEXCOORD0;
-    float4 pts : TEXCOORD16;
-};
-
-[maxvertexcount(4)]
-void main(point XePointVertex v[1], inout TriangleStream<XePointVertex> stream)
-{
-    // oPts.x = vertex point diameter in pixels, clamped to PA_SU_POINT_MINMAX
-    // (c10.zw); a VS that does not export a size leaves oPts at 0 and the
-    // PA_SU_POINT_SIZE constant diameters (c10.xy) apply instead, mirroring
-    // the ring backend's vertex-vs-constant point size selection. Half-extent
-    // in NDC (pre-divide clip units need the *w) = (size/2) * (2/viewport)
-    // = size * |c9.xy|.
-    float2 size_px;
-    if (v[0].pts.x > 0.0)
-        size_px = clamp(v[0].pts.x, XE_SYS(10).z, XE_SYS(10).w).xx;
-    else
-        size_px = XE_SYS(10).xy;
-    float2 half_ndc = size_px * abs(XE_SYS(9).xy);
-    float2 corners[4] = { float2(-1.0, -1.0), float2(1.0, -1.0),
-                          float2(-1.0, 1.0),  float2(1.0, 1.0) };
-    [unroll]
-    for (uint i = 0; i < 4; i++)
-    {
-        XePointVertex o = v[0];
-        o.pos.xy += corners[i] * half_ndc * v[0].pos.w;
-        stream.Append(o);
-    }
-}
-)";
-        DxcCompiler gsCompiler;
-        IDxcBlob* gs = gsCompiler.compile(POINT_GS, false, false, false, L"-T gs_6_0");
-        if (gs != nullptr)
-        {
-            writeAllBytes(fmt::format("{}/point_expand.gs.dxil", outPath).c_str(),
-                gs->GetBufferPointer(), gs->GetBufferSize());
-            gs->Release();
-        }
-        else
-        {
-            fmt::println("point_expand GS compile failed: {}", gsCompiler.lastError);
-        }
-        if (IDxcBlob* gsv = gsCompiler.compile(POINT_GS, false, false, true, L"-T gs_6_0"))
-        {
-            writeAllBytes(fmt::format("{}/point_expand.gs.spirv", outPath).c_str(),
-                gsv->GetBufferPointer(), gsv->GetBufferSize());
-            gsv->Release();
-        }
-        else
-        {
-            fmt::println("point_expand GS spirv compile failed: {}", gsCompiler.lastError);
-        }
-    }
-
-    // Fullscreen blit pair (frontbuffer-texture -> swapchain composite in the
-    // native video layer's Swap). Standalone shaders that only declare the
-    // slices of the rexglue root signature they use: b4 descriptor indices,
-    // bindless 2D textures (t0 space1), bindless samplers (s0 space0).
-    {
-        static const char BLIT_VS[] = R"(
-void main(in uint vid : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD0)
-{
-    // Fullscreen triangle.
-    uv = float2((vid << 1) & 2, vid & 2);
-    pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
-}
-)";
-        static const char BLIT_PS[] = R"(
-#ifdef __spirv__
-struct XePushConstants { uint64_t System; uint64_t FloatsVs; uint64_t FloatsPs; uint64_t BoolLoop; uint64_t Fetch; uint64_t IdxVs; uint64_t IdxPs; uint64_t SharedMem; };
-[[vk::push_constant]] ConstantBuffer<XePushConstants> xe_push;
-#define XE_IDX(i) vk::RawBufferLoad<uint>(xe_push.IdxPs + (i) * 4)
-#else
-cbuffer XeDescriptorIndices : register(b4, space0)
-{
-    uint4 xe_descriptor_indices[8];
-};
-#define XE_IDX(i) (xe_descriptor_indices[(i) >> 2][(i) & 3])
-#endif
-// Texture2DArray to match the runtime's forced 2D-array SRVs (the pack-wide
-// xe_textures_2d contract), a plain Texture2D declaration over an array
-// descriptor is undefined in D3D12.
-Texture2DArray<float4> xe_textures2d[] : register(t0, space1);
-SamplerState xe_samplers[] : register(s0, space0);
-
-void main(in float4 pos : SV_Position, in float2 uv : TEXCOORD0, out float4 color : SV_Target0)
-{
-    color = xe_textures2d[XE_IDX(0)]
-        .SampleLevel(xe_samplers[0], float3(uv, 0.0), 0.0);
-    // Display gamma ramp (D3DDevice_SetGammaRamp / DC_LUT emulation): b4
-    // [0].y carries a 256x3 R16_UNORM LUT descriptor (rows = R,G,B curves),
-    // 0 = identity/no ramp. The ring backend applies the guest ramp in its
-    // present pass (apply_gamma); without it the native output misses the
-    // game's display contrast curve.
-    uint lut = XE_IDX(1);
-    if (lut != 0)
-    {
-        uint3 idx = uint3(saturate(color.rgb) * 255.0 + 0.5);
-        color.r = xe_textures2d[(lut)].Load(int4(idx.r, 0, 0, 0)).x;
-        color.g = xe_textures2d[(lut)].Load(int4(idx.g, 1, 0, 0)).x;
-        color.b = xe_textures2d[(lut)].Load(int4(idx.b, 2, 0, 0)).x;
-    }
-    // Optional user warmth grade (b4 [0].z = strength float as bits, 0 = off):
-    // a present-time warm push toward the 360 look. Preserves luma roughly by
-    // trading blue for red/green rather than scaling up.
-    uint warmthBits = XE_IDX(2);
-    if (warmthBits != 0)
-    {
-        float w = asfloat(warmthBits);
-        color.rgb *= lerp(float3(1.0, 1.0, 1.0), float3(1.12, 1.06, 0.82), saturate(w));
-        if (w > 1.0)
-            color.rgb *= lerp(float3(1.0, 1.0, 1.0), float3(1.12, 1.06, 0.82), saturate(w - 1.0));
-    }
-    color.a = 1.0;
-}
-)";
-        DxcCompiler blitCompiler;
-        IDxcBlob *vs = blitCompiler.compile(BLIT_VS, false, false, false);
-        IDxcBlob *ps = vs != nullptr ? blitCompiler.compile(BLIT_PS, true, false, false) : nullptr;
-        if (vs != nullptr && ps != nullptr)
-        {
-            writeAllBytes(fmt::format("{}/blit.vs.dxil", outPath).c_str(), vs->GetBufferPointer(), vs->GetBufferSize());
-            writeAllBytes(fmt::format("{}/blit.ps.dxil", outPath).c_str(), ps->GetBufferPointer(), ps->GetBufferSize());
-            if (IDxcBlob* vsv = blitCompiler.compile(BLIT_VS, false, false, true))
-            {
-                writeAllBytes(fmt::format("{}/blit.vs.spirv", outPath).c_str(), vsv->GetBufferPointer(), vsv->GetBufferSize());
-                vsv->Release();
-            }
-            if (IDxcBlob* psv = blitCompiler.compile(BLIT_PS, true, false, true))
-            {
-                writeAllBytes(fmt::format("{}/blit.ps.spirv", outPath).c_str(), psv->GetBufferPointer(), psv->GetBufferSize());
-                psv->Release();
-            }
-        }
-        else
-        {
-            fmt::println("blit shader compile failed: {}", blitCompiler.lastError);
-        }
-        if (vs != nullptr) vs->Release();
-        if (ps != nullptr) ps->Release();
-    }
-
-    fmt::println("");
-    fmt::println("=== rexglue pack ===");
-    fmt::println("generated: {}/{}", okCount, jobs.size());
-    for (auto& [reason, count] : failures)
-        fmt::println("  {:4d}  {}", count, reason);
-    fmt::println("pack: {}", outPath);
-    return okCount == jobs.size() ? 0 : 1;
+    fmt::println("def literals: {} in {} shaders, {} read by the shader; {} shaders with a dynamic float file",
+        literals, literalShaders, literalsRead, dynamicFloats);
+    return bad == 0 && found != 0 ? 0 : 1;
 }
 
 int main(int argc, char** argv)
@@ -1243,13 +1291,12 @@ int main(int argc, char** argv)
             std::string_view(reinterpret_cast<const char*>(includeData.get()), includeSize));
     }
 
-    // Fingerprint raw runtime ucode dumps (rexglue --dump_shaders *.ucode.bin.*,
-    // LE words): emits "name,ucode_hash,fingerprint" CSV for matching against
-    // the coverage report's fingerprint column.
+    // Fingerprints raw runtime ucode dumps (LE words) into "name,runtime_ucode_hash,fingerprint,fp2" rows.
+    // fp2 is the pack key, fingerprint the v1 hash of the coverage report.
     if (argc >= 4 && strcmp(argv[1], "--fingerprint") == 0)
     {
         StringBuffer csv;
-        csv.println("name,runtime_ucode_hash,fingerprint");
+        csv.println("name,runtime_ucode_hash,fingerprint,fp2");
 
         for (auto& file : std::filesystem::recursive_directory_iterator(argv[2]))
         {
@@ -1269,7 +1316,10 @@ int main(int argc, char** argv)
             uint64_t fingerprint = ucodeFingerprint(
                 reinterpret_cast<const uint32_t*>(fileData.get()), fileSize / sizeof(uint32_t), false);
 
-            csv.println("{},{:016X},{:016X}", name, hash, fingerprint);
+            uint64_t fp2 = ucodeFingerprint2(
+                reinterpret_cast<const uint32_t*>(fileData.get()), fileSize / sizeof(uint32_t), false);
+
+            csv.println("{},{:016X},{:016X},{:016X}", name, hash, fingerprint, fp2);
         }
 
         writeAllBytes(argv[3], csv.out.data(), csv.out.size());
@@ -1290,35 +1340,54 @@ int main(int argc, char** argv)
         }
     }
 
-    if (argc >= 6 && strcmp(argv[1], "--rexglue-pack-deltas") == 0)
+    if (argc >= 5 && strcmp(argv[1], "--cc2-pack") == 0)
     {
         try
         {
-            size_t includeSize = 0;
-            auto includeData = readAllBytes(argv[5], includeSize);
-            return runRexgluePack(argv[2], nullptr, argv[3], argv[4],
-                std::string_view(reinterpret_cast<const char*>(includeData.get()), includeSize), true);
+            return runCc2Pack(argv[2], argv[3], argv[4]);
         }
         catch (const std::exception& e)
         {
-            fprintf(stderr, "rexglue-pack-deltas failed: %s\n", e.what());
+            fprintf(stderr, "cc2-pack failed: %s\n", e.what());
             return 1;
         }
     }
 
-    if (argc >= 7 && strcmp(argv[1], "--rexglue-pack") == 0)
+    if (argc >= 5 && strcmp(argv[1], "--add-misses") == 0)
     {
         try
         {
-            size_t includeSize = 0;
-            auto includeData = readAllBytes(argv[6], includeSize);
-            return runRexgluePack(argv[2], argv[3], argv[4], argv[5],
-                std::string_view(reinterpret_cast<const char*>(includeData.get()), includeSize));
+            return runAddMisses(argv[2], argv[3], argv[4]);
         }
         catch (const std::exception& e)
         {
-            fprintf(stderr, "rexglue-pack failed: %s\n", e.what());
-            fflush(stderr);
+            fprintf(stderr, "add-misses failed: %s\n", e.what());
+            return 1;
+        }
+    }
+
+    if (argc >= 5 && strcmp(argv[1], "--translate") == 0)
+    {
+        try
+        {
+            return runTranslateOne(argv[2], argv[3], argv[4], !(argc >= 6 && strcmp(argv[5], "nocontainer") == 0));
+        }
+        catch (const std::exception& e)
+        {
+            fprintf(stderr, "translate failed: %s\n", e.what());
+            return 1;
+        }
+    }
+
+    if (argc >= 4 && strcmp(argv[1], "--pack-check") == 0)
+    {
+        try
+        {
+            return runPackCheck(argv[2], argv[3], argc >= 5 ? strtoull(argv[4], nullptr, 10) : 0);
+        }
+        catch (const std::exception& e)
+        {
+            fprintf(stderr, "pack-check failed: %s\n", e.what());
             return 1;
         }
     }
@@ -1405,8 +1474,11 @@ int main(int argc, char** argv)
 #ifndef XENOS_RECOMP_INPUT
     if (argc < 4)
     {
-        printf("Usage: XenosRecomp [input path] [output path] [shader common header file path]\n"
-               "       XenosRecomp --coverage [input path] [report csv path] [shader common header file path]");
+        printf("Usage: XenosRecomp [input path] [output path] [shader common header file path] [optional: HLSL dump dir]\n"
+               "       XenosRecomp --coverage [input path] [report csv path] [shader common header file path]\n"
+               "       XenosRecomp --cc2-pack [corpus] [map csv] [out .pack]\n"
+               "       XenosRecomp --add-misses [corpus] [misses dir] [map csv]\n"
+               "       XenosRecomp --pack-check [.pack] [manifest csv] [optional: row count]\n");
         return 0;
     }
 #endif
@@ -1435,6 +1507,12 @@ int main(int argc, char** argv)
 #endif
         ;
 
+    std::string hlslDumpDir;
+    if (argc > 4)
+        hlslDumpDir = argv[4];
+    else if (const char* env = std::getenv("XENOS_RECOMP_HLSL_DUMP"))
+        hlslDumpDir = env;
+
     size_t includeSize = 0;
     auto includeData = readAllBytes(includeInput, includeSize);
     std::string_view include(reinterpret_cast<const char*>(includeData.get()), includeSize);
@@ -1454,6 +1532,7 @@ int main(int argc, char** argv)
             size_t fileSize = 0;
             auto fileData = readAllBytes(file.path().string().c_str(), fileSize);
             bool foundAny = false;
+            int containerIndex = 0;
 
             for (size_t i = 0; fileSize > sizeof(ShaderContainer) && i < fileSize - sizeof(ShaderContainer) - 1;)
             {
@@ -1470,9 +1549,14 @@ int main(int argc, char** argv)
                     if (shader.second)
                     {
                         shader.first->second.data = fileData.get() + i;
+                        std::string stem = file.path().stem().string();
+                        if (containerIndex > 0)
+                            stem += fmt::format(".{}", containerIndex);
+                        shader.first->second.sourceName = std::move(stem);
                         foundAny = true;
                     }
 
+                    ++containerIndex;
                     i += dataSize;
                 }
                 else
@@ -1485,31 +1569,82 @@ int main(int argc, char** argv)
                 files.emplace_back(std::move(fileData));
         }
 
+        if (!hlslDumpDir.empty())
+            std::filesystem::create_directories(hlslDumpDir);
+
         std::atomic<uint32_t> progress = 0;
 
         std::for_each(std::execution::par_unseq, shaders.begin(), shaders.end(), [&](auto& hashShaderPair)
             {
                 auto& shader = hashShaderPair.second;
+                const XXH64_hash_t hash = hashShaderPair.first;
+
+                auto recordFailure = [hash](std::string reason)
+                {
+                    std::lock_guard<std::mutex> lock(g_failureMutex);
+                    g_failures.push_back({hash, std::move(reason)});
+                };
 
                 thread_local ShaderRecompiler recompiler;
                 recompiler = {};
-                recompiler.recompile(shader.data, include);
+                try
+                {
+                    recompiler.recompile(shader.data, include);
+                }
+                catch (const std::exception& e)
+                {
+                    // Unsupported ops throw with their name; report them with the other failures.
+                    recordFailure(e.what());
+                    return;
+                }
 
                 shader.specConstantsMask = recompiler.specConstantsMask;
+
+                if (!hlslDumpDir.empty())
+                {
+                    auto path = std::filesystem::path(hlslDumpDir) /
+                        (shader.sourceName.empty()
+                            ? fmt::format("{}_{:016X}", recompiler.isPixelShader ? "ps" : "vs", hash)
+                            : shader.sourceName);
+                    path += ".hlsl";
+
+                    std::string contents = fmt::format(
+                        "// {} shader  hash=0x{:016X}  specConstants=0x{:X}\n",
+                        recompiler.isPixelShader ? "pixel" : "vertex",
+                        hash, recompiler.specConstantsMask);
+                    contents.append(recompiler.out);
+                    writeAllBytes(path.string().c_str(), contents.data(), contents.size());
+                }
 
                 thread_local DxcCompiler dxcCompiler;
 
 #ifdef XENOS_RECOMP_DXIL
                 shader.dxil = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, recompiler.specConstantsMask != 0, false);
-                assert(shader.dxil != nullptr);
-                assert(*(reinterpret_cast<uint32_t *>(shader.dxil->GetBufferPointer()) + 1) != 0 && "DXIL was not signed properly!");
+                if (shader.dxil == nullptr)
+                {
+                    recordFailure("dxc-dxil-compile-failed");
+                    return;
+                }
+                if (*(reinterpret_cast<uint32_t*>(shader.dxil->GetBufferPointer()) + 1) == 0)
+                {
+                    recordFailure("dxil-not-signed");
+                    return;
+                }
 #endif
 
                 IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);
-                assert(spirv != nullptr);
+                if (spirv == nullptr)
+                {
+                    recordFailure("dxc-spirv-compile-failed");
+                    return;
+                }
 
-                bool result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo);
-                assert(result);
+                if (!smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo))
+                {
+                    spirv->Release();
+                    recordFailure("smolv-encode-failed");
+                    return;
+                }
 
                 spirv->Release();
 
@@ -1518,10 +1653,22 @@ int main(int argc, char** argv)
                     fmt::println("Recompiling shaders... {}%", currentProgress / float(shaders.size()) * 100.0f);
             });
 
+        if (!g_failures.empty())
+        {
+            fmt::println(stderr, "Recompile failures ({}):", g_failures.size());
+            for (const auto& failure : g_failures)
+                fmt::println(stderr, "  hash=0x{:016X} reason={}", failure.hash, failure.reason);
+            return 2;
+        }
+
         fmt::println("Creating shader cache...");
 
         StringBuffer f;
+#ifdef REBLUE_RECOMP
+        f.println("#include \"gpu/shaders/shader_cache.h\"");
+#else
         f.println("#include \"shader_cache.h\"");
+#endif
         f.println("ShaderCacheEntry g_shaderCacheEntries[] = {{");
 
         std::vector<uint8_t> dxil;

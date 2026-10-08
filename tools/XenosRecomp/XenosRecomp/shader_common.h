@@ -10,7 +10,23 @@
     #define SPEC_CONSTANT_REVERSE_Z         (1 << 4)
 #endif
 
-#if !defined(__cplusplus) || defined(__INTELLISENSE__)
+// SPIR-V vertex input locations, shared with reblue's host input-layout
+// builder. A semantic missing here gets no location from the emitter.
+#define REBLUE_VERTEX_INPUT_LOCATIONS(X) \
+    X(Position,  0,  0) \
+    X(Position,  1,  1) \
+    X(Position,  2,  2) \
+    X(Position,  3,  3) \
+    X(Position,  4,  4) \
+    X(Normal,    0,  5) \
+    X(Tangent,   0,  6) \
+    X(TexCoord,  0,  7) \
+    X(TexCoord,  1,  8) \
+    X(TexCoord,  2,  9) \
+    X(Color,     0, 10)
+
+// SPEC_CONSTANTS_ONLY keeps the HLSL below out of host C++ TUs, which IntelliSense would otherwise parse.
+#if (!defined(__cplusplus) || defined(__INTELLISENSE__)) && !defined(SHADER_COMMON_SPEC_CONSTANTS_ONLY)
 
 #define FLT_MIN asfloat(0xff7fffff)
 #define FLT_MAX asfloat(0x7f7fffff)
@@ -26,10 +42,25 @@ struct PushConstants
 
 [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
 
+#ifdef REBLUE_RECOMP
+// 256-bit boolean register file (BD bool addresses reach ~158), then per-usage 16-bit-pair swap masks.
+#define g_Booleans(i)              vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256 + (i)*4)
+#define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 288)
+#define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 292)
+#define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 300)
+#define g_SwappedNormals           vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 304)
+#define g_SwappedBinormals         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 308)
+#define g_SwappedTangents          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 312)
+#define g_SwappedBlendWeights      vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 316)
+#define g_SwappedPositions         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 320)
+#define g_SintTexcoords            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 324)
+#define g_ShadowPcfScale           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 328)
+#else
 #define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
 #define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
 #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
 #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
+#endif
 
 [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
 
@@ -37,14 +68,36 @@ struct PushConstants
 
 #else
 
+#ifdef REBLUE_RECOMP
+#define DEFINE_SHARED_CONSTANTS() \
+    uint4 g_BooleansArr[2] : packoffset(c16); \
+    uint g_SwappedTexcoords : packoffset(c18.x); \
+    float2 g_HalfPixelOffset : packoffset(c18.y); \
+    float g_AlphaThreshold : packoffset(c18.w); \
+    uint g_SwappedNormals : packoffset(c19.x); \
+    uint g_SwappedBinormals : packoffset(c19.y); \
+    uint g_SwappedTangents : packoffset(c19.z); \
+    uint g_SwappedBlendWeights : packoffset(c19.w); \
+    uint g_SwappedPositions : packoffset(c20.x); \
+    uint g_SintTexcoords : packoffset(c20.y); \
+    float g_ShadowPcfScale : packoffset(c20.z);
+
+#define g_Booleans(i) (g_BooleansArr[(i) / 4][(i) % 4])
+#else
 #define DEFINE_SHARED_CONSTANTS() \
     uint g_Booleans : packoffset(c16.x); \
     uint g_SwappedTexcoords : packoffset(c16.y); \
     float2 g_HalfPixelOffset : packoffset(c16.z); \
     float g_AlphaThreshold : packoffset(c17.x);
+#endif
 
 uint g_SpecConstants();
 
+#endif
+
+#ifdef REBLUE_RECOMP
+// Test Xenos boolean register N in the unified VS(0..127)/PS(128..255) file.
+#define BOOL_BIT(n) ((g_Booleans((n) / 32u) & (1u << ((n) & 31u))) != 0)
 #endif
 
 Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
@@ -70,6 +123,26 @@ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, f
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
     return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DDimensions(texture) + offset - 0.5));
 }
+
+#ifdef REBLUE_RECOMP
+// Bilinear-filtered shadow compare over the four neighboring depth texels.
+float shadowCmp2D(uint resourceDescriptorIndex, float2 texCoord, float ref)
+{
+    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+    int2 dimensions = int2(getTexture2DDimensions(texture));
+    float2 coord = texCoord * dimensions - 0.5;
+    float2 weights = frac(coord);
+    int2 base = int2(floor(coord));
+    int2 c0 = clamp(base, int2(0, 0), dimensions - 1);
+    int2 c1 = clamp(base + 1, int2(0, 0), dimensions - 1);
+    float4 taps = float4(
+        texture.Load(int3(c0, 0)).x,
+        texture.Load(int3(c1.x, c0.y, 0)).x,
+        texture.Load(int3(c0.x, c1.y, 0)).x,
+        texture.Load(int3(c1, 0)).x) > ref;
+    return lerp(lerp(taps.x, taps.y, weights.x), lerp(taps.z, taps.w, weights.x), weights.y);
+}
+#endif
 
 float w0(float a)
 {
@@ -150,7 +223,14 @@ float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float
 
 struct CubeMapData
 {
+	#ifdef REBLUE_RECOMP
+    // BD's cube-shadow PCF issues up to 9 cube ops per shader (bd_mirror_cs_ps /
+    // bd_glass_cs_ps); overflowing this array drops the stored directions and
+    // every tfetchCube reads OOB -> point-light shadows vanish.
+    float3 cubeMapDirections[9];
+    #else
     float3 cubeMapDirections[2];
+    #endif
     uint cubeMapIndex;
 };
 
@@ -159,6 +239,136 @@ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, flo
     return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
 }
 
+// LOD-controlled variants (no fetch constants in this ABI, so only the instruction bias and register LOD apply).
+// _lod0 is the base map level, _level an explicit LOD, _bias a computed LOD plus bias, _grad register gradients.
+float4 tfetch2D_lod0(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+{
+    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), 0.0);
+}
+
+float4 tfetch2D_level(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lod)
+{
+    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), lod);
+}
+
+float4 tfetch2D_bias(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float bias)
+{
+    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+    return texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), bias);
+}
+
+float4 tfetch2D_grad(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float bias,
+                     float3 gradH, float3 gradV)
+{
+    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+    float scale = exp2(bias);
+    return texture.SampleGrad(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture),
+        gradH.xy * scale, gradV.xy * scale);
+}
+
+float4 tfetch3D_lod0(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
+{
+    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord, 0.0);
+}
+
+float4 tfetch3D_level(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float lod)
+{
+    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord, lod);
+}
+
+float4 tfetch3D_bias(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float bias)
+{
+    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord, bias);
+}
+
+float4 tfetch3D_grad(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float bias, float3 gradH, float3 gradV)
+{
+    float scale = exp2(bias);
+    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SampleGrad(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord,
+        gradH * scale, gradV * scale);
+}
+
+float4 getCompTexLOD2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord)
+{
+    return float4(g_Texture2DDescriptorHeap[resourceDescriptorIndex].CalculateLevelOfDetailUnclamped(
+        g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord), 0.0, 0.0, 0.0);
+}
+
+float4 getCompTexLOD3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
+{
+    return float4(g_Texture3DDescriptorHeap[resourceDescriptorIndex].CalculateLevelOfDetailUnclamped(
+        g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord), 0.0, 0.0, 0.0);
+}
+
+float4 tfetchCube_lod0(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
+{
+    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex],
+        cubeMapData.cubeMapDirections[texCoord.z], 0.0);
+}
+
+float4 tfetchCube_level(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData,
+                        float lod)
+{
+    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex],
+        cubeMapData.cubeMapDirections[texCoord.z], lod);
+}
+
+float4 tfetchCube_bias(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData,
+                       float bias)
+{
+    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex],
+        cubeMapData.cubeMapDirections[texCoord.z], bias);
+}
+
+float4 tfetchCube_grad(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData,
+                       float bias, float3 gradH, float3 gradV)
+{
+    float scale = exp2(bias);
+    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleGrad(g_SamplerDescriptorHeap[samplerDescriptorIndex],
+        cubeMapData.cubeMapDirections[texCoord.z], gradH * scale, gradV * scale);
+}
+
+float4 getCompTexLODCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
+{
+    return float4(g_TextureCubeDescriptorHeap[resourceDescriptorIndex].CalculateLevelOfDetailUnclamped(
+        g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]), 0.0, 0.0, 0.0);
+}
+
+#ifdef REBLUE_RECOMP
+// DEC3N normal decode; IA binds as R32_UINT so lane .x carries the raw bits (asuint recovers them).
+float4 tfetchR11G11B10(float4 value)
+{
+    if (g_SpecConstants() & SPEC_CONSTANT_R11G11B10_NORMAL)
+    {
+        uint v = asuint(value.x);
+        return float4(
+            (v & 0x00000400 ? -1.0 : 0.0) + ((v & 0x3FF) / 1024.0),
+            (v & 0x00200000 ? -1.0 : 0.0) + (((v >> 11) & 0x3FF) / 1024.0),
+            (v & 0x80000000 ? -1.0 : 0.0) + (((v >> 22) & 0x1FF) / 512.0),
+            0.0);
+    }
+    return value;
+}
+
+// Undo the engine bswap32 16-bit-pair swap (.yxwz) for any 16-bit-packed semantic flagged in the mask.
+float4 swapFloats(uint swappedMask, float4 value, uint semanticIndex)
+{
+    return (swappedMask & (1u << semanticIndex)) != 0 ? value.yxwz : value;
+}
+
+// Recover X360 integer-cast-to-float TEXCOORDs from R16G16(B16A16)_UINT bindings (sign-extend low 16 bits).
+float4 sintTexcoord(uint mask, float4 value, uint semanticIndex)
+{
+    if ((mask & (1u << semanticIndex)) != 0)
+    {
+        int4 si = (int4(asuint(value)) << 16) >> 16;
+        return float4(si);
+    }
+    return value;
+}
+#else
 float4 tfetchR11G11B10(uint4 value)
 {
     if (g_SpecConstants() & SPEC_CONSTANT_R11G11B10_NORMAL)
@@ -179,6 +389,7 @@ float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
 {
     return (swappedTexcoords & (1ull << semanticIndex)) != 0 ? value.yxwz : value;
 }
+#endif
 
 float4 cube(float4 value, inout CubeMapData cubeMapData)
 {
@@ -189,19 +400,63 @@ float4 cube(float4 value, inout CubeMapData cubeMapData)
     return float4(0.0, 0.0, 0.0, index);
 }
 
+// Xenos multiply: a +-0 or denormal factor gives +0 whatever the other one is, inf and NaN
+// included (dxbc_translator_alu.cpp:85). The recompiler skips it when both operands are identical.
+#define XE_FLT_MIN_NORMAL 1.17549435e-38
+
+template<typename T> T xe_mul(T a, T b)
+{
+    return select(or(abs(a) < XE_FLT_MIN_NORMAL, abs(b) < XE_FLT_MIN_NORMAL), (T)0.0, a * b);
+}
+
+// Dot products apply the rule per product and add in order, as dp4/dp3/dp2add do on Xenos.
+float xe_dot(float2 a, float2 b)
+{
+    float2 p = xe_mul(a, b);
+    return p.x + p.y;
+}
+
+float xe_dot(float3 a, float3 b)
+{
+    float3 p = xe_mul(a, b);
+    return (p.x + p.y) + p.z;
+}
+
+float xe_dot(float4 a, float4 b)
+{
+    float4 p = xe_mul(a, b);
+    return ((p.x + p.y) + p.z) + p.w;
+}
+
+// Shader Model 3 max/min: a >= b ? a : b, so a NaN in a picks b (dxbc_translator_alu.cpp:123).
+template<typename T> T xe_max(T a, T b)
+{
+    return select(a >= b, a, b);
+}
+
+template<typename T> T xe_min(T a, T b)
+{
+    return select(a < b, a, b);
+}
+
 float4 dst(float4 src0, float4 src1)
 {
     float4 dest;
     dest.x = 1.0;
-    dest.y = src0.y * src1.y;
+    dest.y = xe_mul(src0.y, src1.y);
     dest.z = src0.z;
     dest.w = src1.w;
     return dest;
 }
 
+// First component that is >= every later one, the interpreter's max4 order (interpreter.cpp:462).
 float4 max4(float4 src0)
 {
-    return max(max(src0.x, src0.y), max(src0.z, src0.w));
+    if (src0.x >= src0.y && src0.x >= src0.z && src0.x >= src0.w)
+        return src0.x;
+    if (src0.y >= src0.z && src0.y >= src0.w)
+        return src0.y;
+    return src0.z >= src0.w ? src0.z : src0.w;
 }
 
 float2 getPixelCoord(uint resourceDescriptorIndex, float2 texCoord)

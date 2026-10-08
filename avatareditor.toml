@@ -7,13 +7,6 @@ fullscreen = false
 mnk_mode = true      # keyboard controls
 mnk_mouse = false
 
-native_video = true
-native_video_fps = false
-native_video_resolution_scale = 100  # 1 to 200
-native_video_msaa = 4                # 0/1 off, 2, 4 (default), 8
-native_video_shader_pack = "../../../shaderpack"
-
 avatar_eye_whites = false
 log_single_file = true
-gpu_plugin = "xenos"
 model_shadows = true

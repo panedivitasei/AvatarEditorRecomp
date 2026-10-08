@@ -1,6 +1,7 @@
 #include "shader_recompiler.h"
 #include "shader_common.h"
 #include "ucode_fingerprint.h"
+#include "xenosrecomp.h"
 
 #include <cmath>
 #include <cstring>
@@ -22,11 +23,21 @@ static constexpr const char* USAGE_TYPES[] =
     "float4", // POSITION
     "float4", // BLENDWEIGHT
     "uint4", // BLENDINDICES
+#ifdef REBLUE_RECOMP
+    // BD IA-decodes SNORM normals to float; swapFloats() undoes the engine int16-pair swap, DEC3N goes through tfetchR11G11B10().
+    "float4", // NORMAL
+#else
     "uint4", // NORMAL
+#endif
     "float4", // PSIZE
     "float4", // TEXCOORD
+#ifdef REBLUE_RECOMP
+    "float4", // TANGENT
+    "float4", // BINORMAL
+#else
     "uint4", // TANGENT
     "uint4", // BINORMAL
+#endif
     "float4", // TESSFACTOR
     "float4", // POSITIONT
     "float4", // COLOR
@@ -78,9 +89,13 @@ struct DeclUsageLocation
     uint32_t location;
 };
 
-// NOTE: These are specialized Vulkan locations for Unleashed Recompiled. Change as necessary. Likely not going to work with other games.
 static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
 {
+#ifdef REBLUE_RECOMP
+    #define REBLUE_VERTEX_LOCATION_ROW(usage, index, location) { DeclUsage::usage, index, location },
+    REBLUE_VERTEX_INPUT_LOCATIONS(REBLUE_VERTEX_LOCATION_ROW)
+    #undef REBLUE_VERTEX_LOCATION_ROW
+#else
     { DeclUsage::Position, 0, 0 },
     { DeclUsage::Normal, 0, 1 },
     { DeclUsage::Tangent, 0, 2 },
@@ -98,6 +113,7 @@ static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
     { DeclUsage::TexCoord, 6, 14 },
     { DeclUsage::TexCoord, 7, 15 },
     { DeclUsage::Position, 1, 15 },
+#endif
 };
 
 static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
@@ -162,229 +178,59 @@ void ShaderRecompiler::printDstSwizzle01(uint32_t dstRegister, uint32_t dstSwizz
     }
 }
 
-// Words per vertex format (xenos::VertexFormat values).
-static uint32_t rexglueVfetchWordCount(uint32_t format)
+// X3 vfetch: format, stride, offset, fetch constant and destination swizzle come from the per-draw layout
+// record, so the declaration-dependent instruction fields are never read (pack_contract.md 2.4).
+void ShaderRecompiler::recompileRexglueVfetch(const VertexFetchInstruction& instr, uint32_t address)
 {
-    switch (format)
+    if (isPixelShader)
+        throw std::runtime_error("vfetch in a pixel shader (the layout table is vertex-only)");
+    if (instr.srcRegisterAm || instr.dstRegisterAam)
+        throw std::runtime_error("vfetch with an aL-relative register");
+
+    uint32_t n = rexFetchCounter++;
+    if (n >= rexVfetchSlots.size() || rexVfetchSlots[n] != address)
+        throw std::runtime_error(fmt::format("vfetch at slot {} is not ordinal {} of the control-flow walk", address, n));
+
+    // A mini fetch reuses the full fetch's address, which the translation recomputes from its own source fields.
+    uint32_t src = uint32_t(instr.srcRegister) | (uint32_t(instr.srcSwizzle) << 8) | (uint32_t(instr.isIndexRounded) << 10);
+    if (instr.isMiniFetch)
     {
-    case 26: case 32: case 34: case 37: return 2; // k_16_16_16_16, k_16_16_16_16_FLOAT, k_32_32, k_32_32_FLOAT
-    case 57: return 3;                                // k_32_32_32_FLOAT
-    case 35: case 38: return 4;                       // k_32_32_32_32, k_32_32_32_32_FLOAT
-    default: return 1;
+        if (!rexHaveFullVfetch)
+            throw std::runtime_error(fmt::format("vfetch_mini at slot {} has no preceding vfetch_full", address));
+        if (src != rexFullVfetchSrc)
+            throw std::runtime_error(fmt::format("vfetch_mini at slot {} src fields differ from the preceding vfetch_full", address));
     }
-}
-
-// Emits the format decode expression producing a float4 (missing components
-// zero). Semantics ported from DxbcShaderTranslator's vertex fetch unpack
-// (dxbc_translator_fetch.cpp:266-450).
-static std::string rexglueVfetchDecode(const std::string& w, const VertexFetchInstruction& instr)
-{
-    uint32_t format = uint32_t(instr.format);
-    bool isSigned = instr.formatCompAll != 0;
-    bool isInteger = instr.numFormatAll != 0;
-    bool rfNoZero = instr.signedRfModeAll != 0; // SignedRepeatingFractionMode::kNoZero
-
-    // Packed integer formats: per-component (width, offset, source word).
-    struct Packed { uint32_t width, offset, word; };
-    Packed packed[4] = {};
-    uint32_t packedCount = 0;
-
-    switch (format)
+    else
     {
-    case 6: // k_8_8_8_8
-        packed[0] = { 8, 0, 0 }; packed[1] = { 8, 8, 0 }; packed[2] = { 8, 16, 0 }; packed[3] = { 8, 24, 0 };
-        packedCount = 4;
-        break;
-    case 7: // k_2_10_10_10
-        packed[0] = { 10, 0, 0 }; packed[1] = { 10, 10, 0 }; packed[2] = { 10, 20, 0 }; packed[3] = { 2, 30, 0 };
-        packedCount = 4;
-        break;
-    case 16: // k_10_11_11 (x 11 bits, y 11 bits, z 10 bits)
-        packed[0] = { 11, 0, 0 }; packed[1] = { 11, 11, 0 }; packed[2] = { 10, 22, 0 };
-        packedCount = 3;
-        break;
-    case 17: // k_11_11_10
-        packed[0] = { 10, 0, 0 }; packed[1] = { 11, 10, 0 }; packed[2] = { 11, 21, 0 };
-        packedCount = 3;
-        break;
-    case 25: // k_16_16
-        packed[0] = { 16, 0, 0 }; packed[1] = { 16, 16, 0 };
-        packedCount = 2;
-        break;
-    case 26: // k_16_16_16_16
-        packed[0] = { 16, 0, 0 }; packed[1] = { 16, 16, 0 }; packed[2] = { 16, 0, 1 }; packed[3] = { 16, 16, 1 };
-        packedCount = 4;
-        break;
-    default:
-        break;
+        rexHaveFullVfetch = true;
+        rexFullVfetchSrc = src;
     }
 
-    auto wordRef = [&](uint32_t word)
-        {
-            return rexglueVfetchWordCount(format) == 1 ? w : fmt::format("{}.{}", w, "xyzw"[word]);
-        };
-
-    if (packedCount != 0)
-    {
-        std::string comps[4] = { "0.0", "0.0", "0.0", "0.0" };
-        for (uint32_t i = 0; i < packedCount; i++)
-        {
-            auto& p = packed[i];
-            std::string bits;
-            if (isSigned)
-            {
-                // Sign-extending bitfield extract.
-                bits = fmt::format("float(asint({} << {}) >> {})", wordRef(p.word), 32 - p.offset - p.width, 32 - p.width);
-            }
-            else
-            {
-                bits = fmt::format("float(({} >> {}) & {}u)", wordRef(p.word), p.offset, (1u << p.width) - 1u);
-            }
-
-            if (!isInteger)
-            {
-                if (isSigned)
-                {
-                    if (rfNoZero)
-                        bits = fmt::format("({} * {} + {})", bits, 2.0 / double((1u << p.width) - 1u), 1.0 / double((1u << p.width) - 1u));
-                    else if (p.width > 2)
-                        bits = fmt::format("max({} * {}, -1.0)", bits, 1.0 / double((1u << (p.width - 1)) - 1u));
-                    else
-                        bits = fmt::format("max({}, -1.0)", bits);
-                }
-                else if (p.width > 1)
-                {
-                    bits = fmt::format("({} * {})", bits, 1.0 / double((1u << p.width) - 1u));
-                }
-            }
-
-            comps[i] = bits;
-        }
-        return fmt::format("float4({}, {}, {}, {})", comps[0], comps[1], comps[2], comps[3]);
-    }
-
-    switch (format)
-    {
-    case 31: // k_16_16_FLOAT
-        return fmt::format("float4(f16tof32({0} & 0xFFFFu), f16tof32({0} >> 16), 0.0, 0.0)", w);
-    case 32: // k_16_16_16_16_FLOAT
-        return fmt::format("float4(f16tof32({0}.x & 0xFFFFu), f16tof32({0}.x >> 16), f16tof32({0}.y & 0xFFFFu), f16tof32({0}.y >> 16))", w);
-    case 33: case 34: case 35: // k_32, k_32_32, k_32_32_32_32
-    {
-        uint32_t count = rexglueVfetchWordCount(format);
-        std::string comps[4] = { "0.0", "0.0", "0.0", "0.0" };
-        for (uint32_t i = 0; i < count; i++)
-        {
-            std::string bits = isSigned ? fmt::format("float(asint({}))", wordRef(i))
-                                        : fmt::format("float({})", wordRef(i));
-            if (!isInteger)
-            {
-                if (isSigned)
-                {
-                    if (rfNoZero)
-                        bits = fmt::format("({} * {} + {})", bits, 1.0 / 2147483647.5, 0.5 / 2147483647.5);
-                    else
-                        bits = fmt::format("({} * {})", bits, 1.0 / 2147483647.0);
-                }
-                else
-                {
-                    bits = fmt::format("({} * {})", bits, 1.0 / 4294967295.0);
-                }
-            }
-            comps[i] = bits;
-        }
-        return fmt::format("float4({}, {}, {}, {})", comps[0], comps[1], comps[2], comps[3]);
-    }
-    case 36: // k_32_FLOAT
-        return fmt::format("float4(asfloat({}), 0.0, 0.0, 0.0)", w);
-    case 37: // k_32_32_FLOAT
-        return fmt::format("float4(asfloat({}), 0.0, 0.0)", w);
-    case 57: // k_32_32_32_FLOAT
-        return fmt::format("float4(asfloat({}), 0.0)", w);
-    case 38: // k_32_32_32_32_FLOAT
-        return fmt::format("asfloat({})", w);
-    default:
-        return fmt::format("float4(0.0, 0.0, 0.0, 0.0) /* unsupported vfetch format {} */", format);
-    }
-}
-
-void ShaderRecompiler::recompileRexglueVfetch(const VertexFetchInstruction& instr)
-{
     if (instr.isPredicated)
     {
         indent();
         println("if ({}p0)", instr.predicateCondition ? "" : "!");
-
         indent();
         out += "{\n";
         ++indentation;
     }
 
-    uint32_t n = rexFetchCounter++;
-
-    // Scope the fetch locals: in complex-control-flow shaders this code sits
-    // under a switch case label, where unscoped initializations are illegal.
-    indent();
-    out += "{\n";
-    ++indentation;
-
-    uint32_t fetchDwordIndex;
-    uint32_t stride;
-    std::string indexExpr;
-    if (instr.isMiniFetch)
-    {
-        // Mini fetches inherit the fetch constant, index and stride from the
-        // preceding full fetch; only offset/format/destination are their own.
-        fetchDwordIndex = rexLastVfetchDwordIndex;
-        stride = rexLastVfetchStride;
-        indexExpr = rexLastVfetchIndex;
-    }
-    else
-    {
-        fetchDwordIndex = uint32_t(instr.constIndex) * 6 + uint32_t(instr.constIndexSelect) * 2;
-        stride = instr.stride;
-        indexExpr = fmt::format("r{}.{}", uint32_t(instr.srcRegister), SWIZZLES[instr.srcSwizzle & 0x3]);
-        rexLastVfetchDwordIndex = fetchDwordIndex;
-        rexLastVfetchStride = stride;
-        rexLastVfetchIndex = indexExpr;
-    }
+    const uint32_t dst = uint32_t(instr.dstRegister);
+    const std::string index = fmt::format("r{}.{}", uint32_t(instr.srcRegister), SWIZZLES[instr.srcSwizzle & 0x3]);
+    const char* rounded = instr.isIndexRounded ? "true" : "false";
 
     indent();
-    println("uint xe_a{} = xe_vfetch_address({}u, {}, {}u, {});", n, fetchDwordIndex, indexExpr, stride,
-        instr.isIndexRounded ? "true" : "false");
-
-    uint32_t wordCount = rexglueVfetchWordCount(uint32_t(instr.format));
-    int32_t offsetBytes = int32_t(instr.offset) * 4;
-
-    static const char* WORD_TYPES[] = { "uint", "uint2", "uint3", "uint4" };
-    indent();
-    println("{} xe_w{} = xe_vfetch_load{}(uint(int(xe_a{}) + {}), {}u);", WORD_TYPES[wordCount - 1], n, wordCount,
-        n, offsetBytes, fetchDwordIndex);
-
-    indent();
-    println("float4 xe_v{} = {};", n, rexglueVfetchDecode(fmt::format("xe_w{}", n), instr));
-
     if (instr.expAdjust != 0)
     {
         float scale = std::ldexp(1.0f, instr.expAdjust);
         uint32_t scaleBits;
         memcpy(&scaleBits, &scale, sizeof(scaleBits));
-        indent();
-        println("xe_v{} *= asfloat(0x{:08X}u);", n, scaleBits);
+        println("r{0} = xe_vfetch_exp({1}u, {2}, {3}, asfloat(0x{4:08X}u), r{0});", dst, n, index, rounded, scaleBits);
     }
-
-    indent();
-    print("r{}.", uint32_t(instr.dstRegister));
-    printDstSwizzle(instr.dstSwizzle, false);
-    print(" = xe_v{}.", n);
-    printDstSwizzle(instr.dstSwizzle, true);
-    out += ";\n";
-
-    printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
-
-    --indentation;
-    indent();
-    out += "}\n";
+    else
+    {
+        println("r{0} = xe_vfetch({1}u, {2}, {3}, r{0});", dst, n, index, rounded);
+    }
 
     if (instr.isPredicated)
     {
@@ -398,7 +244,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
 {
     if (rexglueMode)
     {
-        recompileRexglueVfetch(instr);
+        recompileRexglueVfetch(instr, address);
         return;
     }
 
@@ -421,6 +267,33 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     auto findResult = vertexElements.find(address);
     assert(findResult != vertexElements.end());
 
+#ifdef REBLUE_RECOMP
+    // Wrap each 16-bit-packed semantic in swapFloats() (per-usage mask); TEXCOORD also runs sintTexcoord() for raw-int bindings.
+    switch (findResult->second.usage)
+    {
+    case DeclUsage::Normal:
+        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
+        print("tfetchR11G11B10(swapFloats(g_SwappedNormals, ");
+        break;
+    case DeclUsage::Tangent:
+        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
+        print("tfetchR11G11B10(swapFloats(g_SwappedTangents, ");
+        break;
+    case DeclUsage::Binormal:
+        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
+        print("tfetchR11G11B10(swapFloats(g_SwappedBinormals, ");
+        break;
+    case DeclUsage::BlendWeight:
+        print("swapFloats(g_SwappedBlendWeights, ");
+        break;
+    case DeclUsage::TexCoord:
+        print("sintTexcoord(g_SintTexcoords, swapFloats(g_SwappedTexcoords, ");
+        break;
+    case DeclUsage::Position:
+        print("swapFloats(g_SwappedPositions, ");
+        break;
+    }
+#else
     switch (findResult->second.usage)
     {
     case DeclUsage::Normal:
@@ -434,9 +307,30 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         print("tfetchTexcoord(g_SwappedTexcoords, ");
         break;
     }
+#endif
 
     print("{}", findResult->second.name);
 
+#ifdef REBLUE_RECOMP
+    switch (findResult->second.usage)
+    {
+    case DeclUsage::Normal:
+    case DeclUsage::Tangent:
+    case DeclUsage::Binormal:
+        print(", {}))", uint32_t(findResult->second.usageIndex));
+        break;
+
+    case DeclUsage::TexCoord:
+        print(", {}), {})", uint32_t(findResult->second.usageIndex),
+              uint32_t(findResult->second.usageIndex));
+        break;
+
+    case DeclUsage::BlendWeight:
+    case DeclUsage::Position:
+        print(", {})", uint32_t(findResult->second.usageIndex));
+        break;
+    }
+#else
     switch (findResult->second.usage)
     {
     case DeclUsage::Normal:
@@ -449,6 +343,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         print(", {})", uint32_t(findResult->second.usageIndex));
         break;
     }
+#endif
 
     out += '.';
     printDstSwizzle(instr.dstSwizzle, true);
@@ -465,10 +360,55 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     }
 }
 
+static const char* fetchOpcodeName(FetchOpcode opcode)
+{
+    switch (opcode)
+    {
+    case FetchOpcode::VertexFetch: return "vfetch";
+    case FetchOpcode::TextureFetch: return "tfetch";
+    case FetchOpcode::GetTextureBorderColorFrac: return "getBCF";
+    case FetchOpcode::GetTextureComputedLod: return "getCompTexLOD";
+    case FetchOpcode::GetTextureGradients: return "getGradients";
+    case FetchOpcode::GetTextureWeights: return "getWeights";
+    case FetchOpcode::SetTextureLod: return "setTexLOD";
+    case FetchOpcode::SetTextureGradientsHorz: return "setGradientH";
+    case FetchOpcode::SetTextureGradientsVert: return "setGradientV";
+    default: return "unknown";
+    }
+}
+
 void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
 {
-    if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
-        return;
+    // Every opcode either translates or fails the shader; nothing is dropped
+    // (the ring translator's set, dxbc_translator_fetch.cpp:570-668).
+    switch (instr.opcode)
+    {
+    case FetchOpcode::TextureFetch:
+    case FetchOpcode::GetTextureWeights:
+    case FetchOpcode::GetTextureComputedLod:
+    case FetchOpcode::GetTextureGradients:
+    case FetchOpcode::SetTextureLod:
+    case FetchOpcode::SetTextureGradientsHorz:
+    case FetchOpcode::SetTextureGradientsVert:
+        break;
+    case FetchOpcode::GetTextureBorderColorFrac:
+        // The ring translator has no getBCF either (dxbc_translator_fetch.cpp:654).
+        throw std::runtime_error("unimplemented fetch opcode 16 (getBCF)");
+    default:
+        throw std::runtime_error(fmt::format("unknown fetch opcode {}", uint32_t(instr.opcode)));
+    }
+
+    if (!isPixelShader && (instr.opcode == FetchOpcode::GetTextureComputedLod ||
+                           instr.opcode == FetchOpcode::GetTextureGradients))
+        throw std::runtime_error(fmt::format("fetch opcode {} ({}) needs pixel shader derivatives",
+            uint32_t(instr.opcode), fetchOpcodeName(instr.opcode)));
+
+    if (instr.opcode == FetchOpcode::GetTextureComputedLod && (!instr.useCompLod || instr.useRegGradients))
+        throw std::runtime_error("fetch opcode 17 (getCompTexLOD) with explicit LOD or register gradients");
+
+    if (instr.opcode == FetchOpcode::GetTextureWeights && instr.dimension != TextureDimension::Texture2D)
+        throw std::runtime_error(fmt::format("unimplemented fetch opcode 19 (getWeights) for dimension {}",
+            uint32_t(instr.dimension)));
 
     if (instr.isPredicated)
     {
@@ -487,6 +427,73 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
             for (size_t i = 0; i < componentCount; i++)
                 out += SWIZZLES[((instr.srcSwizzle >> (i * 2))) & 0x3];
         };
+
+    auto closePredicate = [&]()
+        {
+            if (instr.isPredicated)
+            {
+                --indentation;
+                indent();
+                out += "}\n";
+            }
+        };
+
+    // Register LOD and gradients live in shader-wide state that the tfetch
+    // variants read (dxbc_translator_fetch.cpp:570).
+    switch (instr.opcode)
+    {
+    case FetchOpcode::SetTextureLod:
+        indent();
+        out += "xe_lod = ";
+        printSrcRegister(1);
+        out += ";\n";
+        usesRegisterLod = true;
+        closePredicate();
+        return;
+
+    case FetchOpcode::SetTextureGradientsHorz:
+    case FetchOpcode::SetTextureGradientsVert:
+        indent();
+        out += instr.opcode == FetchOpcode::SetTextureGradientsHorz ? "xe_grad_h = " : "xe_grad_v = ";
+        printSrcRegister(3);
+        out += ";\n";
+        usesRegisterGradients = true;
+        closePredicate();
+        return;
+    }
+
+    bool hasResult = false;
+    for (uint32_t i = 0; i < 4; i++)
+    {
+        auto swizzle = getDestSwizzle(instr.dstSwizzle, i);
+        if (swizzle >= FetchDestinationSwizzle::X && swizzle <= FetchDestinationSwizzle::W)
+            hasResult = true;
+    }
+
+    if (!hasResult)
+    {
+        // Constant 0/1 writes only, nothing is fetched.
+        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
+        closePredicate();
+        return;
+    }
+
+    if (instr.opcode == FetchOpcode::GetTextureGradients)
+    {
+        // XZ = ddx(src.xy), YW = ddy(src.xy), coarse like the texture unit
+        // (dxbc_translator_fetch.cpp:625).
+        std::string srcX = fmt::format("r{}.{}", instr.srcRegister, SWIZZLES[instr.srcSwizzle & 0x3]);
+        std::string srcY = fmt::format("r{}.{}", instr.srcRegister, SWIZZLES[(instr.srcSwizzle >> 2) & 0x3]);
+        indent();
+        print("r{}.", instr.dstRegister);
+        printDstSwizzle(instr.dstSwizzle, false);
+        print(" = float4(ddx_coarse({0}), ddy_coarse({0}), ddx_coarse({1}), ddy_coarse({1})).", srcX, srcY);
+        printDstSwizzle(instr.dstSwizzle, true);
+        out += ";\n";
+        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
+        closePredicate();
+        return;
+    }
 
     std::string constName;
     const char* constNamePtr = nullptr;
@@ -519,6 +526,75 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     }
 #endif
 
+    // LOD selection for tfetch, as dxbc_translator_fetch.cpp:676 and :1401.
+    // BaseMap mip filtering samples level 0; otherwise the LOD (or the bias
+    // on a computed LOD) is register LOD + instruction bias, and the helpers
+    // add the fetch-constant bias.
+    std::string lodVariant;
+    std::string lodArguments;
+    if (instr.opcode == FetchOpcode::TextureFetch)
+    {
+        const bool computedLod = instr.useCompLod && (isPixelShader || instr.useRegGradients);
+
+        std::string lodSum;
+        if (instr.useRegLod)
+        {
+            lodSum = "xe_lod";
+            usesRegisterLod = true;
+        }
+        if (instr.lodBias != 0)
+        {
+            std::string bias = fmt::format("{}", instr.lodBias / 16.0f);
+            if (bias.find_first_of(".e") == std::string::npos)
+                bias += ".0";
+            lodSum = lodSum.empty() ? bias : fmt::format("{} + {}", lodSum, bias);
+        }
+
+        if (instr.mipFilter == 2) // TextureFilter::kBaseMap
+        {
+            lodVariant = "_lod0";
+        }
+        else if (!computedLod)
+        {
+            lodVariant = "_level";
+            lodArguments = fmt::format(", {}", lodSum.empty() ? "0.0" : lodSum);
+        }
+        else if (instr.useRegGradients)
+        {
+            lodVariant = "_grad";
+            lodArguments = fmt::format(", {}, xe_grad_h, xe_grad_v", lodSum.empty() ? "0.0" : lodSum);
+            usesRegisterGradients = true;
+        }
+        else if (rexglueMode && (inDivergentFlow || instr.isPredicated))
+        {
+            // Implicit derivatives under per-pixel flow deadlock Intel EUs, so
+            // these keep the mip-0 workaround until derivative hoisting replaces it.
+            lodVariant = "_lod0";
+        }
+        else if (!lodSum.empty())
+        {
+            lodVariant = "_bias";
+            lodArguments = fmt::format(", {}", lodSum);
+        }
+    }
+
+#ifdef REBLUE_RECOMP
+    // Stashed before the fetch statement: the kernel reuses UV registers as
+    // fetch destinations (r6.y = tfetch2D(..., r6.yw)).
+    const bool shadowTap = hasShadowTexture && !instr.isPredicated &&
+        instr.opcode == FetchOpcode::TextureFetch &&
+        instr.dimension == TextureDimension::Texture2D &&
+        strcmp(constNamePtr, "ShadowTexture") == 0 &&
+        instr.offsetX == 0 && instr.offsetY == 0 && shadowTapUVCount < 8;
+    if (shadowTap)
+    {
+        indent();
+        print("shadowTapUV[{}] = ", shadowTapUVCount);
+        printSrcRegister(2);
+        out += ";\n";
+    }
+#endif
+
     indent();
     print("r{}.", instr.dstRegister);
     printDstSwizzle(instr.dstSwizzle, false);
@@ -539,6 +615,11 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     case FetchOpcode::GetTextureWeights:
     {
         out += "getWeights";
+        break;
+    }
+    case FetchOpcode::GetTextureComputedLod:
+    {
+        out += "getCompTexLOD";
         break;
     }
     }
@@ -567,13 +648,7 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     }
 
     out += dimension;
-
-    // Divergent-flow / VS fetches use the explicit-LOD helper variants:
-    // implicit-derivative Sample under per-pixel flow deadlocks Intel EUs,
-    // and vertex shaders have no derivatives at all.
-    if (rexglueMode && instr.opcode == FetchOpcode::TextureFetch &&
-        (inDivergentFlow || instr.isPredicated || !isPixelShader))
-        out += "_lod0";
+    out += lodVariant;
 
 #ifdef UNLEASHED_RECOMP
     if (bicubic)
@@ -610,16 +685,19 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     }
     printSrcRegister(componentCount);
 
+    // getCompTexLOD takes no offsets (dxbc_translator_fetch.cpp:694).
     switch (instr.dimension)
     {
     case TextureDimension::Texture2D:
-        print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
+        if (instr.opcode != FetchOpcode::GetTextureComputedLod)
+            print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
         break;
     case TextureDimension::TextureCube:
         out += ", cubeMapData";
         break;
     }
 
+    out += lodArguments;
     out += ").";
 
     printDstSwizzle(instr.dstSwizzle, true);
@@ -628,22 +706,74 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
 
     printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
 
-    if (instr.isPredicated)
+#ifdef REBLUE_RECOMP
+    if (hasShadowTexture)
     {
-        --indentation;
-        indent();
-        out += "}\n";
+        for (size_t i = 0; i < 4; i++)
+        {
+            if (getDestSwizzle(instr.dstSwizzle, i) <= FetchDestinationSwizzle::One)
+                shadowTapSlots.erase(uint32_t(instr.dstRegister * 4 + i));
+        }
+        if (shadowTap)
+        {
+            for (size_t i = 0; i < 4; i++)
+            {
+                if (getDestSwizzle(instr.dstSwizzle, i) == FetchDestinationSwizzle::X)
+                    shadowTapSlots[uint32_t(instr.dstRegister * 4 + i)] = shadowTapUVCount;
+            }
+            ++shadowTapUVCount;
+        }
     }
+#endif
+
+    closePredicate();
+}
+
+static const char* aluVectorOpcodeName(AluVectorOpcode opcode)
+{
+    static constexpr const char* NAMES[] =
+    {
+        "add", "mul", "max", "min", "seq", "sgt", "sge", "sne", "frc", "trunc", "floor", "mad",
+        "cndeq", "cndge", "cndgt", "dp4", "dp3", "dp2add", "cube", "max4", "setp_eq_push",
+        "setp_ne_push", "setp_gt_push", "setp_ge_push", "kill_eq", "kill_gt", "kill_ge", "kill_ne",
+        "dst", "maxa"
+    };
+    return uint32_t(opcode) < std::size(NAMES) ? NAMES[uint32_t(opcode)] : "unknown";
+}
+
+static const char* aluScalarOpcodeName(AluScalarOpcode opcode)
+{
+    static constexpr const char* NAMES[] =
+    {
+        "adds", "adds_prev", "muls", "muls_prev", "muls_prev2", "maxs", "mins", "seqs", "sgts",
+        "sges", "snes", "frcs", "truncs", "floors", "exp", "logc", "log", "rcpc", "rcpf", "rcp",
+        "rsqc", "rsqf", "rsq", "maxas", "maxasf", "subs", "subs_prev", "setp_eq", "setp_ne",
+        "setp_gt", "setp_ge", "setp_inv", "setp_pop", "setp_clr", "setp_rstr", "kills_eq",
+        "kills_gt", "kills_ge", "kills_ne", "kills_one", "sqrt", "unknown", "mulsc0", "mulsc1",
+        "addsc0", "addsc1", "subsc0", "subsc1", "sin", "cos", "retain_prev"
+    };
+    return uint32_t(opcode) < std::size(NAMES) ? NAMES[uint32_t(opcode)] : "unknown";
 }
 
 void ShaderRecompiler::recompile(const AluInstruction& instr)
 {
+    // Unknown opcodes fail the shader instead of emitting an empty expression.
+    if (uint32_t(instr.vectorOpcode) > uint32_t(AluVectorOpcode::MaxA))
+        throw std::runtime_error(fmt::format("unknown ALU vector opcode {}", uint32_t(instr.vectorOpcode)));
+    if (uint32_t(instr.scalarOpcode) == 41 || uint32_t(instr.scalarOpcode) > uint32_t(AluScalarOpcode::RetainPrev))
+        throw std::runtime_error(fmt::format("unknown ALU scalar opcode {}", uint32_t(instr.scalarOpcode)));
+
+    // Loop-relative destinations (r[aL + n]) are not modeled.
+    if (!instr.exportData && (instr.vectorDestRelative || instr.scalarDestRelative))
+        throw std::runtime_error(fmt::format("unimplemented aL-relative ALU destination ({} / {})",
+            aluVectorOpcodeName(instr.vectorOpcode), aluScalarOpcodeName(instr.scalarOpcode)));
+
     if (instr.isPredicated)
     {
         indent();
         println("if ({}p0)", instr.predicateCondition ? "" : "!");
 
-        indent(); 
+        indent();
         out += "{\n";
         ++indentation;
     }
@@ -659,13 +789,34 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         SCALAR_CONSTANT_1
     };
 
-    auto op = [&](size_t operand)
+    // maskOverride selects which swizzled source components a vector operand
+    // prints, independent of the write mask.
+    auto op = [&](size_t operand, uint32_t maskOverride = 0)
         {
             size_t reg = 0;
             size_t swizzle = 0;
             bool select = true;
             bool negate = false;
             bool abs = false;
+
+            // Which relative flag a constant operand uses depends on how many
+            // constants precede it (ucode.h src_const_is_addressed).
+            bool constRelative = false;
+            switch (operand)
+            {
+            case VECTOR_0:
+                constRelative = instr.const0Relative;
+                break;
+            case VECTOR_1:
+                constRelative = instr.src1Select ? instr.const0Relative : instr.const1Relative;
+                break;
+            case VECTOR_2:
+            case SCALAR_0:
+            case SCALAR_1:
+            case SCALAR_CONSTANT_0:
+                constRelative = (instr.src1Select && instr.src2Select) ? instr.const0Relative : instr.const1Relative;
+                break;
+            }
 
             switch (operand)
             {
@@ -724,6 +875,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             }
 
             std::string regFormatted;
+            const char* relativeSuffix = constRelative ? (instr.constAddressRegisterRelative ? " + a0" : " + aL") : "";
 
             if (select)
             {
@@ -734,8 +886,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             {
                 // Container-less: absolute register file (relative reads
                 // mirror the named multi-register indexing below).
-                regFormatted = fmt::format("xe_fcfile_read({}{})", reg,
-                    instr.const0Relative ? (instr.constAddressRegisterRelative ? " + a0" : " + aL") : "");
+                regFormatted = fmt::format("xe_fcfile_read({}{})", reg, relativeSuffix);
             }
             else if (rexglueMode && !rexFloatRank.empty())
             {
@@ -761,19 +912,19 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                     #endif
                         {
                             regFormatted = fmt::format("{}({}{})", constantName,
-                                reg - findResult->second->registerIndex, instr.const0Relative ? (instr.constAddressRegisterRelative ? " + a0" : " + aL") : "");
+                                reg - findResult->second->registerIndex, relativeSuffix);
                         }
                     }
                     else
                     {
-                        assert(!instr.const0Relative && !instr.const1Relative);
+                        assert(!constRelative);
                         regFormatted = constantName;
                     }
                 }
                 else
                 {
-                    assert(!instr.const0Relative && !instr.const1Relative);
-                    regFormatted = fmt::format("c{}", reg);
+                    assert(!constRelative);
+                    regFormatted = rexglueMode ? fmt::format("xe_fc{}", reg) : fmt::format("c{}", reg);
                 }
             }
 
@@ -796,24 +947,38 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             {
                 uint32_t mask;
 
-                switch (instr.vectorOpcode)
+                if (maskOverride != 0)
                 {
-                case AluVectorOpcode::Dp2Add:
-                    mask = (operand == VECTOR_2) ? 0b1 : 0b11;
-                    break;
+                    mask = maskOverride;
+                }
+                else
+                {
+                    switch (instr.vectorOpcode)
+                    {
+                    case AluVectorOpcode::Dp2Add:
+                        mask = (operand == VECTOR_2) ? 0b1 : 0b11;
+                        break;
 
-                case AluVectorOpcode::Dp3:
-                    mask = 0b111;
-                    break;
+                    case AluVectorOpcode::Dp3:
+                        mask = 0b111;
+                        break;
 
-                case AluVectorOpcode::Dp4:
-                case AluVectorOpcode::Max4:
-                    mask = 0b1111;
-                    break;
+                    // Kills compare all four components, dst reads a full
+                    // float4 (ucode.h GetAluVectorOpNeededSourceComponents).
+                    case AluVectorOpcode::Dp4:
+                    case AluVectorOpcode::Max4:
+                    case AluVectorOpcode::KillEq:
+                    case AluVectorOpcode::KillGt:
+                    case AluVectorOpcode::KillGe:
+                    case AluVectorOpcode::KillNe:
+                    case AluVectorOpcode::Dst:
+                        mask = 0b1111;
+                        break;
 
-                default:
-                    mask = instr.vectorWriteMask != 0 ? instr.vectorWriteMask : 0b1;
-                    break;
+                    default:
+                        mask = instr.vectorWriteMask != 0 ? instr.vectorWriteMask : 0b1;
+                        break;
+                    }
                 }
 
                 for (size_t i = 0; i < 4; i++)
@@ -842,25 +1007,48 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             return result;
         };
 
+    // Xenos multiply (0 * anything = +0) and SM3 max/min. Identical operands
+    // cannot hit the zero case or a lone NaN, so they keep the plain form.
+    auto mul = [](const std::string& a, const std::string& b)
+        {
+            return a == b ? fmt::format("{} * {}", a, b) : fmt::format("xe_mul({}, {})", a, b);
+        };
+    auto dot = [](const std::string& a, const std::string& b)
+        {
+            return a == b ? fmt::format("dot({}, {})", a, b) : fmt::format("xe_dot({}, {})", a, b);
+        };
+    auto maxOp = [](const std::string& a, const std::string& b)
+        {
+            return a == b ? a : fmt::format("xe_max({}, {})", a, b);
+        };
+    auto minOp = [](const std::string& a, const std::string& b)
+        {
+            return a == b ? a : fmt::format("xe_min({}, {})", a, b);
+        };
+
     switch (instr.vectorOpcode)
     {
     case AluVectorOpcode::KillEq:
         indent();
+        rexUsesKill = true;
         println("clip(any({} == {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
         break;
-    
+
     case AluVectorOpcode::KillGt:
         indent();
+        rexUsesKill = true;
         println("clip(any({} > {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
         break;
-    
+
     case AluVectorOpcode::KillGe:
         indent();
+        rexUsesKill = true;
         println("clip(any({} >= {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
         break;
-    
+
     case AluVectorOpcode::KillNe:
         indent();
+        rexUsesKill = true;
         println("clip(any({} != {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
         break;
     }
@@ -876,19 +1064,22 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             {
             case ExportRegister::PSColor0:
                 exportRegister = "oC0";
-                break;        
+                break;
             case ExportRegister::PSColor1:
                 exportRegister = "oC1";
-                break;        
+                break;
             case ExportRegister::PSColor2:
                 exportRegister = "oC2";
-                break;            
+                break;
             case ExportRegister::PSColor3:
                 exportRegister = "oC3";
-                break;           
+                break;
             case ExportRegister::PSDepth:
                 exportRegister = "oDepth";
                 break;
+            default:
+                throw std::runtime_error(fmt::format("unimplemented pixel shader export register {}{}",
+                    uint32_t(instr.vectorDest), instr.vectorDest >= 32 && instr.vectorDest <= 37 ? " (memexport)" : ""));
             }
         }
         else
@@ -938,7 +1129,8 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                 auto findResult = interpolators.find(instr.vectorDest);
 #ifdef XENOS_COVERAGE
                 if (findResult == interpolators.end())
-                    throw CoverageError(fmt::format("assert: unmapped VS export register {}", uint32_t(instr.vectorDest)));
+                    throw CoverageError(fmt::format("assert: unmapped VS export register {}{}", uint32_t(instr.vectorDest),
+                        instr.vectorDest >= 32 && instr.vectorDest <= 37 ? " (memexport)" : ""));
 #endif
                 assert(findResult != interpolators.end());
                 exportRegister = findResult->second;
@@ -948,59 +1140,149 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         }
     }
 
-    if (instr.vectorOpcode >= AluVectorOpcode::SetpEqPush && instr.vectorOpcode <= AluVectorOpcode::SetpGePush)
-    {
-        indent();
-        print("p0 = {} == 0.0 && {} ", op(VECTOR_0), op(VECTOR_1));
-
-        switch (instr.vectorOpcode)
-        {
-        case AluVectorOpcode::SetpEqPush:
-            out += "==";
-            break;
-        case AluVectorOpcode::SetpNePush:
-            out += "!=";
-            break;
-        case AluVectorOpcode::SetpGtPush:
-            out += ">";
-            break;
-        case AluVectorOpcode::SetpGePush:
-            out += ">=";
-            break;
-        }
-
-        out += " 0.0;\n";
-    }
-    else if (instr.vectorOpcode >= AluVectorOpcode::MaxA)
-    {
-        indent();
-        println("a0 = (int)clamp(floor(({}).w + 0.5), -256.0, 255.0);", op(VECTOR_0));
-    }
-
     uint32_t vectorWriteMask = instr.vectorWriteMask;
     if (instr.exportData)
         vectorWriteMask &= ~instr.scalarWriteMask;
 
-    if (vectorWriteMask != 0)
+    // Both ops read their sources before either writes (the ring translator
+    // stores both results after both ops, dxbc_translator_alu.cpp:954). A vector result
+    // headed for a register the scalar op reads is held in a temporary, and
+    // maxa's a0 update waits until the scalar op has read its constants.
+    const bool scalarActive = instr.scalarOpcode != AluScalarOpcode::RetainPrev;
+    int scalarSourceGpr = -1;
+    uint32_t scalarSourceComponents = 0;
+    if (scalarActive)
+    {
+        const uint32_t componentA = 1u << (((instr.src3Swizzle >> 6) + 3) & 0x3);
+        const uint32_t componentB = 1u << (instr.src3Swizzle & 0x3);
+        switch (instr.scalarOpcode)
+        {
+        case AluScalarOpcode::Mulsc0:
+        case AluScalarOpcode::Mulsc1:
+        case AluScalarOpcode::Addsc0:
+        case AluScalarOpcode::Addsc1:
+        case AluScalarOpcode::Subsc0:
+        case AluScalarOpcode::Subsc1:
+            scalarSourceGpr = int((uint32_t(instr.scalarOpcode) & 1) | (instr.src3Select << 1) | (instr.src3Swizzle & 0x3C));
+            scalarSourceComponents = componentB;
+            break;
+        default:
+            if (instr.src3Select)
+            {
+                scalarSourceGpr = int(instr.src3Register & 0x3F);
+                scalarSourceComponents = componentA | componentB;
+            }
+            break;
+        }
+    }
+    const bool deferVector = vectorWriteMask != 0 && exportRegister.empty() && scalarActive &&
+        scalarSourceGpr == int(instr.vectorDest) && (vectorWriteMask & scalarSourceComponents) != 0;
+    const bool deferA0 = instr.vectorOpcode == AluVectorOpcode::MaxA;
+    const bool scoped = deferVector || deferA0;
+
+    if (scoped)
     {
         indent();
-        if (!exportRegister.empty())
-        {
-            out += exportRegister;
-            out += '.';
-        }
-        else
-        {
-            print("r{}.", instr.vectorDest);
-        }
+        out += "{\n";
+        ++indentation;
+    }
 
+    if (deferA0)
+    {
+        // maxa: a0 = clamp(floor(src0.w + 0.5)) (dxbc_translator_alu.cpp:552).
+        indent();
+        println("int xe_a0 = (int)clamp(floor({} + 0.5), -256.0, 255.0);", op(VECTOR_0, 0b1000));
+    }
+
+    if (instr.vectorOpcode >= AluVectorOpcode::SetpEqPush && instr.vectorOpcode <= AluVectorOpcode::SetpGePush)
+    {
+        // The predicate comes from the W components (interpreter.cpp:477).
+        const char* compare = "==";
+        switch (instr.vectorOpcode)
+        {
+        case AluVectorOpcode::SetpNePush:
+            compare = "!=";
+            break;
+        case AluVectorOpcode::SetpGtPush:
+            compare = ">";
+            break;
+        case AluVectorOpcode::SetpGePush:
+            compare = ">=";
+            break;
+        }
+        indent();
+        println("p0 = {} == 0.0 && {} {} 0.0;", op(VECTOR_0, 0b1000), op(VECTOR_1, 0b1000), compare);
+    }
+
+    std::string vectorWriteTarget;
+
+#ifdef REBLUE_RECOMP
+    // A Sgt/Sge whose sources are ShadowTexture taps re-emits per lane as a
+    // filtered compare from the stashed tap UV, turning the guest's binary PCF
+    // into hardware-equivalent bilinear PCF. Anything else falls through.
+    bool shadowCmpRewritten = false;
+    if (vectorWriteMask != 0 && !instr.exportData && !deferVector && hasShadowTexture &&
+        (instr.vectorOpcode == AluVectorOpcode::Sgt || instr.vectorOpcode == AluVectorOpcode::Sge) &&
+        instr.src1Select && !instr.src1Negate && (instr.src1Register & 0x80) == 0 &&
+        instr.src2Select && !instr.src2Negate && (instr.src2Register & 0x80) == 0)
+    {
+        const uint32_t srcA = instr.src1Register & 0x3F;
+        const uint32_t srcB = instr.src2Register & 0x3F;
+        bool allTaps = instr.vectorDest != srcA && instr.vectorDest != srcB;
+        for (size_t i = 0; i < 4 && allTaps; i++)
+        {
+            if ((vectorWriteMask >> i) & 0x1)
+                allTaps = shadowTapSlots.find(srcA * 4 + (((instr.src1Swizzle >> (i * 2)) + i) & 0x3)) != shadowTapSlots.end();
+        }
+        if (allTaps)
+        {
+            for (size_t i = 0; i < 4; i++)
+            {
+                if (((vectorWriteMask >> i) & 0x1) == 0)
+                    continue;
+                const uint32_t compA = ((instr.src1Swizzle >> (i * 2)) + i) & 0x3;
+                const uint32_t compB = ((instr.src2Swizzle >> (i * 2)) + i) & 0x3;
+                indent();
+                println("r{}.{} = shadowCmp2D(ShadowTexture_Texture2DDescriptorIndex, shadowTapUV[{}], r{}.{});",
+                    instr.vectorDest, SWIZZLES[i], shadowTapSlots[srcA * 4 + compA], srcB, SWIZZLES[compB]);
+            }
+            shadowCmpRewritten = true;
+        }
+    }
+
+    if (vectorWriteMask != 0 && !shadowCmpRewritten)
+#else
+    if (vectorWriteMask != 0)
+#endif
+    {
+        if (!exportRegister.empty())
+            vectorWriteTarget = fmt::format("{}.", exportRegister);
+        else
+            vectorWriteTarget = fmt::format("r{}.", instr.vectorDest);
+
+        uint32_t componentCount = 0;
         for (size_t i = 0; i < 4; i++)
         {
             if ((vectorWriteMask >> i) & 0x1)
-                out += SWIZZLES[i];
+            {
+                vectorWriteTarget += SWIZZLES[i];
+                ++componentCount;
+            }
         }
 
-        out += " = ";
+        indent();
+        if (deferVector)
+        {
+            if (componentCount == 1)
+                out += "float xe_vr = ";
+            else
+                print("float{} xe_vr = ", componentCount);
+        }
+        else
+        {
+            out += vectorWriteTarget;
+            out += " = ";
+        }
 
         if (instr.vectorSaturate)
             out += "saturate(";
@@ -1012,16 +1294,16 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             break;
 
         case AluVectorOpcode::Mul:
-            print("{} * {}", op(VECTOR_0), op(VECTOR_1));
+            out += mul(op(VECTOR_0), op(VECTOR_1));
             break;
 
         case AluVectorOpcode::Max:
         case AluVectorOpcode::MaxA:
-            print("max({}, {})", op(VECTOR_0), op(VECTOR_1));
+            out += maxOp(op(VECTOR_0), op(VECTOR_1));
             break;
 
         case AluVectorOpcode::Min:
-            print("min({}, {})", op(VECTOR_0), op(VECTOR_1));
+            out += minOp(op(VECTOR_0), op(VECTOR_1));
             break;
 
         case AluVectorOpcode::Seq:
@@ -1053,7 +1335,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             break;
 
         case AluVectorOpcode::Mad:
-            print("{} * {} + {}", op(VECTOR_0), op(VECTOR_1), op(VECTOR_2));
+            print("{} + {}", mul(op(VECTOR_0), op(VECTOR_1)), op(VECTOR_2));
             break;
 
         case AluVectorOpcode::CndEq:
@@ -1070,16 +1352,26 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
         case AluVectorOpcode::Dp4:
         case AluVectorOpcode::Dp3:
-            print("dot({}, {})", op(VECTOR_0), op(VECTOR_1));
+            out += dot(op(VECTOR_0), op(VECTOR_1));
             break;
 
         case AluVectorOpcode::Dp2Add:
-            print("dot({}, {}) + {}", op(VECTOR_0), op(VECTOR_1), op(VECTOR_2));
+            print("{} + {}", dot(op(VECTOR_0), op(VECTOR_1)), op(VECTOR_2));
             break;
 
         case AluVectorOpcode::Cube:
-            print("cube(r{}, cubeMapData)", instr.src1Register);
+        {
+            // Xenos cube takes the direction from src1's swizzled lanes (z, w, x);
+            // the canonical emit is src.zzxy which makes this src.xyz, but other
+            // compilers emit e.g. src.yyzx (Blue Dragon), so honor the swizzle.
+            const uint32_t reg = instr.src1Register & 0x3F;
+            const bool srcAbs = (instr.src1Register & 0x80) != 0;
+            auto lane = [&](uint32_t i) { return SWIZZLES[((instr.src1Swizzle >> (i * 2)) + i) & 0x3]; };
+            print("cube({}{}r{}.{}{}{}{}{}, cubeMapData)",
+                instr.src1Negate ? "-" : "", srcAbs ? "abs(" : "", reg,
+                lane(2), lane(3), lane(0), lane(0), srcAbs ? ")" : "");
             break;
+        }
 
         case AluVectorOpcode::Max4:
             print("max4({})", op(VECTOR_0));
@@ -1089,8 +1381,26 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         case AluVectorOpcode::SetpNePush:
         case AluVectorOpcode::SetpGtPush:
         case AluVectorOpcode::SetpGePush:
-            print("p0 ? 0.0 : {} + 1.0", op(VECTOR_0));
+        {
+            // The result comes from the X components, replicated
+            // (interpreter.cpp:477).
+            const char* compare = "==";
+            switch (instr.vectorOpcode)
+            {
+            case AluVectorOpcode::SetpNePush:
+                compare = "!=";
+                break;
+            case AluVectorOpcode::SetpGtPush:
+                compare = ">";
+                break;
+            case AluVectorOpcode::SetpGePush:
+                compare = ">=";
+                break;
+            }
+            std::string x0 = op(VECTOR_0, 0b0001);
+            print("({0} == 0.0 && {1} {2} 0.0) ? 0.0 : {0} + 1.0", x0, op(VECTOR_1, 0b0001), compare);
             break;
+        }
 
         case AluVectorOpcode::KillEq:
             print("any({} == {})", op(VECTOR_0), op(VECTOR_1));
@@ -1119,7 +1429,18 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         out += ";\n";
     }
 
-    if (instr.scalarOpcode != AluScalarOpcode::RetainPrev)
+#ifdef REBLUE_RECOMP
+    if (hasShadowTexture && vectorWriteMask != 0 && exportRegister.empty())
+    {
+        for (size_t i = 0; i < 4; i++)
+        {
+            if ((vectorWriteMask >> i) & 0x1)
+                shadowTapSlots.erase(uint32_t(instr.vectorDest * 4 + i));
+        }
+    }
+#endif
+
+    if (scalarActive)
     {
         if (instr.scalarOpcode >= AluScalarOpcode::SetpEq && instr.scalarOpcode <= AluScalarOpcode::SetpRstr)
         {
@@ -1180,22 +1501,28 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             break;
 
         case AluScalarOpcode::Muls:
-            print("{} * {}", op(SCALAR_0), op(SCALAR_1));
+            out += mul(op(SCALAR_0), op(SCALAR_1));
             break;
 
         case AluScalarOpcode::MulsPrev:
+            out += mul(op(SCALAR_0), "ps");
+            break;
+
         case AluScalarOpcode::MulsPrev2:
-            print("{} * ps", op(SCALAR_0));
+            // -FLT_MAX unless ps and src.b are finite, src.b > 0 and ps is not
+            // already -FLT_MAX (dxbc_translator_alu.cpp:638, interpreter.cpp:650).
+            print("(ps == -FLT_MAX || !(abs(ps) <= FLT_MAX) || !(abs({0}) <= FLT_MAX) || !({0} > 0.0)) ? -FLT_MAX : {1}",
+                op(SCALAR_1), mul(op(SCALAR_0), "ps"));
             break;
 
         case AluScalarOpcode::Maxs:
         case AluScalarOpcode::MaxAs:
         case AluScalarOpcode::MaxAsf:
-            print("max({}, {})", op(SCALAR_0), op(SCALAR_1));
+            out += maxOp(op(SCALAR_0), op(SCALAR_1));
             break;
 
         case AluScalarOpcode::Mins:
-            print("min({}, {})", op(SCALAR_0), op(SCALAR_1));
+            out += minOp(op(SCALAR_0), op(SCALAR_1));
             break;
 
         case AluScalarOpcode::Seqs:
@@ -1271,7 +1598,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             break;
 
         case AluScalarOpcode::SetpInv:
-            print("{0} == 0.0 ? 1.0 : {0}", op(SCALAR_0));
+            // p0 = src == 1; ps = 0 when p0 is set, else (src == 0 ? 1 : src)
+            // (dxbc_translator_alu.cpp:829).
+            print("p0 ? 0.0 : ({0} == 0.0 ? 1.0 : {0})", op(SCALAR_0));
             break;
 
         case AluScalarOpcode::SetpPop:
@@ -1312,7 +1641,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
         case AluScalarOpcode::Mulsc0:
         case AluScalarOpcode::Mulsc1:
-            print("{} * {}", op(SCALAR_CONSTANT_0), op(SCALAR_CONSTANT_1));
+            out += mul(op(SCALAR_CONSTANT_0), op(SCALAR_CONSTANT_1));
             break;
 
         case AluScalarOpcode::Addsc0:
@@ -1339,17 +1668,38 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
         out += ";\n";
 
+        // maxas/maxasf: a0 from src.a, rounded or floored, clamped to
+        // [-256, 255] (dxbc_translator_alu.cpp:774).
         switch (instr.scalarOpcode)
         {
         case AluScalarOpcode::MaxAs:
             indent();
             println("a0 = (int)clamp(floor({} + 0.5), -256.0, 255.0);", op(SCALAR_0));
-            break;     
+            break;
         case AluScalarOpcode::MaxAsf:
             indent();
             println("a0 = (int)clamp(floor({}), -256.0, 255.0);", op(SCALAR_0));
             break;
         }
+    }
+
+    if (deferVector)
+    {
+        indent();
+        println("{} = xe_vr;", vectorWriteTarget);
+    }
+
+    if (deferA0)
+    {
+        indent();
+        out += "a0 = xe_a0;\n";
+    }
+
+    if (scoped)
+    {
+        --indentation;
+        indent();
+        out += "}\n";
     }
 
     uint32_t scalarWriteMask = instr.scalarWriteMask;
@@ -1378,6 +1728,17 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         out += " = ps;\n";
     }
 
+#ifdef REBLUE_RECOMP
+    if (hasShadowTexture && scalarWriteMask != 0 && exportRegister.empty())
+    {
+        for (size_t i = 0; i < 4; i++)
+        {
+            if ((scalarWriteMask >> i) & 0x1)
+                shadowTapSlots.erase(uint32_t(instr.scalarDest * 4 + i));
+        }
+    }
+#endif
+
     if (instr.exportData)
     {
         uint32_t zeroMask = instr.scalarDestRelative ? (0b1111 & ~(instr.vectorWriteMask | instr.scalarWriteMask)) : 0;
@@ -1402,6 +1763,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     if (instr.scalarOpcode >= AluScalarOpcode::KillsEq && instr.scalarOpcode <= AluScalarOpcode::KillsOne)
     {
         indent();
+        rexUsesKill = true;
         out += "clip(ps != 0.0 ? -1 : 1);\n";
     }
 
@@ -1425,13 +1787,11 @@ void ShaderRecompiler::emitRexglueDeclarations(const uint8_t* shaderData)
     const auto shaderContainer = reinterpret_cast<const ShaderContainer*>(shaderData);
     const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset);
 
-    // Float constants at b1. The runtime uploads only the registers the
-    // shader reads, packed in ascending order, unless any read is
-    // register-relative, in which case the full 256-register file is
-    // uploaded at absolute offsets (see the command processor's
-    // float_bitmap gather). Pass 2 with a static-usage shader gets
-    // per-register variables at their compacted ranks; the discovery pass
-    // and dynamic shaders get the named absolute layout.
+    // Float constants at b1: the runtime uploads only the registers the shader reads, packed in
+    // ascending order, or the full 256-register file at absolute offsets when any read is
+    // register-relative (the command processor's float_bitmap gather). Pass 2 with a static-usage
+    // shader gets per-register variables at their compacted ranks, the discovery pass and dynamic
+    // shaders get the named absolute layout.
     if (rexAbsoluteFloatFile)
     {
         // Container-less generation: the whole guest register file by
@@ -1504,10 +1864,18 @@ void ShaderRecompiler::emitRexglueDeclarations(const uint8_t* shaderData)
     }
     std::stable_sort(floatInfos.begin(), floatInfos.end(),
         [](const ConstantInfo* a, const ConstantInfo* b) { return a->registerIndex.get() < b->registerIndex.get(); });
+    // Registers the table does not name (the def literals) get their own members, merged in register order.
+    auto extra = rexExtraFloatRegs.begin();
+    auto printExtraBelow = [&](uint32_t limit)
+        {
+            for (; extra != rexExtraFloatRegs.end() && *extra < limit; ++extra)
+                println("\tfloat4 xe_fc{0} : packoffset(c{0});", *extra);
+        };
     for (const ConstantInfo* constantInfo : floatInfos)
     {
         const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
 
+        printExtraBelow(constantInfo->registerIndex.get());
         print("\tfloat4 {}", constantName);
         if (constantInfo->registerCount > 1)
             print("[{}]", constantInfo->registerCount.get());
@@ -1516,6 +1884,7 @@ void ShaderRecompiler::emitRexglueDeclarations(const uint8_t* shaderData)
         for (uint16_t j = 0; j < constantInfo->registerCount; j++)
             float4Constants.emplace(constantInfo->registerIndex + j, constantInfo);
     }
+    printExtraBelow(UINT32_MAX);
 
     out += "};\n\n";
 
@@ -1553,6 +1922,8 @@ void ShaderRecompiler::emitRexglueDeclarations(const uint8_t* shaderData)
                 constantName, constantInfo->registerIndex.get());
         }
     }
+    for (uint32_t reg : rexExtraFloatRegs)
+        println("#define xe_fc{0} vk::RawBufferLoad<float4>(XE_PUSH_FLOATS + {0} * 16, 4)", reg);
     out += "#endif\n";
     }
 
@@ -1624,9 +1995,95 @@ void ShaderRecompiler::emitRexglueDeclarations(const uint8_t* shaderData)
                 }
             }
         }, this);
+
+    // Vfetch ordinals in control-flow walk order, which is the record order of the per-draw layout table.
+    ucodeVisitVfetchSlots(codeWords, codeDwords, true,
+        [](uint32_t slot, const uint32_t*, void* context)
+        {
+            static_cast<ShaderRecompiler*>(context)->rexVfetchSlots.push_back(slot);
+        }, this);
+
+    if (rexVfetchSlots.size() > 32)
+        throw std::runtime_error(fmt::format("{} vfetches exceed the 32-record layout table", rexVfetchSlots.size()));
+
+    if (!isPixelShader)
+    {
+        const std::string marker = "//@XE_VFETCH_STATIC_RECORDS@\n";
+        const size_t at = out.find(marker);
+        if (at != std::string::npos)
+        {
+            xenosrecomp::XeVfetchRecord records[64] = {};
+            const uint32_t count = xenosrecomp::ReadVfetchRecords(std::span<const uint32_t>(codeWords, codeDwords), true, records);
+            if (count != rexVfetchSlots.size())
+                throw std::runtime_error(fmt::format("{} layout records for {} vfetch ordinals", count, rexVfetchSlots.size()));
+            std::string text = "static const uint4 xe_vfetch_static_records[32] =\n{\n";
+            for (uint32_t i = 0; i < 32; i++)
+            {
+                const xenosrecomp::XeVfetchRecord r = i < count ? records[i] : xenosrecomp::XeVfetchRecord{};
+                text += fmt::format("    uint4(0x{:08X}u, 0x{:08X}u, 0x{:08X}u, 0x{:08X}u),\n", r.word0, r.stride_dwords,
+                                    uint32_t(r.offset_dwords), r.dst_swizzle);
+            }
+            text += "};\n\nuint4 xe_vfetch_record(uint ordinal)\n{\n    return xe_vfetch_static_records[ordinal];\n}\n";
+            out.replace(at, marker.size(), text);
+        }
+    }
+
+    std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> elementUsage;
+    if (!isPixelShader)
+    {
+        auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
+        for (uint32_t i = 0; i < vertexShader->vertexElementCount; i++)
+        {
+            union
+            {
+                VertexElement vertexElement;
+                uint32_t value;
+            };
+            value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + i];
+            elementUsage.try_emplace(uint32_t(vertexElement.address),
+                uint32_t(vertexElement.usage), uint32_t(vertexElement.usageIndex));
+        }
+    }
+    for (uint32_t slot : rexVfetchSlots)
+    {
+        auto it = elementUsage.find(slot);
+        if (it != elementUsage.end())
+            rexVfetchRefl.push_back({ slot, it->second.first, it->second.second });
+        else
+            rexVfetchRefl.push_back({ slot, 0xFF, 0 });
+    }
 }
 
 // Mirrors FindOrAddSamplerBinding's key normalization and slot allocation.
+std::string ShaderRecompiler::boolCondition(uint32_t boolAddress, bool whenSet)
+{
+#ifdef REBLUE_RECOMP
+    if (!rexglueMode)
+    {
+        auto findResult = boolConstants.find(boolAddress);
+        if (findResult != boolConstants.end())
+            return fmt::format("{}{}", whenSet ? "" : "!", findResult->second);
+        return fmt::format("{}BOOL_BIT({})", whenSet ? "" : "!", boolAddress);
+    }
+#endif
+    // PS bools sit at hardware slots 128-255 while the constant table indexes them from 0.
+    // Without a table entry the g_Booleans bit is used directly, PS registers from bit 16.
+    uint32_t localAddress = boolAddress;
+    if (isPixelShader && localAddress >= 128)
+        localAddress -= 128;
+
+    const char* compare = whenSet ? "!" : "=";
+    const uint32_t maskBit = localAddress + (isPixelShader ? 16 : 0);
+    if (rexglueMode && maskBit < 32)
+        rexBoolMask |= 1u << maskBit;
+    auto findResult = boolConstants.find(localAddress);
+    if (findResult != boolConstants.end())
+        return fmt::format("(g_Booleans & {}) {}= 0", findResult->second, compare);
+    if (rexglueMode)
+        return fmt::format("(g_Booleans & (1 << {})) {}= 0", localAddress + (isPixelShader ? 16 : 0), compare);
+    return fmt::format("b{} {}= 0", boolAddress, compare);
+}
+
 uint32_t ShaderRecompiler::rexAddSamplerBinding(const TextureFetchInstruction& instr)
 {
     uint32_t magFilter = instr.magFilter, minFilter = instr.minFilter, mipFilter = instr.mipFilter;
@@ -1639,8 +2096,10 @@ uint32_t ShaderRecompiler::rexAddSamplerBinding(const TextureFetchInstruction& i
     }
     else
     {
-        // Anisotropic filtering is only used with computed LOD.
-        aniso = instr.useCompLod ? uint32_t(instr.anisoFilter) : 0u;
+        // Anisotropic filtering only applies to computed LODs, which vertex
+        // shaders get only with register gradients (dxbc_translator_fetch.cpp:676).
+        bool computedLod = instr.useCompLod && (isPixelShader || instr.useRegGradients);
+        aniso = computedLod ? uint32_t(instr.anisoFilter) : 0u;
     }
     // Direct3D 12 can't mix anisotropic and point filtering (0=disabled,
     // 7=use fetch constant, 5=max 16:1).
@@ -1654,7 +2113,8 @@ uint32_t ShaderRecompiler::rexAddSamplerBinding(const TextureFetchInstruction& i
     auto key = std::make_tuple(uint32_t(instr.constIndex), magFilter, minFilter, mipFilter, aniso);
     auto result = rexSamplerSlots.try_emplace(key, uint32_t(rexBindings.size()));
     if (result.second)
-        rexBindings.push_back({ uint32_t(rexBindings.size()), true, uint32_t(instr.constIndex), 0, false });
+        rexBindings.push_back({ uint32_t(rexBindings.size()), true, uint32_t(instr.constIndex), 0, false,
+                                magFilter, minFilter, mipFilter, aniso });
     return result.first->second;
 }
 
@@ -1672,8 +2132,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     if (rexglueMode && isPixelShader)
         out += "#define XE_PIXEL_SHADER\n";
 
+    // Vertex fetch layout records are fixed per patched shader (the pack keys on the patched code and the runtime
+    // fills b5 from the same walk), so the vertex shader gets them as literals: every layout and fetch-constant
+    // lookup then folds to a static index instead of a per-vertex dynamic constant-buffer read.
+    if (rexglueMode && !isPixelShader)
+        out += "#define XE_VFETCH_STATIC 1\n";
+
     out += include;
     out += '\n';
+    if (rexglueMode && !isPixelShader)
+        out += "//@XE_VFETCH_STATIC_RECORDS@\n";
 
     const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset);
     constantTableData = reinterpret_cast<const uint8_t*>(&constantTableContainer->constantTable);
@@ -1699,6 +2167,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
 
         const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+
+#ifdef REBLUE_RECOMP
+        if (isPixelShader && constantInfo->registerSet == RegisterSet::Sampler &&
+            strcmp(constantName, "ShadowTexture") == 0)
+        {
+            hasShadowTexture = true;
+        }
+#endif
 
     #ifdef UNLEASHED_RECOMP
         if (!isPixelShader)
@@ -1736,8 +2212,19 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     constantName, shaderName, constantInfo->registerIndex * 16);
             }
             
+#ifdef REBLUE_RECOMP
+            // BD aliases a singleton constant over an array slot; the wider registrant wins so body and cbuffer agree.
+            for (uint16_t j = 0; j < constantInfo->registerCount; j++)
+            {
+                uint32_t reg = constantInfo->registerIndex + j;
+                auto it = float4Constants.find(reg);
+                if (it == float4Constants.end() || it->second->registerCount < constantInfo->registerCount)
+                    float4Constants[reg] = constantInfo;
+            }
+#else
             for (uint16_t j = 0; j < constantInfo->registerCount; j++)
                 float4Constants.emplace(constantInfo->registerIndex + j, constantInfo);
+#endif
 
             break;
         }
@@ -1760,6 +2247,22 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         }
     }
 
+#ifdef REBLUE_RECOMP
+    // BD bodies reference unnamed sampler slots; emit fallback descriptor-index defines for any slot 0..15 the table didn't name.
+    for (uint32_t r = 0; r < 16; r++)
+    {
+        if (samplers.find(r) != samplers.end())
+            continue;
+        for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+        {
+            println("#define s{}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+                r, TEXTURE_DIMENSIONS[j], j * 64 + r * 4);
+        }
+        println("#define s{}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+            r, std::size(TEXTURE_DIMENSIONS) * 64 + r * 4);
+    }
+#endif
+
     out += "\n#else\n\n";
 
     println("cbuffer {}ShaderConstants : register(b{}, space4)", isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 1 : 0);
@@ -1772,6 +2275,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
         if (constantInfo->registerSet == RegisterSet::Float4)
         {
+#ifdef REBLUE_RECOMP
+            // Only the alias winner gets a packoffset slot; a loser would overlap it in the cbuffer and fail DXC.
+            auto winner = float4Constants.find(constantInfo->registerIndex);
+            if (winner == float4Constants.end() || winner->second != constantInfo)
+                continue;
+#endif
+
             const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
 
             print("\tfloat4 {}", constantName);
@@ -1814,6 +2324,22 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         }
     }
 
+#ifdef REBLUE_RECOMP
+    // Mirror the SPIR-V fallback: packoffset slots for any unnamed sampler index 0..15.
+    for (uint32_t r = 0; r < 16; r++)
+    {
+        if (samplers.find(r) != samplers.end())
+            continue;
+        for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+        {
+            println("\tuint s{}_Texture{}DescriptorIndex : packoffset(c{}.{});",
+                r, TEXTURE_DIMENSIONS[j], j * 4 + r / 4, SWIZZLES[r % 4]);
+        }
+        println("\tuint s{}_SamplerDescriptorIndex : packoffset(c{}.{});",
+            r, 4 * std::size(TEXTURE_DIMENSIONS) + r / 4, SWIZZLES[r % 4]);
+    }
+#endif
+
     out += "\tDEFINE_SHARED_CONSTANTS();\n";
     out += "};\n\n";
 
@@ -1828,6 +2354,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         if (constantInfo->registerSet == RegisterSet::Bool)
         {
             const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+#ifdef REBLUE_RECOMP
+            if (!rexglueMode)
+            {
+                // Key named bools by the unified VS(0..127)/PS(128..255) bit so CF tests (also unified) resolve them.
+                const uint32_t unifiedBit = uint32_t(constantInfo->registerIndex) + (isPixelShader ? 128u : 0u);
+                println("\t#define {} BOOL_BIT({})", constantName, unifiedBit);
+                boolConstants.emplace(unifiedBit, constantName);
+                continue;
+            }
+#endif
             println("\t#define {} (1 << {})", constantName, constantInfo->registerIndex + (isPixelShader ? 16 : 0));
             boolConstants.emplace(constantInfo->registerIndex, constantName);
         }
@@ -1854,15 +2390,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
         if (rexglueMode)
         {
-            // Xenos wires VS exports to PS input registers BY INDEX (o{i} ->
-            // interpolator entry i), regardless of the D3DX semantic names in
-            // the containers, which may differ between the paired shaders.
+            // Xenos wires VS exports to PS input registers by index (o{i} -> interpolator entry i),
+            // whatever D3DX semantic names the paired containers carry.
             //
-            // Declare only the registers the container's interpolator table
-            // maps (the read set). D3D12 links PS inputs by semantic against
-            // the VS's full oVar0-15 signature, so a sparse subset is legal,
-            // and every input the ucode never reads stops costing attribute
-            // setup/interpolation on every pixel of every draw.
+            // Only the registers the interpolator table maps are declared: D3D12 links PS inputs by
+            // semantic against the VS's full oVar0-15 signature, so a sparse subset is legal and unread
+            // inputs stop costing interpolation.
             {
                 auto psShader = reinterpret_cast<const PixelShader*>(shader);
                 uint32_t readMask = 0;
@@ -1878,16 +2411,25 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     if (uint32_t(interpolator.reg) < 16)
                         readMask |= 1u << uint32_t(interpolator.reg);
                 }
+                rexPsReadMask = readMask;
+                // Explicit locations keep a sparse input list linked to the right VS outputs on Vulkan.
                 for (uint32_t i = 0; i < 16; i++)
                 {
                     if (readMask & (1u << i))
-                        println("\tin float4 iVar{0} : TEXCOORD{0},", i);
+                        println("\t[[vk::location({0})]] in float4 iVar{0} : TEXCOORD{0},", i);
                 }
             }
         }
         else
         for (auto& [usage, usageIndex] : INTERPOLATORS)
-            println("\tin float4 i{0}{1} : {2}{1},", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
+        {
+#ifdef REBLUE_RECOMP
+            const char* interpolation = (usage == DeclUsage::Color) ? "centroid " : "";
+#else
+            const char* interpolation = "";
+#endif
+            println("\tin {3}float4 i{0}{1} : {2}{1},", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)], interpolation);
+        }
 
         out += "#ifdef __spirv__\n";
         out += "\tin bool iFace : SV_IsFrontFace\n";
@@ -2002,11 +2544,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         {
             // Index-wired varyings (see the pixel shader input note).
             for (uint32_t i = 0; i < 16; i++)
-                print(",\n\tout float4 oVar{0} : TEXCOORD{0}", i);
+                print(",\n\t[[vk::location({0})]] out float4 oVar{0} : TEXCOORD{0}", i);
             // Point size (export register 63, x component), declared on
             // Every rexglue VS so the whole pack shares one output signature
             // and the runtime's point_expand GS links against any of them.
-            out += ",\n\tout float4 oPts : TEXCOORD16";
+            out += ",\n\t[[vk::location(16)]] out float4 oPts : TEXCOORD16";
         }
         else
         for (auto& [usage, usageIndex] : INTERPOLATORS)
@@ -2038,11 +2580,71 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         while (*definitions != 0)
         {
             auto definition = reinterpret_cast<const Float4Definition*>(definitions);
-            auto value = reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + definition->physicalOffset);
+            const size_t literalBytes = size_t((definition->count + 3) / 4) * 16;
+            // Literal bits live in the physical data: after the virtual part of a full container, or in the
+            // separate physical span a runtime shader object provides.
+            const be<uint32_t>* value = nullptr;
+            if (rexPhysicalData != nullptr)
+            {
+                if (size_t(definition->physicalOffset) + literalBytes <= rexPhysicalSize)
+                    value = reinterpret_cast<const be<uint32_t>*>(rexPhysicalData + definition->physicalOffset);
+            }
+            else if (rexContainerSize == 0 ||
+                size_t(shaderContainer->virtualSize) + definition->physicalOffset + literalBytes <= rexContainerSize)
+            {
+                value = reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + definition->physicalOffset);
+            }
+
+            // Rexglue mode reads every literal register from b1 and only reports the literals, since their values
+            // belong to the shader object rather than the microcode (pack_contract.md O-1).
+            if (rexglueMode)
+            {
+                for (uint16_t i = 0; i < (definition->count + 3) / 4; i++)
+                {
+                    RexLiteralRefl literal{ uint32_t(definition->registerIndex + i - (isPixelShader ? 256 : 0)), {}, value != nullptr };
+                    if (value != nullptr)
+                    {
+                        for (uint32_t k = 0; k < 4; k++)
+                            literal.value[k] = value[i * 4 + k].get();
+                    }
+                    rexLiterals.push_back(literal);
+                }
+                definitions += 2;
+                continue;
+            }
+            if (value == nullptr)
+                throw std::runtime_error("definition table literals lie outside the container");
+
             for (uint16_t i = 0; i < (definition->count + 3) / 4; i++)
             {
+#ifdef REBLUE_RECOMP
+                // BD bakes its sun-shadow PCF tap offsets as literals in 1/1024 UV units around 0.5 and 1.0 anchors, and
+                // those within 3/1024 of an anchor are rescaled by g_ShadowPcfScale (c20.z), which is identity at 1.0.
+                auto shadowKernelComponent = [&](uint32_t u) -> std::string
+                {
+                    if (hasShadowTexture)
+                    {
+                        if (u == 0x3A800000)
+                            return fmt::format("(asfloat(0x{:X}u) * g_ShadowPcfScale)", u);
+                        float f;
+                        memcpy(&f, &u, sizeof(f));
+                        for (float anchor : { 0.5f, 1.0f })
+                        {
+                            float d = f > anchor ? f - anchor : anchor - f;
+                            if (f != anchor && d <= 3.0f / 1024.0f)
+                                return fmt::format("({} + (asfloat(0x{:X}u) - {}) * g_ShadowPcfScale)", anchor, u, anchor);
+                        }
+                    }
+                    return fmt::format("asfloat(0x{:X}u)", u);
+                };
+                println("\tfloat4 c{} = float4({}, {}, {}, {});",
+                    definition->registerIndex + i - (isPixelShader ? 256 : 0),
+                    shadowKernelComponent(value[0].get()), shadowKernelComponent(value[1].get()),
+                    shadowKernelComponent(value[2].get()), shadowKernelComponent(value[3].get()));
+#else
                 println("\tfloat4 c{} = asfloat(uint4(0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}));",
                     definition->registerIndex + i - (isPixelShader ? 256 : 0), value[0].get(), value[1].get(), value[2].get(), value[3].get());
+#endif
 
                 value += 4;
             }
@@ -2093,6 +2695,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         if (isPixelShader)
         {
             value = reinterpret_cast<const PixelShader*>(shader)->interpolators[i];
+            rexInterps.push_back({ uint32_t(interpolator.reg), uint32_t(interpolator.usage), uint32_t(interpolator.usageIndex) });
             if (rexglueMode)
             {
                 // Identity wiring: PS register r{n} receives VS export o{n}.
@@ -2108,6 +2711,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         {
             auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
             value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + vertexShader->vertexElementCount + i];
+            rexInterps.push_back({ uint32_t(interpolator.reg), uint32_t(interpolator.usage), uint32_t(interpolator.usageIndex) });
             if (rexglueMode)
             {
                 // Not used in rexglue mode (the export emitter goes straight
@@ -2130,9 +2734,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     if (!isPixelShader)
     {
-    #ifdef UNLEASHED_RECOMP
+    #if defined(UNLEASHED_RECOMP)
         if (!hasMtxProjection)
             out += "\toPos = 0.0;\n";
+    #elif defined(REBLUE_RECOMP)
+        // Always define SV_Position so a skipped position-write block doesn't leave it undef.
+        out += "\toPos = 0.0;\n";
     #endif
 
         if (rexglueMode)
@@ -2155,11 +2762,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             print("\tfloat4 r{} = ", i);
             if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
             {
+                rexPixelPosReg = uint32_t(i);
                 if (rexglueMode)
                 {
                     // Guest pixel position register: xy = pixel coords
                     // (centers at .5), w sign = facing.
-                    out += "float4(iPos.xy, 0.0, iFace ? 1.0 : -1.0);\n";
+                    out += "float4(iPos.xy * xe_pixel_position_scale, 0.0, iFace ? 1.0 : -1.0);\n";
                 }
                 else
                 {
@@ -2189,12 +2797,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     out += "\tbool p0 = false;\n";
     out += "\tfloat ps = 0.0;\n";
     out += "\tuint returnPc = 0;\n";
+    const size_t fetchStatePos = out.size();
     if (isPixelShader)
     {
 #ifdef UNLEASHED_RECOMP
         out += "\tfloat2 pixelCoord = 0.0;\n";
 #endif
         out += "\tCubeMapData cubeMapData = (CubeMapData)0;\n";
+#ifdef REBLUE_RECOMP
+        if (hasShadowTexture)
+            out += "\tfloat2 shadowTapUV[8] = (float2[8])0;\n";
+#endif
     }
 
     const be<uint32_t>* code = rexCodeOverride != nullptr
@@ -2213,18 +2826,251 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         };
     };
 
-    auto controlFlowCode = code;
     uint32_t instrAddress = 0;
     uint32_t instrSize = rexCodeOverride != nullptr ? rexCodeOverrideSize : shader->size;
+
+    // Subroutine inlining. A call that is unconditional and unpredicated, whose body is a straight run of clauses
+    // ending in a return, is spliced in at its call site and the body dropped, so the program becomes call-free
+    // and the structured or guard emitters below can take it instead of the pc dispatch loop. Anything else
+    // (conditional calls, bodies with transfers, jumps into a body, growth past the cf region) keeps the original
+    // stream. XENOSRECOMP_KEEP_CALLS=1 disables the pass for A/B builds.
+    std::vector<be<uint32_t>> inlinedCf;
+    if (getenv("XENOSRECOMP_KEEP_CALLS") == nullptr)
+    {
+        struct CfWord
+        {
+            uint32_t lo = 0;
+            uint32_t hi = 0;
+            ControlFlowInstruction instr{};
+        };
+        std::vector<CfWord> cfs;
+        uint32_t cfSize = instrSize;
+        uint32_t at = 0;
+        auto scan = code;
+        while (at < cfSize)
+        {
+            const uint32_t w0 = scan[0], w1 = scan[1], w2 = scan[2];
+            const uint32_t lo[2] = { w0, (w1 >> 16) | (w2 << 16) };
+            const uint32_t hi[2] = { w1 & 0xFFFF, w2 >> 16 };
+            for (int k = 0; k < 2; k++)
+            {
+                CfWord c;
+                c.lo = lo[k];
+                c.hi = hi[k];
+                const uint32_t words[2] = { c.lo, c.hi };
+                memcpy(&c.instr, words, sizeof(words));
+                uint32_t clauseAddress = 0;
+                switch (c.instr.opcode)
+                {
+                case ControlFlowOpcode::Exec:
+                case ControlFlowOpcode::ExecEnd:
+                    clauseAddress = c.instr.exec.address;
+                    break;
+                case ControlFlowOpcode::CondExec:
+                case ControlFlowOpcode::CondExecEnd:
+                case ControlFlowOpcode::CondExecPredClean:
+                case ControlFlowOpcode::CondExecPredCleanEnd:
+                    clauseAddress = c.instr.condExec.address;
+                    break;
+                case ControlFlowOpcode::CondExecPred:
+                case ControlFlowOpcode::CondExecPredEnd:
+                    clauseAddress = c.instr.condExecPred.address;
+                    break;
+                default:
+                    break;
+                }
+                if (clauseAddress != 0)
+                    cfSize = std::min<uint32_t>(cfSize, clauseAddress * 12);
+                cfs.push_back(c);
+            }
+            scan += 3;
+            at += 12;
+        }
+
+        auto isClause = [](ControlFlowOpcode op)
+        {
+            return op == ControlFlowOpcode::Exec || op == ControlFlowOpcode::CondExec ||
+                   op == ControlFlowOpcode::CondExecPred || op == ControlFlowOpcode::CondExecPredClean ||
+                   op == ControlFlowOpcode::Nop || op == ControlFlowOpcode::Alloc ||
+                   op == ControlFlowOpcode::MarkVsFetchDone;
+        };
+        auto isEnd = [](ControlFlowOpcode op)
+        {
+            return op == ControlFlowOpcode::ExecEnd || op == ControlFlowOpcode::CondExecEnd ||
+                   op == ControlFlowOpcode::CondExecPredEnd || op == ControlFlowOpcode::CondExecPredCleanEnd ||
+                   op == ControlFlowOpcode::Return;
+        };
+
+        const uint32_t n = uint32_t(cfs.size());
+        struct Sub
+        {
+            uint32_t start = 0;
+            uint32_t ret = 0;
+        };
+        std::map<uint32_t, Sub> subs;
+        bool ok = true;
+        for (uint32_t i = 0; i < n && ok; i++)
+        {
+            if (cfs[i].instr.opcode != ControlFlowOpcode::CondCall)
+                continue;
+            const auto& cc = cfs[i].instr.condCall;
+            const uint32_t t = cc.address;
+            if (!cc.isUnconditional || cc.isPredicated || t == 0 || t >= n)
+                ok = false;
+            else
+                subs[t].start = t;
+        }
+        if (subs.empty())
+            ok = false;
+        uint32_t mainEnd = n;
+        for (auto& [start, sub] : subs)
+        {
+            if (!ok)
+                break;
+            uint32_t r = start;
+            while (r < n && cfs[r].instr.opcode != ControlFlowOpcode::Return)
+            {
+                if (!isClause(cfs[r].instr.opcode))
+                {
+                    ok = false;
+                    break;
+                }
+                ++r;
+            }
+            if (!ok || r >= n || !isEnd(cfs[start - 1].instr.opcode))
+            {
+                ok = false;
+                break;
+            }
+            sub.ret = r;
+            mainEnd = std::min(mainEnd, start);
+        }
+        if (ok)
+        {
+            // Past the main region only subroutine bodies, their returns and padding may remain.
+            for (uint32_t j = mainEnd; j < n && ok; j++)
+            {
+                bool covered = cfs[j].instr.opcode == ControlFlowOpcode::Nop;
+                for (const auto& [start, sub] : subs)
+                    covered = covered || (j >= start && j <= sub.ret);
+                if (!covered)
+                    ok = false;
+            }
+            // No transfer in the main region may reach into a body.
+            for (uint32_t i = 0; i < mainEnd && ok; i++)
+            {
+                const auto& in = cfs[i].instr;
+                uint32_t t = 0;
+                bool hasTarget = false;
+                switch (in.opcode)
+                {
+                case ControlFlowOpcode::CondJmp: t = in.condJmp.address; hasTarget = true; break;
+                case ControlFlowOpcode::LoopStart: t = in.loopStart.address; hasTarget = true; break;
+                case ControlFlowOpcode::LoopEnd: t = in.loopEnd.address; hasTarget = true; break;
+                case ControlFlowOpcode::Return: ok = false; break;
+                default: break;
+                }
+                if (hasTarget && t >= mainEnd)
+                    ok = false;
+            }
+        }
+        if (ok)
+        {
+            std::vector<CfWord> seq;
+            std::vector<uint32_t> newIndex(mainEnd + 1, 0);
+            struct Fixup
+            {
+                uint32_t seqIndex;
+                uint32_t oldTarget;
+            };
+            std::vector<Fixup> fixups;
+            for (uint32_t i = 0; i < mainEnd; i++)
+            {
+                newIndex[i] = uint32_t(seq.size());
+                const auto& in = cfs[i].instr;
+                if (in.opcode == ControlFlowOpcode::CondCall)
+                {
+                    const Sub& sub = subs[in.condCall.address];
+                    for (uint32_t j = sub.start; j < sub.ret; j++)
+                        seq.push_back(cfs[j]);
+                    continue;
+                }
+                if (in.opcode == ControlFlowOpcode::CondJmp)
+                    fixups.push_back({ uint32_t(seq.size()), in.condJmp.address });
+                else if (in.opcode == ControlFlowOpcode::LoopStart)
+                    fixups.push_back({ uint32_t(seq.size()), in.loopStart.address });
+                else if (in.opcode == ControlFlowOpcode::LoopEnd)
+                    fixups.push_back({ uint32_t(seq.size()), in.loopEnd.address });
+                seq.push_back(cfs[i]);
+            }
+            newIndex[mainEnd] = uint32_t(seq.size());
+            if (seq.size() > n)
+                ok = false;
+            for (const Fixup& f : fixups)
+            {
+                if (!ok)
+                    break;
+                if (f.oldTarget > mainEnd)
+                {
+                    ok = false;
+                    break;
+                }
+                CfWord& c = seq[f.seqIndex];
+                const uint32_t t = newIndex[f.oldTarget];
+                switch (c.instr.opcode)
+                {
+                case ControlFlowOpcode::CondJmp: c.instr.condJmp.address = t; break;
+                case ControlFlowOpcode::LoopStart: c.instr.loopStart.address = t; break;
+                case ControlFlowOpcode::LoopEnd: c.instr.loopEnd.address = t; break;
+                default: break;
+                }
+                uint32_t words[2];
+                memcpy(words, &c.instr, sizeof(words));
+                c.lo = words[0];
+                c.hi = words[1];
+            }
+            if (ok)
+            {
+                if (seq.size() % 2 != 0)
+                    seq.push_back(CfWord{});
+                for (size_t i = 0; i < seq.size(); i += 2)
+                {
+                    const CfWord& a = seq[i];
+                    const CfWord& b = seq[i + 1];
+                    const uint32_t w[3] = { a.lo, (a.hi & 0xFFFF) | (b.lo << 16), (b.lo >> 16) | (b.hi << 16) };
+                    for (uint32_t word : w)
+                    {
+                        be<uint32_t> v;
+                        v.value = byteSwap(word);
+                        inlinedCf.push_back(v);
+                    }
+                }
+            }
+        }
+    }
+    const be<uint32_t>* cfStream = inlinedCf.empty() ? code : inlinedCf.data();
+    if (!inlinedCf.empty())
+        instrSize = uint32_t(inlinedCf.size() * sizeof(uint32_t));
+    auto controlFlowCode = cfStream;
+
     bool simpleControlFlow = true;
-    // All transfers strictly forward, no loops/calls/returns: such programs
-    // get GUARD emission (`if (pc <= i)` blocks; jumps just raise pc)
-    // instead of the while/switch pc machine. The dispatch loop makes every
-    // block a dynamic-jump target, the compiler cannot flatten flow and
-    // all registers stay live across every case, which is far slower.
-    // A forward-only guard chain is a plain branch DAG instead.
+    // Programs whose transfers all go strictly forward (no loops, calls or returns) get guard
+    // emission (`if (pc <= i)` blocks, jumps raise pc) instead of the while/switch pc machine.
+    // The dispatch loop turns every block into a dynamic-jump target and keeps all registers live,
+    // while a forward-only guard chain stays a plain branch DAG.
     bool forwardOnlyFlow = true;
     uint32_t scanPc = 0;
+
+    // Per-instruction control flow summary for the structurizer below.
+    enum class CfKind : uint8_t { None, Cond, Uncond, LoopStart, LoopEnd };
+    struct CfSummary
+    {
+        CfKind kind = CfKind::None;
+        uint32_t target = 0;
+    };
+    std::vector<CfSummary> cfSummaries;
+    std::vector<uint32_t> loopStarts;
+    std::unordered_map<uint32_t, uint32_t> loopEndFor;
 
     while (instrAddress < instrSize)
     {
@@ -2258,17 +3104,33 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 divergentPcs.insert(scanPc);
                 break;
 
-            case ControlFlowOpcode::CondJmp:
-            {
-                if (cfInstr.condJmp.isUnconditional || cfInstr.condJmp.direction)
+            // Loop-back transfers rule out guard emission; the structurizer still emits real for-loops.
+            case ControlFlowOpcode::LoopStart:
+                loopStarts.push_back(scanPc);
+                cfSummaries.push_back({ CfKind::LoopStart, 0 });
+                forwardOnlyFlow = false;
+                break;
+
+            case ControlFlowOpcode::LoopEnd:
+                if (loopStarts.empty())
                     simpleControlFlow = false;
                 else
-                    ++ifEndLabels[cfInstr.condJmp.address];
+                {
+                    loopEndFor[loopStarts.back()] = scanPc;
+                    loopStarts.pop_back();
+                }
+                cfSummaries.push_back({ CfKind::LoopEnd, 0 });
+                forwardOnlyFlow = false;
+                break;
 
-                // Backward or degenerate target: guard emission cannot
-                // represent it (pc only ever increases there).
+            case ControlFlowOpcode::CondJmp:
+            {
+                // A backward or degenerate target defeats both the structurizer and guard emission.
                 if (cfInstr.condJmp.direction || cfInstr.condJmp.address <= scanPc)
+                {
+                    simpleControlFlow = false;
                     forwardOnlyFlow = false;
+                }
 
                 // A p0-conditional jump splits the quad per-pixel: everything
                 // between the jump and its (forward) target runs divergent
@@ -2282,16 +3144,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                         for (uint32_t d = scanPc + 1; d < cfInstr.condJmp.address; d++)
                             divergentPcs.insert(d);
                 }
+
+                cfSummaries.push_back({
+                    cfInstr.condJmp.isUnconditional ? CfKind::Uncond : CfKind::Cond,
+                    uint32_t(cfInstr.condJmp.address) });
                 break;
             }
-
-            case ControlFlowOpcode::LoopStart:
-            case ControlFlowOpcode::LoopEnd:
-                // Loop-back transfer: guard emission cannot represent it.
-                // (Simple mode still emits real for-loops when nothing else
-                // broke structure; this only demotes guard -> pc machine.)
-                forwardOnlyFlow = false;
-                break;
 
             case ControlFlowOpcode::CondCall:
                 // Subroutines need the pc-dispatch loop (the call target and the
@@ -2313,6 +3171,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 break;
             }
 
+            if (cfSummaries.size() == scanPc)
+                cfSummaries.push_back({});
+
             if (address != 0)
                 instrSize = std::min<uint32_t>(instrSize, address * 12);
 
@@ -2321,6 +3182,129 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
         controlFlowCode += 3;
         instrAddress += 12;
+    }
+
+    if (!loopStarts.empty())
+        simpleControlFlow = false;
+
+    // An unconditional jump inside divergent code sends only some lanes to its target, so the
+    // skipped span (an else branch) is divergent too.
+    for (uint32_t i = 0; i < cfSummaries.size(); i++)
+    {
+        if (cfSummaries[i].kind == CfKind::Uncond && cfSummaries[i].target > i &&
+            (allPcsDivergent || divergentPcs.count(i) != 0))
+        {
+            for (uint32_t d = i + 1; d < cfSummaries[i].target; d++)
+                divergentPcs.insert(d);
+        }
+    }
+
+    if (simpleControlFlow)
+    {
+        // Recursive-descent structurizer for forward-jump if/else diamonds (then-exit jumps may chain to an enclosing
+        // merge) and LoopStart/LoopEnd pairs over a region [lo, hi) with continuation cont; other shapes fall back.
+        const uint32_t instrCount = (instrSize / 12) * 2;
+        if (cfSummaries.size() > instrCount)
+            cfSummaries.resize(instrCount);
+
+        std::function<bool(uint32_t, uint32_t, uint32_t)> structure =
+            [&](uint32_t lo, uint32_t hi, uint32_t cont) -> bool
+        {
+            uint32_t i = lo;
+            while (i < hi)
+            {
+                const CfSummary& summary = cfSummaries[i];
+                switch (summary.kind)
+                {
+                case CfKind::Uncond:
+                {
+                    if (i + 1 == hi && (summary.target == cont || summary.target == hi))
+                        i = hi;
+                    else
+                        return false;
+                    break;
+                }
+                case CfKind::Cond:
+                {
+                    const uint32_t t = summary.target;
+                    if (t > hi)
+                    {
+                        if (t != cont)
+                            return false;
+                        ++ifEndLabels[hi];
+                        if (!structure(i + 1, hi, cont))
+                            return false;
+                        i = hi;
+                    }
+                    // A then-exit jump targeting the cond target itself is a
+                    // no-op (empty else); fall through to the plain-if path,
+                    // whose trailing-jump rule deletes it.
+                    else if (t < hi && t - 1 > i && cfSummaries[t - 1].kind == CfKind::Uncond &&
+                             cfSummaries[t - 1].target != t)
+                    {
+                        const uint32_t merge = cfSummaries[t - 1].target;
+                        if (merge == cont || merge == hi)
+                        {
+                            elseLabels.insert(t);
+                            ++ifEndLabels[hi];
+                            if (!structure(i + 1, t - 1, merge == cont ? cont : hi))
+                                return false;
+                            if (!structure(t, hi, cont))
+                                return false;
+                            i = hi;
+                        }
+                        else if (merge < hi)
+                        {
+                            elseLabels.insert(t);
+                            ++ifEndLabels[merge];
+                            if (!structure(i + 1, t - 1, merge))
+                                return false;
+                            if (!structure(t, merge, merge))
+                                return false;
+                            i = merge;
+                        }
+                        else
+                        {
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        ++ifEndLabels[t];
+                        if (!structure(i + 1, t, t == hi ? cont : t))
+                            return false;
+                        i = t;
+                    }
+                    break;
+                }
+                case CfKind::LoopStart:
+                {
+                    auto loopEnd = loopEndFor.find(i);
+                    if (loopEnd == loopEndFor.end() || loopEnd->second >= hi)
+                        return false;
+                    if (!structure(i + 1, loopEnd->second, loopEnd->second))
+                        return false;
+                    i = loopEnd->second + 1;
+                    break;
+                }
+                case CfKind::LoopEnd:
+                    return false; // reached without its LoopStart
+
+                default:
+                    ++i;
+                    break;
+                }
+            }
+            return true;
+        };
+
+        simpleControlFlow = structure(0, instrCount, instrCount);
+    }
+
+    if (!simpleControlFlow)
+    {
+        ifEndLabels.clear();
+        elseLabels.clear();
     }
 
     const bool guardFlow = !simpleControlFlow && forwardOnlyFlow;
@@ -2337,6 +3321,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     }
     else
     {
+        rexPcMachine = true;
         out += "\n\tuint pc = 0;\n";
         out += "\twhile (true)\n";
         out += "\t{\n";
@@ -2344,7 +3329,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         out += "\t\t{\n";
     }
 
-    controlFlowCode = code;
+    controlFlowCode = cfStream;
     instrAddress = 0;
     uint32_t pc = 0;
 
@@ -2382,6 +3367,19 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                         out += "}\n";
                     }
                 }
+                // Inner regions close first (validated nesting), then the
+                // enclosing if's then-branch flips to its else-branch.
+                if (elseLabels.count(pc) != 0)
+                {
+                    --indentation;
+                    indent();
+                    out += "}\n";
+                    indent();
+                    out += "else\n";
+                    indent();
+                    out += "{\n";
+                    ++indentation;
+                }
             }
 
             ++pc;
@@ -2414,24 +3412,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd ||
                                 cfInstr.opcode == ControlFlowOpcode::CondExecPredCleanEnd);
 
-                // The clause only runs when the bool constant matches the
-                // condition; emitting it unguarded lets a disabled clause
-                // clobber live registers. Bool conditions are uniform across
-                // the draw, so the guard introduces no divergent fetches. The
-                // shader end after a Cond*End clause stays unconditional; the
-                // guard closes before it.
-                uint32_t boolAddress = cfInstr.condExec.boolAddress;
-                if (isPixelShader && boolAddress >= 128)
-                    boolAddress -= 128;
-
+                // The clause runs only when the bool constant matches the condition, and bools are uniform
+                // across the draw, so the guard adds no divergent fetches (dxbc_translator.cpp:1561).
+                // The shader end after a Cond*End clause stays unconditional; the guard closes before it.
                 indent();
-                auto findResult = boolConstants.find(boolAddress);
-                if (findResult != boolConstants.end())
-                    println("if ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condExec.condition ? "!" : "=");
-                else if (rexglueMode)
-                    println("if ((g_Booleans & (1 << {})) {}= 0)", boolAddress + (isPixelShader ? 16 : 0), cfInstr.condExec.condition ? "!" : "=");
-                else
-                    println("if (b{} {}= 0)", uint32_t(cfInstr.condExec.boolAddress), cfInstr.condExec.condition ? "!" : "=");
+                println("if ({})", boolCondition(cfInstr.condExec.boolAddress, cfInstr.condExec.condition));
                 indent();
                 out += "{\n";
                 ++indentation;
@@ -2445,6 +3430,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 count = cfInstr.condExecPred.count;
                 sequence = cfInstr.condExecPred.sequence;
                 shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecPredEnd);
+
+                // The clause runs only when p0 matches at its start; predicated
+                // instructions inside recheck p0 (dxbc_translator.cpp:1580).
+                indent();
+                println("if ({}p0)", cfInstr.condExecPred.condition ? "" : "!");
+                indent();
+                out += "{\n";
+                ++indentation;
+                clauseGuardOpen = true;
                 break;
 
             case ControlFlowOpcode::LoopStart:
@@ -2466,6 +3460,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 break;
 
             case ControlFlowOpcode::LoopEnd:
+                if (cfInstr.loopEnd.isPredicatedBreak)
+                    throw std::runtime_error("unimplemented control flow: loop_end with predicated break");
                 if (simpleControlFlow)
                 {
                     --indentation;
@@ -2487,10 +3483,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             {
                 if (cfInstr.condJmp.isUnconditional)
                 {
-                    assert(!simpleControlFlow);
-                    println("\t\t\tpc = {}u;", uint32_t(cfInstr.condJmp.address));
-                    if (!guardFlow)
-                        out += "\t\t\tcontinue;\n";
+                    // Structured mode: the then-branch exit jump was consumed by
+                    // the "} else {" emitted at the next instruction.
+                    if (!simpleControlFlow)
+                    {
+                        println("\t\t\tpc = {}u;", uint32_t(cfInstr.condJmp.address));
+                        if (!guardFlow)
+                            out += "\t\t\tcontinue;\n";
+                    }
                 }
                 else
                 {
@@ -2501,21 +3501,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     }
                     else
                     {
-                        // Pixel shader bool constants live at hardware slots 128-255;
-                        // the constant table indexes them 0-based.
-                        uint32_t boolAddress = cfInstr.condJmp.boolAddress;
-                        if (isPixelShader && boolAddress >= 128)
-                            boolAddress -= 128;
-
-                        auto findResult = boolConstants.find(boolAddress);
-                        if (findResult != boolConstants.end())
-                            println("if ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
-                        else if (rexglueMode)
-                            // No constant table (container-less generation):
-                            // g_Booleans bit position directly (PS regs at 16+).
-                            println("if ((g_Booleans & (1 << {})) {}= 0)", boolAddress + (isPixelShader ? 16 : 0), cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
-                        else
-                            println("if (b{} {}= 0)", uint32_t(cfInstr.condJmp.boolAddress), cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+                        println("if ({})", boolCondition(cfInstr.condJmp.boolAddress, cfInstr.condJmp.condition ^ simpleControlFlow));
                     }
 
                     if (simpleControlFlow)
@@ -2557,19 +3543,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     }
                     else
                     {
-                        // Pixel shader bool constants live at hardware slots 128-255;
-                        // the constant table indexes them 0-based.
-                        uint32_t boolAddress = cfInstr.condCall.boolAddress;
-                        if (isPixelShader && boolAddress >= 128)
-                            boolAddress -= 128;
-
-                        auto findResult = boolConstants.find(boolAddress);
-                        if (findResult != boolConstants.end())
-                            println("\t\t\tif ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condCall.condition ? "!" : "=");
-                        else if (rexglueMode)
-                            println("\t\t\tif ((g_Booleans & (1 << {})) {}= 0)", boolAddress + (isPixelShader ? 16 : 0), cfInstr.condCall.condition ? "!" : "=");
-                        else
-                            println("\t\t\tif (b{} {}= 0)", uint32_t(cfInstr.condCall.boolAddress), cfInstr.condCall.condition ? "!" : "=");
+                        println("\t\t\tif ({})", boolCondition(cfInstr.condCall.boolAddress, cfInstr.condCall.condition));
                     }
                     out += "\t\t\t{\n";
                     println("\t\t\t\treturnPc = {};", pc);
@@ -2791,6 +3765,30 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         out += "\t\tbreak;\n";
         out += "\t}\n";
     }
+    else
+    {
+        // Regions closing one past the last instruction never get visited by
+        // the loop above; balance their braces here.
+        auto findResult = ifEndLabels.find(pc);
+        if (findResult != ifEndLabels.end())
+        {
+            for (uint32_t i = 0; i < findResult->second; i++)
+            {
+                --indentation;
+                indent();
+                out += "}\n";
+            }
+        }
+    }
+
+    // setTexLOD / setGradientH / setGradientV state (the translator's
+    // grad_h_lod and grad_v temporaries), declared only when used.
+    std::string fetchState;
+    if (usesRegisterLod)
+        fetchState += "\tfloat xe_lod = 0.0;\n";
+    if (usesRegisterGradients)
+        fetchState += "\tfloat3 xe_grad_h = 0.0;\n\tfloat3 xe_grad_v = 0.0;\n";
+    out.insert(fetchStatePos, fetchState);
 
 #ifdef UNLEASHED_RECOMP
     if (hasMtxProjection)

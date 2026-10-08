@@ -11,8 +11,11 @@
 #include "plume_vulkan.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <climits>
+#include <cstdio>
 #include <unordered_map>
 
 #if DLSS_ENABLED
@@ -397,8 +400,12 @@ namespace plume {
         case RenderBlend::INV_SRC1_ALPHA:
             return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
         default:
-            assert(false && "Unknown blend factor.");
-            return VK_BLEND_FACTOR_MAX_ENUM;
+            // REXGLUE: RenderBlend::UNKNOWN (the RenderBlendDesc default)
+            // reaches here for pipelines that leave blend factors unset
+            // because blendEnabled is false — the factors are don't-care.
+            // D3D12 tolerates this; MAX_ENUM crashes Vulkan drivers, so
+            // return a valid inert factor instead.
+            return VK_BLEND_FACTOR_ONE;
         }
     }
 
@@ -415,8 +422,9 @@ namespace plume {
         case RenderBlendOperation::MAX:
             return VK_BLEND_OP_MAX;
         default:
-            assert(false && "Unknown blend operation.");
-            return VK_BLEND_OP_MAX_ENUM;
+            // REXGLUE: RenderBlendOperation::UNKNOWN default — see the
+            // blend-factor default above. Inert ADD instead of MAX_ENUM.
+            return VK_BLEND_OP_ADD;
         }
     }
 
@@ -840,7 +848,10 @@ namespace plume {
         bufferInfo.usage |= (desc.flags & RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT) ? VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR : 0;
         bufferInfo.usage |= (desc.flags & RenderBufferFlag::SHADER_BINDING_TABLE) ? VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR : 0;
         
-        const uint32_t deviceAddressMask = RenderBufferFlag::CONSTANT | RenderBufferFlag::ACCELERATION_STRUCTURE | RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT | RenderBufferFlag::SHADER_BINDING_TABLE;
+        // REXGLUE: DEVICE_ADDRESSABLE added — getDeviceAddress()'s own
+        // contract asserts on that flag, but the usage mask omitted it, so a
+        // buffer flagged ONLY as addressable never got the usage bit.
+        const uint32_t deviceAddressMask = RenderBufferFlag::CONSTANT | RenderBufferFlag::ACCELERATION_STRUCTURE | RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT | RenderBufferFlag::SHADER_BINDING_TABLE | RenderBufferFlag::DEVICE_ADDRESSABLE;
         const bool useDeviceAddress = device->capabilities.bufferDeviceAddress && (desc.flags & deviceAddressMask);
         bufferInfo.usage |= useDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0;
         
@@ -1395,7 +1406,7 @@ namespace plume {
         pipelineInfo.layout = pipelineLayout->vk;
         pipelineInfo.stage = stageInfo;
 
-        VkResult res = vkCreateComputePipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
+        VkResult res = vkCreateComputePipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
             return;
@@ -1507,10 +1518,15 @@ namespace plume {
             renderTargetCount = 1;
         }
 
+        // REXGLUE: ONE viewport/scissor, not one-per-render-target. Xenos
+        // MRT draws share a single viewport/scissor, and the runtime sets
+        // exactly one (setViewport/setScissor index 0); declaring N dynamic
+        // viewports then setting only viewport 0 is a validation error
+        // (VUID-vkCmdDraw-None-07831/07832) the guest MRT passes tripped.
         VkPipelineViewportStateCreateInfo viewportState = {};
         viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        viewportState.viewportCount = renderTargetCount;
-        viewportState.scissorCount = renderTargetCount;
+        viewportState.viewportCount = 1;
+        viewportState.scissorCount = 1;
 
         VkPipelineRasterizationStateCreateInfo rasterization = {};
         rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
@@ -1617,6 +1633,7 @@ namespace plume {
         dynamicStates.clear();
         dynamicStates.emplace_back(VK_DYNAMIC_STATE_VIEWPORT);
         dynamicStates.emplace_back(VK_DYNAMIC_STATE_SCISSOR);
+        dynamicStates.emplace_back(VK_DYNAMIC_STATE_BLEND_CONSTANTS);
 
         if (desc.dynamicDepthBiasEnabled) {
             dynamicStates.emplace_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
@@ -1654,10 +1671,19 @@ namespace plume {
         pipelineInfo.layout = pipelineLayout->vk;
         pipelineInfo.renderPass = renderPass;
 
-        VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
+        VkResult res = vkCreateGraphicsPipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X.\n", res);
             return;
+        }
+        // REXGLUE: checkpoint at most once a second while pipelines are being created, so a killed
+        // run loses under a second of compiles instead of up to 63 pipelines.
+        if (device->pipelineCache != VK_NULL_HANDLE) {
+            static std::atomic<int64_t> s_lastSave{0};
+            const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            int64_t last = s_lastSave.load();
+            if (now - last >= 1000 && s_lastSave.compare_exchange_strong(last, now)) device->savePipelineCache();
         }
     }
 
@@ -3117,6 +3143,10 @@ namespace plume {
         vkCmdSetDepthBias(vk, depthBias, depthBiasClamp, slopeScaledDepthBias);
     }
 
+    void VulkanCommandList::setBlendFactor(const float *rgba) {
+        vkCmdSetBlendConstants(vk, rgba);
+    }
+
     static void clearCommonRectVector(uint32_t width, uint32_t height, const RenderRect *clearRects, uint32_t clearRectsCount, std::vector<VkClearRect> &rectVector) {
         rectVector.clear();
 
@@ -3233,6 +3263,40 @@ namespace plume {
             imageCopy.imageExtent.height = srcLocation.placedFootprint.height;
             imageCopy.imageExtent.depth = srcLocation.placedFootprint.depth;
             vkCmdCopyBufferToImage(vk, srcBuffer->vk, dstTexture->vk, toImageLayout(dstTexture->textureLayout), 1, &imageCopy);
+        }
+        else if ((srcLocation.type == RenderTextureCopyType::SUBRESOURCE) && (dstLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT)) {
+            // REXGLUE: texture -> buffer readback (the depth-resolve staging
+            // copy). plume's Vulkan backend was missing this direction — the
+            // texture->texture else branch below dereferences dstTexture,
+            // which is null when the destination is a buffer footprint.
+            assert(srcTexture != nullptr);
+            assert(dstBuffer != nullptr);
+
+            const uint32_t blockWidth = RenderFormatBlockWidth(srcTexture->desc.format);
+            VkBufferImageCopy imageCopy = {};
+            imageCopy.bufferOffset = dstLocation.placedFootprint.offset;
+            imageCopy.bufferRowLength = ((dstLocation.placedFootprint.rowWidth + blockWidth - 1) / blockWidth) * blockWidth;
+            imageCopy.bufferImageHeight = ((dstLocation.placedFootprint.height + blockWidth - 1) / blockWidth) * blockWidth;
+            imageCopy.imageSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
+            imageCopy.imageSubresource.baseArrayLayer = srcLocation.subresource.arrayIndex;
+            imageCopy.imageSubresource.layerCount = 1;
+            imageCopy.imageSubresource.mipLevel = srcLocation.subresource.mipLevel;
+            if (srcBox != nullptr) {
+                imageCopy.imageOffset.x = srcBox->left;
+                imageCopy.imageOffset.y = srcBox->top;
+                imageCopy.imageOffset.z = srcBox->front;
+                imageCopy.imageExtent.width = srcBox->right - srcBox->left;
+                imageCopy.imageExtent.height = srcBox->bottom - srcBox->top;
+                imageCopy.imageExtent.depth = srcBox->back - srcBox->front;
+            } else {
+                imageCopy.imageOffset.x = dstX;
+                imageCopy.imageOffset.y = dstY;
+                imageCopy.imageOffset.z = dstZ;
+                imageCopy.imageExtent.width = dstLocation.placedFootprint.width;
+                imageCopy.imageExtent.height = dstLocation.placedFootprint.height;
+                imageCopy.imageExtent.depth = dstLocation.placedFootprint.depth;
+            }
+            vkCmdCopyImageToBuffer(vk, srcTexture->vk, toImageLayout(srcTexture->textureLayout), dstBuffer->vk, 1, &imageCopy);
         }
         else {
             VkImageCopy imageCopy = {};
@@ -3773,6 +3837,35 @@ namespace plume {
             }
 
             std::string deviceName(deviceProperties.deviceName);
+
+#ifdef _WIN32
+            // REXGLUE: adapter pick (env REXGLUE_ADAPTER), mirroring the
+            // D3D12 backend: hex vendor id ("8086" = Intel) or
+            // case-insensitive name fragment ("intel", "vega") — hybrid-GPU
+            // machines choose the GPU per config. Non-matching devices are
+            // skipped; the caller falls back to unfiltered if nothing
+            // matched.
+            {
+                char adapterEnv[64] = {};
+                if (GetEnvironmentVariableA("REXGLUE_ADAPTER", adapterEnv, sizeof(adapterEnv)) && adapterEnv[0] != 0) {
+                    char *hexEnd = nullptr;
+                    const unsigned long vendorFilter = strtoul(adapterEnv, &hexEnd, 16);
+                    bool matched = (hexEnd != adapterEnv && *hexEnd == 0 &&
+                                    vendorFilter != 0 && deviceProperties.vendorID == vendorFilter);
+                    if (!matched) {
+                        std::string nameLower = deviceName;
+                        std::string frag = adapterEnv;
+                        for (char &c : nameLower) c = char(tolower((unsigned char)c));
+                        for (char &c : frag) c = char(tolower((unsigned char)c));
+                        matched = nameLower.find(frag) != std::string::npos;
+                    }
+                    if (!matched) {
+                        continue;
+                    }
+                }
+            }
+#endif
+
             uint32_t deviceTypeScore = deviceTypeScoreTable[deviceTypeIndex];
             bool preferDeviceTypeScore = (deviceTypeScore > currentDeviceTypeScore);
             bool preferUserChoice = preferredDeviceName == deviceName;
@@ -4100,6 +4193,30 @@ namespace plume {
             fprintf(stderr, "vmaCreateAllocator failed with error code 0x%X.\n", res);
             release();
             return;
+        }
+
+        // REXGLUE: pipeline cache seeded from disk. One file per GPU, since a driver discards a blob
+        // written by another device and a shared file kept resetting on dual-GPU machines.
+        {
+            std::vector<uint8_t> cacheBlob;
+            if (const std::string path = pipelineCachePath(); !path.empty()) {
+                if (FILE *f = fopen(path.c_str(), "rb")) {
+                    fseek(f, 0, SEEK_END);
+                    long n = ftell(f);
+                    fseek(f, 0, SEEK_SET);
+                    if (n > 0) {
+                        cacheBlob.resize(size_t(n));
+                        if (fread(cacheBlob.data(), 1, cacheBlob.size(), f) != cacheBlob.size())
+                            cacheBlob.clear();
+                    }
+                    fclose(f);
+                }
+            }
+            VkPipelineCacheCreateInfo cacheInfo = {};
+            cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+            cacheInfo.initialDataSize = cacheBlob.size();
+            cacheInfo.pInitialData = cacheBlob.empty() ? nullptr : cacheBlob.data();
+            vkCreatePipelineCache(vk, &cacheInfo, nullptr, &pipelineCache);
         }
 
         // Find the biggest device local memory available on the device.
@@ -4434,8 +4551,47 @@ namespace plume {
         }
     }
 
+    std::string VulkanDevice::pipelineCachePath() const {
+        const char *tmp = getenv("TEMP");
+        if (tmp == nullptr) return {};
+        char name[64];
+        snprintf(name, sizeof(name), "\\rexglue_pipeline_cache_%04x_%04x.bin", physicalDeviceProperties.vendorID,
+                 physicalDeviceProperties.deviceID);
+        return std::string(tmp) + name;
+    }
+
+    void VulkanDevice::savePipelineCache() {
+        // REXGLUE: persist the pipeline cache so a later launch skips
+        // recompiling everything (the source of the first-run stutter).
+        // Called periodically from pipeline creation AND on teardown, since a
+        // window-close/force-kill can skip the destructor.
+        if (pipelineCache == VK_NULL_HANDLE) return;
+        size_t cacheSize = 0;
+        if (vkGetPipelineCacheData(vk, pipelineCache, &cacheSize, nullptr) != VK_SUCCESS || cacheSize == 0) return;
+        std::vector<uint8_t> cacheBlob(cacheSize);
+        if (vkGetPipelineCacheData(vk, pipelineCache, &cacheSize, cacheBlob.data()) != VK_SUCCESS) return;
+        const std::string path = pipelineCachePath();
+        if (path.empty()) return;
+        std::string tmpPath = path + ".tmp";
+        // Write to a temp then rename so a kill mid-write cannot corrupt it.
+        if (FILE *f = fopen(tmpPath.c_str(), "wb")) {
+            bool ok = fwrite(cacheBlob.data(), 1, cacheSize, f) == cacheSize;
+            fclose(f);
+            if (ok) {
+                remove(path.c_str());
+                rename(tmpPath.c_str(), path.c_str());
+            }
+        }
+    }
+
     void VulkanDevice::release() {
         nullBuffer = nullptr; // force destruction before destroying allocator
+
+        if (pipelineCache != VK_NULL_HANDLE) {
+            savePipelineCache();
+            vkDestroyPipelineCache(vk, pipelineCache, nullptr);
+            pipelineCache = VK_NULL_HANDLE;
+        }
 
         if (allocator != VK_NULL_HANDLE) {
             vmaDestroyAllocator(allocator);

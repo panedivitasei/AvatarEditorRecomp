@@ -284,7 +284,7 @@ bool Closet::InstallItem(const AssetId& id, const std::vector<uint8_t>& blob,
   if (Find(id)) {
     return true;  // a reinstall: files refreshed, the row is already there
   }
-  // Same row avatarextract writes: guid, categories hex, bodies, name.
+  // Same row the Avatar Aura import writes: guid, categories hex, bodies, name.
   std::string safe_name;
   for (char c : name) safe_name.push_back(c == '\t' || c == '\n' || c == '\r' ? ' ' : c);
   FILE* f = std::fopen((dir_ / "closet_index.tsv").string().c_str(), "ab");
@@ -370,8 +370,8 @@ bool Closet::ReadTitleIcon(uint32_t title_id, std::vector<uint8_t>& out) const {
   if (!is_loaded_) {
     return false;
   }
-  // The Dry Cleaner stores whatever the user picked (png/jpg/bmp/gif); the
-  // tile server decodes by content and re-encodes to PNG.
+  // The Avatar Aura import keeps whatever image the user picked, so the tile
+  // server decodes by content and re-encodes to PNG.
   static const char* const kExts[] = {"png", "jpg", "jpeg", "bmp", "gif"};
   for (const char* ext : kExts) {
     char name[32];

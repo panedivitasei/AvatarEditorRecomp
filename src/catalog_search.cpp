@@ -10,7 +10,7 @@
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
 
-#include "videonative/renderer_fps.h"
+#include "search_state.h"
 
 namespace ae_search {
 
@@ -77,8 +77,7 @@ void Controller::Push() {
   std::vector<const char*> line_ptrs;
   line_ptrs.reserve(lines.size());
   for (const auto& s : lines) line_ptrs.push_back(s.c_str());
-  rex::videonative::fps::SetSearchOverlay(open_, query_.c_str(), line_ptrs.data(),
-                                          int(line_ptrs.size()));
+  SetSearchOverlay(open_, query_.c_str(), line_ptrs.data(), int(line_ptrs.size()));
 }
 
 void Controller::Toggle() {
@@ -122,7 +121,7 @@ void Controller::Apply(bool clear) {
   const bool arming = !query_.empty();
   const bool was_armed = applied_;
   applied_ = arming;
-  rex::videonative::fps::SetSearchApplied(arming);
+  SetSearchApplied(arming);
   if (store_mode_) {
     if (games_list_) {
       rex::kernel::xam::SetMarketplaceGamesFilter(query_);
@@ -135,7 +134,7 @@ void Controller::Apply(bool clear) {
   } else {
     rex::kernel::xam::SetAvatarCatalogSearch(query_);
     if (arming || was_armed) {
-      rex::videonative::fps::RequestCatalogRebuild();
+      RequestCatalogRebuild();
     }
   }
   open_ = false;

@@ -7,6 +7,8 @@
 
 #include "plume_d3d12.h"
 
+#include <atomic>
+#include <chrono>
 #include <unordered_set>
 
 #include <dxgi1_5.h>
@@ -253,12 +255,6 @@ namespace plume {
         if (dxgiFormat == DXGI_FORMAT_R32G8X24_TYPELESS) {
             // Specialize into full depth-stencil view.
             return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-        }
-        if (dxgiFormat == DXGI_FORMAT_R32_TYPELESS) {
-            // Depth targets that must ALSO be readable as textures have to be
-            // created typeless (D3D12 forbids an SRV over a typed depth
-            // resource), so specialize the view the same way.
-            return DXGI_FORMAT_D32_FLOAT;
         }
         return dxgiFormat;
     }
@@ -1197,6 +1193,10 @@ namespace plume {
                     break;
                 }
 
+                if (interfaceTextureView->desc.stencilAspect) {
+                    if (srvDesc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) srvDesc.Texture2D.PlaneSlice = 1;
+                    if (srvDesc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) srvDesc.Texture2DArray.PlaneSlice = 1;
+                }
                 setSRV(descriptorIndex, nativeResource, &srvDesc);
             }
             else if (nativeResource != nullptr) {
@@ -2418,6 +2418,10 @@ namespace plume {
 #   endif
     }
 
+    void D3D12CommandList::setBlendFactor(const float *rgba) {
+        d3d->OMSetBlendFactor(rgba);
+    }
+
     void D3D12CommandList::clearColor(uint32_t attachmentIndex, RenderColor colorValue, const RenderRect *clearRects, uint32_t clearRectsCount) {
         assert(targetFramebuffer != nullptr);
         assert(attachmentIndex < targetFramebuffer->colorTargets.size());
@@ -3005,7 +3009,7 @@ namespace plume {
 
         this->texture = texture;
         this->desc = desc;
-        this->format = toDXGITextureView(desc.format);
+        this->format = desc.stencilAspect ? DXGI_FORMAT_X32_TYPELESS_G8X24_UINT : toDXGITextureView(desc.format);
         this->dimension = desc.dimension;
         this->mipLevels = std::min(desc.mipLevels, texture->desc.mipLevels - desc.mipSlice);
         this->mipSlice = desc.mipSlice;
@@ -3249,16 +3253,30 @@ namespace plume {
 
     // D3D12GraphicsPipeline
 
+    // REXGLUE: a failed PSO names its HRESULT, and with REXGLUE_D3D_DEBUG the debug layer's reason, in plume_present_dbg.txt.
+    static void logPipelineFailure(ID3D12Device *d3d, HRESULT res) {
+        FILE *f = fopen("plume_present_dbg.txt", "a");
+        if (f == nullptr) return;
+        fprintf(f, "CreateGraphicsPipelineState failed: 0x%lX\n", res);
+        ID3D12InfoQueue *queue = nullptr;
+        if (SUCCEEDED(d3d->QueryInterface(IID_PPV_ARGS(&queue)))) {
+            for (UINT64 i = 0; i < queue->GetNumStoredMessages(); i++) {
+                SIZE_T size = 0;
+                queue->GetMessage(i, nullptr, &size);
+                std::vector<uint8_t> storage(size);
+                auto *message = reinterpret_cast<D3D12_MESSAGE *>(storage.data());
+                if (SUCCEEDED(queue->GetMessage(i, message, &size))) fprintf(f, "  %s\n", message->pDescription);
+            }
+            queue->ClearStoredMessages();
+            queue->Release();
+        }
+        fclose(f);
+    }
+
     D3D12GraphicsPipeline::D3D12GraphicsPipeline(D3D12Device *device, const RenderGraphicsPipelineDesc &desc) : D3D12Pipeline(device, Type::Graphics) {
         assert(desc.pipelineLayout != nullptr);
 
         topology = toD3D12(desc.primitiveTopology);
-        // The reference is dynamic state in D3D12 (OMSetStencilRef via
-        // checkStencilRef at draw time) — it was never captured from the
-        // desc, so every pipeline drew with ref 0 and stencil-gated passes
-        // (the AE mirror reflection, gated on stencil==0xFF) passed
-        // everywhere.
-        stencilRef = desc.stencilReference;
 
         const D3D12PipelineLayout *pipelineLayout = static_cast<const D3D12PipelineLayout *>(desc.pipelineLayout);
         const D3D12Shader *vertexShader = static_cast<const D3D12Shader *>(desc.vertexShader);
@@ -3313,6 +3331,7 @@ namespace plume {
         psoDesc.DepthStencilState.DepthWriteMask = desc.depthWriteEnabled ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
         psoDesc.DepthStencilState.DepthFunc = toD3D12(desc.depthFunction);
         psoDesc.DepthStencilState.StencilEnable = desc.stencilEnabled;
+        stencilRef = desc.stencilReference;
         psoDesc.DepthStencilState.StencilReadMask = desc.stencilReadMask;
         psoDesc.DepthStencilState.StencilWriteMask = desc.stencilWriteMask;
         psoDesc.DepthStencilState.FrontFace.StencilFailOp = toD3D12(desc.stencilFrontFace.failOp);
@@ -3380,7 +3399,64 @@ namespace plume {
 
         psoDesc.InputLayout = { inputElements.data(), UINT(inputElements.size()) };
 
-        device->d3d->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&d3d));
+        // REXGLUE: look the PSO up in the device's pipeline library first and store what had to be compiled. The name
+        // hashes everything the desc points at, so a changed shader or root signature never loads a stale entry.
+        if (device->pipelineLibrary == nullptr) {
+            HRESULT res = device->d3d->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&d3d));
+            if (FAILED(res)) logPipelineFailure(device->d3d, res);
+            return;
+        }
+        uint64_t hash = 14695981039346656037ull;
+        auto mix = [&hash](const void *data, size_t size) {
+            const uint8_t *bytes = static_cast<const uint8_t *>(data);
+            for (size_t i = 0; i < size; i++) {
+                hash = (hash ^ bytes[i]) * 1099511628211ull;
+            }
+        };
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC keyDesc;
+        memcpy(&keyDesc, &psoDesc, sizeof(keyDesc));
+        keyDesc.pRootSignature = nullptr;
+        keyDesc.VS.pShaderBytecode = nullptr;
+        keyDesc.GS.pShaderBytecode = nullptr;
+        keyDesc.PS.pShaderBytecode = nullptr;
+        keyDesc.InputLayout.pInputElementDescs = nullptr;
+        mix(&keyDesc, sizeof(keyDesc));
+        mix(&pipelineLayout->signatureHash, sizeof(pipelineLayout->signatureHash));
+        for (const D3D12_SHADER_BYTECODE &code : { psoDesc.VS, psoDesc.GS, psoDesc.PS }) {
+            mix(&code.BytecodeLength, sizeof(code.BytecodeLength));
+            if (code.pShaderBytecode != nullptr) mix(code.pShaderBytecode, code.BytecodeLength);
+        }
+        for (D3D12_INPUT_ELEMENT_DESC element : inputElements) {
+            mix(element.SemanticName, strlen(element.SemanticName));
+            element.SemanticName = nullptr;
+            mix(&element, sizeof(element));
+        }
+        wchar_t name[24];
+        swprintf(name, 24, L"%016llX", static_cast<unsigned long long>(hash));
+        {
+            std::lock_guard<std::mutex> lock(device->pipelineLibraryMutex);
+            if (SUCCEEDED(device->pipelineLibrary->LoadGraphicsPipeline(name, &psoDesc, IID_PPV_ARGS(&d3d)))) {
+                return;
+            }
+        }
+        HRESULT res = device->d3d->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&d3d));
+        if (FAILED(res)) {
+            logPipelineFailure(device->d3d, res);
+            return;
+        }
+        bool stored = false;
+        {
+            std::lock_guard<std::mutex> lock(device->pipelineLibraryMutex);
+            stored = SUCCEEDED(device->pipelineLibrary->StorePipeline(name, d3d));
+        }
+        // Checkpoint at most once a second while pipelines are being compiled, as the Vulkan cache does.
+        static std::atomic<int64_t> s_lastSave{0};
+        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        int64_t last = s_lastSave.load();
+        if (stored && now - last >= 1000 && s_lastSave.compare_exchange_strong(last, now)) {
+            device->savePipelineLibrary();
+        }
     }
 
     D3D12GraphicsPipeline::~D3D12GraphicsPipeline() {
@@ -3806,6 +3882,11 @@ namespace plume {
             return;
         }
 
+        signatureHash = 14695981039346656037ull;
+        for (SIZE_T i = 0; i < signatureBlob->GetBufferSize(); i++) {
+            signatureHash = (signatureHash ^ static_cast<const uint8_t *>(signatureBlob->GetBufferPointer())[i]) * 1099511628211ull;
+        }
+
         res = device->d3d->CreateRootSignature(0, signatureBlob->GetBufferPointer(), signatureBlob->GetBufferSize(), IID_PPV_ARGS(&rootSignature));
         if (FAILED(res)) {
             fprintf(stderr, "CreateRootSignature failed with error code 0x%lX.\n", res);
@@ -4100,6 +4181,8 @@ namespace plume {
             customUploadPool = std::make_unique<D3D12Pool>(this, poolDesc, true);
         }
 
+        openPipelineLibrary();
+
         // Create a command queue only for retrieving the timestamp frequency. Delete it immediately afterwards.
         std::unique_ptr<D3D12CommandQueue> timestampCommandQueue = std::make_unique<D3D12CommandQueue>(this, RenderCommandListType::DIRECT);
         res = timestampCommandQueue->d3d->GetTimestampFrequency(&timestampFrequency);
@@ -4378,7 +4461,81 @@ namespace plume {
         return countsSupported;
     }
 
+    std::string D3D12Device::pipelineLibraryPath() const {
+        const char *tmp = getenv("TEMP");
+        if (tmp == nullptr) return {};
+        char name[96];
+        snprintf(name, sizeof(name), "\\rexglue_d3d12_pipelines_%04x_%04x_%016llx.bin", pipelineLibraryVendor,
+                 pipelineLibraryDevice, static_cast<unsigned long long>(description.driverVersion));
+        return std::string(tmp) + name;
+    }
+
+    // REXGLUE: the file name carries the driver version, so a driver update starts a new file instead of failing loads.
+    void D3D12Device::openPipelineLibrary() {
+        if (d3d == nullptr || adapter == nullptr) return;
+        DXGI_ADAPTER_DESC1 adapterDesc;
+        if (FAILED(adapter->GetDesc1(&adapterDesc))) return;
+        pipelineLibraryVendor = adapterDesc.VendorId;
+        pipelineLibraryDevice = adapterDesc.DeviceId;
+        const std::string path = pipelineLibraryPath();
+        if (path.empty()) return;
+        if (FILE *f = fopen(path.c_str(), "rb")) {
+            fseek(f, 0, SEEK_END);
+            long n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (n > 0) {
+                pipelineLibraryBlob.resize(size_t(n));
+                if (fread(pipelineLibraryBlob.data(), 1, pipelineLibraryBlob.size(), f) != pipelineLibraryBlob.size()) {
+                    pipelineLibraryBlob.clear();
+                }
+            }
+            fclose(f);
+        }
+        HRESULT res = E_FAIL;
+        if (!pipelineLibraryBlob.empty()) {
+            res = d3d->CreatePipelineLibrary(pipelineLibraryBlob.data(), pipelineLibraryBlob.size(), IID_PPV_ARGS(&pipelineLibrary));
+        }
+        if (FAILED(res)) {
+            // A blob the driver refuses (another build, a torn file) is replaced by an empty library.
+            pipelineLibrary = nullptr;
+            pipelineLibraryBlob.clear();
+            res = d3d->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&pipelineLibrary));
+        }
+        if (FAILED(res)) {
+            pipelineLibrary = nullptr;
+            fprintf(stderr, "CreatePipelineLibrary failed with error code 0x%lX; PSOs are not cached.\n", res);
+        }
+    }
+
+    void D3D12Device::savePipelineLibrary() {
+        std::vector<uint8_t> data;
+        {
+            std::lock_guard<std::mutex> lock(pipelineLibraryMutex);
+            if (pipelineLibrary == nullptr) return;
+            data.resize(pipelineLibrary->GetSerializedSize());
+            if (data.empty() || FAILED(pipelineLibrary->Serialize(data.data(), data.size()))) return;
+        }
+        const std::string path = pipelineLibraryPath();
+        if (path.empty()) return;
+        // Written to a temp name and renamed, so a kill mid-write cannot leave a torn file.
+        const std::string tmpPath = path + ".tmp";
+        if (FILE *f = fopen(tmpPath.c_str(), "wb")) {
+            bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
+            fclose(f);
+            if (ok) {
+                remove(path.c_str());
+                rename(tmpPath.c_str(), path.c_str());
+            }
+        }
+    }
+
     void D3D12Device::release() {
+        if (pipelineLibrary != nullptr) {
+            savePipelineLibrary();
+            pipelineLibrary->Release();
+            pipelineLibrary = nullptr;
+        }
+
         if (d3d != nullptr) {
             d3d->Release();
             d3d = nullptr;

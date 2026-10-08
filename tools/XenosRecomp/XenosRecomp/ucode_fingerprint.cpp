@@ -145,6 +145,27 @@ uint64_t ucodeFingerprint(const uint32_t* code, size_t dwordCount, bool bigEndia
     return XXH3_64bits(words.data(), words.size() * sizeof(uint32_t));
 }
 
+// fp2 keys a translation by the patched code including the vertex-declaration fields. Each declaration variant
+// gets its own entry with its fetch layouts baked in as literals, which is what keeps the vertex fetch path free
+// of per-vertex dynamic constant-buffer reads; the runtime translates any variant the pack lacks.
+uint64_t ucodeFingerprint2(const uint32_t* code, size_t dwordCount, bool bigEndian)
+{
+    auto words = loadWords(code, dwordCount, bigEndian);
+    return XXH3_64bits(words.data(), words.size() * sizeof(uint32_t));
+}
+
+void ucodeVisitVfetchSlots(const uint32_t* code, size_t dwordCount, bool bigEndian,
+    void (*visit)(uint32_t slot, const uint32_t* instructionDwords, void*), void* context)
+{
+    auto words = loadWords(code, dwordCount, bigEndian);
+
+    walkExecSlots(words, [&](size_t slot, bool isFetch)
+        {
+            if (isFetch && (words[slot] & 0x1F) == uint32_t(FetchOpcode::VertexFetch))
+                visit(uint32_t(slot / 3), &words[slot], context);
+        });
+}
+
 void ucodeVisitVfetches(const uint32_t* code, size_t dwordCount, bool bigEndian,
     void (*visit)(const VfetchInfo&, void*), void* context)
 {

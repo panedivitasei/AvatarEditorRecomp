@@ -6,6 +6,7 @@
 
 #include <dxcapi.h>
 
+#include <algorithm>
 #include <bit>
 #include <cassert>
 #include <cstdint>
@@ -24,6 +25,7 @@ struct CoverageError : std::runtime_error
 #endif
 #include <execution>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <set>
 #include <smolv.h>
@@ -31,6 +33,7 @@ struct CoverageError : std::runtime_error
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <xxhash.h>
 #include <zstd.h>

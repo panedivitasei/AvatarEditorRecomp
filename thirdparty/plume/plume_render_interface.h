@@ -40,10 +40,6 @@ namespace plume {
         virtual ~RenderTexture() { }
         virtual std::unique_ptr<RenderTextureView> createTextureView(const RenderTextureViewDesc &desc) const = 0;
         virtual void setName(const std::string &name) = 0;
-        // REXGLUE: the layout this backend's barrier ledger last recorded for
-        // the texture, for callers that keep their own layout tracking and
-        // need to cross-check it. UNKNOWN when the backend does not track.
-        virtual RenderTextureLayout getKnownLayout() const { return RenderTextureLayout::UNKNOWN; }
     };
 
     struct RenderAccelerationStructure {
@@ -145,6 +141,8 @@ namespace plume {
         virtual void setScissors(const RenderRect *scissorRects, uint32_t count) = 0;
         virtual void setFramebuffer(const RenderFramebuffer *framebuffer) = 0;
         virtual void setDepthBias(float depthBias, float depthBiasClamp, float slopeScaledDepthBias) = 0;
+        // REXGLUE: constant colour for the BLEND_FACTOR blend factors; Vulkan pipelines declare it dynamic.
+        virtual void setBlendFactor(const float *rgba) { (void)rgba; }
         virtual void clearColor(uint32_t attachmentIndex = 0, RenderColor colorValue = RenderColor(), const RenderRect *clearRects = nullptr, uint32_t clearRectsCount = 0) = 0;
         virtual void clearDepthStencil(bool clearDepth = true, bool clearStencil = true, float depthValue = 1.0f, uint32_t stencilValue = 0, const RenderRect *clearRects = nullptr, uint32_t clearRectsCount = 0) = 0;
         virtual void copyBufferRegion(RenderBufferReference dstBuffer, RenderBufferReference srcBuffer, uint64_t size) = 0;

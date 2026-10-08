@@ -8,7 +8,91 @@ DxcCompiler::DxcCompiler()
 
 DxcCompiler::~DxcCompiler()
 {
-    dxcCompiler->Release();
+    if (dxcCompiler != nullptr)
+        dxcCompiler->Release();
+}
+
+std::vector<const wchar_t*> DxcCompiler::arguments(bool compilePixelShader, bool compileLibrary, bool compileSpirv,
+    const wchar_t* targetOverride)
+{
+    std::vector<const wchar_t*> args;
+
+    const wchar_t* target = targetOverride;
+    if (target == nullptr)
+    {
+        if (compileLibrary)
+        {
+            assert(!compileSpirv);
+            target = L"-T lib_6_3";
+        }
+        else
+        {
+            target = compilePixelShader ? L"-T ps_6_0" : L"-T vs_6_0";
+        }
+    }
+
+    args.push_back(target);
+    args.push_back(L"-HV 2021");
+    args.push_back(L"-all-resources-bound");
+    // Guest shaders rely on inf/NaN semantics (clamped log/rcp feeding pow chains) that fast-math may elide.
+    // DXC rejects -Gis together with -spirv, so SPIR-V relies on the backend's default float rules.
+    if (!compileSpirv)
+        args.push_back(L"-Gis");
+
+    if (compileSpirv)
+    {
+        args.push_back(L"-spirv");
+        args.push_back(L"-fvk-use-dx-layout");
+
+        // Y inversion belongs in the vertex stage only, because a GS copies the already-inverted position as data.
+        // Inverting again at the GS write would un-flip every GS-attached draw.
+        if (!compilePixelShader && targetOverride == nullptr)
+            args.push_back(L"-fvk-invert-y");
+    }
+    else
+    {
+        args.push_back(L"-Wno-ignored-attributes");
+        args.push_back(L"-Qstrip_reflect");
+    }
+
+    args.push_back(L"-Qstrip_debug");
+
+    // Keep the HLSL preprocessor in step with how this tool was built so shader_common.h picks the matching layout.
+#ifdef REBLUE_RECOMP
+    args.push_back(L"-DREBLUE_RECOMP");
+#elif defined(UNLEASHED_RECOMP)
+    args.push_back(L"-DUNLEASHED_RECOMP");
+#endif
+
+    return args;
+}
+
+std::string DxcCompiler::version() const
+{
+    std::string text = "unknown";
+    IDxcVersionInfo* info = nullptr;
+    if (dxcCompiler != nullptr && SUCCEEDED(dxcCompiler->QueryInterface(IID_PPV_ARGS(&info))))
+    {
+        UINT32 major = 0, minor = 0;
+        info->GetVersion(&major, &minor);
+        text = fmt::format("{}.{}", major, minor);
+
+        IDxcVersionInfo2* info2 = nullptr;
+        if (SUCCEEDED(info->QueryInterface(IID_PPV_ARGS(&info2))))
+        {
+            UINT32 commitCount = 0;
+            char* commitHash = nullptr;
+            if (SUCCEEDED(info2->GetCommitInfo(&commitCount, &commitHash)))
+            {
+                text += fmt::format("+{}.{}", commitCount, commitHash != nullptr ? commitHash : "");
+                if (commitHash != nullptr)
+                    CoTaskMemFree(commitHash);
+            }
+            info2->Release();
+        }
+        info->Release();
+    }
+    return text;
 }
 
 IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixelShader, bool compileLibrary, bool compileSpirv,
@@ -18,65 +102,12 @@ IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixe
     source.Ptr = shaderSource.c_str();
     source.Size = shaderSource.size();
 
-    const wchar_t* args[32]{};
-    uint32_t argCount = 0;
-
-    const wchar_t* target = targetOverride;
-    if (target == nullptr)
-    {
-    if (compileLibrary)
-    {
-        assert(!compileSpirv);
-        target = L"-T lib_6_3";
-    }
-    else
-    {
-        if (compilePixelShader)
-            target = L"-T ps_6_0";
-        else
-            target = L"-T vs_6_0";
-    }
-    }
-
-    args[argCount++] = target;
-    args[argCount++] = L"-HV 2021";
-    args[argCount++] = L"-all-resources-bound";
-    // IEEE strictness: guest shaders rely on inf/NaN semantics (e.g. clamped
-    // log/rcp feeding pow chains); fast-math may elide those clamps.
-    // DXC rejects -Gis together with -spirv; the SPIR-V path relies on the
-    // backend's default (non-fast-math) float rules instead.
-    if (!compileSpirv)
-        args[argCount++] = L"-Gis";
-
-    if (compileSpirv)
-    {
-        args[argCount++] = L"-spirv";
-        args[argCount++] = L"-fvk-use-dx-layout";
-
-        // Y inversion belongs in the vertex stage only. A geometry shader
-        // (targetOverride) copies the vertex shader's already-inverted
-        // SV_Position as plain data, so inverting again at the GS write would
-        // cancel the vertex shader's inversion and un-flip every GS-attached
-        // draw.
-        if (!compilePixelShader && targetOverride == nullptr)
-            args[argCount++] = L"-fvk-invert-y";
-    }
-    else
-    {
-        args[argCount++] = L"-Wno-ignored-attributes";
-        args[argCount++] = L"-Qstrip_reflect";
-    }
-
-    args[argCount++] = L"-Qstrip_debug";
-
-#ifdef UNLEASHED_RECOMP
-    args[argCount++] = L"-DUNLEASHED_RECOMP";
-#endif
+    std::vector<const wchar_t*> args = arguments(compilePixelShader, compileLibrary, compileSpirv, targetOverride);
 
     lastError.clear();
 
     IDxcResult* result = nullptr;
-    HRESULT hr = dxcCompiler->Compile(&source, args, argCount, nullptr, IID_PPV_ARGS(&result));
+    HRESULT hr = dxcCompiler->Compile(&source, args.data(), uint32_t(args.size()), nullptr, IID_PPV_ARGS(&result));
 
     IDxcBlob* object = nullptr;
     if (SUCCEEDED(hr))
@@ -98,8 +129,6 @@ IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixe
                 assert(SUCCEEDED(hr) && errors != nullptr);
 
                 lastError = errors->GetStringPointer();
-                fputs(lastError.c_str(), stderr);
-
                 errors->Release();
             }
         }
