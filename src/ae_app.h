@@ -107,12 +107,10 @@ class AvatareditorApp : public rex::ReXApp {
       }
       paths.game_data_root = p.lexically_normal();
     }
-    // Profiles, saves, and the avatar manifest are shared with the other
-    // JMstudios titles through %USERPROFILE%\JMstudios.
+    // Profiles and saves are shared with the other JMstudios titles through
+    // Documents\JMstudios\userdata.
     if (REXCVAR_GET(user_data_root).empty()) {
-      const char* profile = std::getenv("USERPROFILE");
-      paths.user_data_root =
-          (profile ? std::filesystem::path(profile) : rex::filesystem::GetUserFolder()) / "JMstudios";
+      paths.user_data_root = rex::filesystem::GetUserFolder() / "JMstudios" / "userdata";
     }
   }
 

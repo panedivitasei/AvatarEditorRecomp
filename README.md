@@ -32,7 +32,7 @@ The config file `avatareditor.toml` is expected to be in the build's root folder
 
 The asset and closet directories can be set in the config. 
 
-Saves and profile data live in `%USERPROFILE%\JMstudios`
+Saves and profile data live in `Documents\JMstudios\userdata`
 
 - `avatar\manifest\avatar_manifest.bin`, the saved avatar
 - `avatar\manifest\gamerpic.png`, the AE gamer pic 

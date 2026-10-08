@@ -114,8 +114,8 @@ static const char* kLegacyMetaCachePath = "legacy_avatar_meta.bin";
 REXCVAR_DEFINE_STRING(avatar_data_dir, "", "Kernel",
                       "Shared cross-title folder for persisted avatar data: the manifest the "
                       "Avatar Editor saves and every game then loads as the local user's "
-                      "avatar. Empty = <user_data_root>\\avatar\\manifest (the shared "
-                      "%USERPROFILE%\\JMstudios\\avatar\\manifest by default).");
+                      "avatar. Empty = <user_data_root>\\avatar\\manifest "
+                      "(Documents\\JMstudios\\userdata\\avatar\\manifest by default).");
 
 static std::string AvatarManifestPath() {
   std::string dir = REXCVAR_GET(avatar_data_dir);
@@ -128,9 +128,7 @@ static std::string AvatarManifestPath() {
     }
   }
   if (dir.empty()) {
-    const char* profile = std::getenv("USERPROFILE");
-    dir = profile ? std::string(profile) + "\\JMstudios\\avatar\\manifest"
-                  : std::string("avatar\\manifest");
+    dir = (rex::filesystem::GetUserFolder() / "JMstudios" / "userdata" / "avatar" / "manifest").string();
   }
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
@@ -199,19 +197,8 @@ void EnsureAvatarProfileSetting(system::xam::UserProfile* profile) {
     return;
   }
   constexpr uint32_t kAvatarInfo1SettingId = 0x63E80044u;
+  // A fresh install has no manifest, and the editor then opens on its own avatar picker.
   auto manifest = ReadPersistedManifest(nullptr);
-  if (manifest.size() != sizeof(avatars::X_AVATAR_METADATA) && LoadAvatarAssetPack()) {
-    // Fresh user: no persisted avatar yet. Consoles hand new profiles a
-    // randomly generated avatar, so synthesize one (title preset manifests
-    // preferred) and persist it; it sticks across boots and can be
-    // customized in the Avatar Editor later.
-    avatars::X_AVATAR_METADATA random_meta;
-    BuildRandomAvatarMetadata(&random_meta, 3, 1);
-    random_meta.owner_xuid = profile->xuid();  // player-owned, not an NPC build
-    const auto* bytes = reinterpret_cast<const uint8_t*>(&random_meta);
-    manifest.assign(bytes, bytes + sizeof(random_meta));
-    WriteHostFile(AvatarManifestPath(), manifest.data(), manifest.size());
-  }
   if (manifest.size() != sizeof(avatars::X_AVATAR_METADATA)) {
     return;
   }
