@@ -411,6 +411,7 @@ struct TextureCacheEntry {
   uint32_t generation = 0;    // tracker generation at that upload
   uint64_t frame = UINT64_MAX;  // frame of the last content check
   uint64_t sample = 0;        // stripe hash of the guest bytes at that upload
+  uint64_t content = 0;       // full hash of the guest bytes at that upload
   uint64_t checked = UINT64_MAX;  // frame of the last stripe check, one per texture per frame
   uint64_t uploaded = UINT64_MAX;  // frame of the last upload
   // Host textures this entry rotates through when its memory is rewritten more than once in a frame, with the host
@@ -529,6 +530,22 @@ void FinishIndices(DrawRecord& r) {
   if (!r.prepared_indices.valid()) return;
   ApplyIndices(r, r.prepared_indices.get());
   r.prepared_indices = {};
+}
+
+// Hashes every byte of the base and mip ranges: the check behind a dirty mark, which the title raises over whole
+// blocks (an avatar asset load marks the shared avatar block) and so mostly covers textures that did not change.
+uint64_t HashTexture(const GuestTextureDesc& desc) {
+  XXH3_state_t* state = XXH3_createState();
+  XXH3_64bits_reset(state);
+  auto take = [&](uint32_t address, uint32_t size) {
+    if (!address || !size) return;
+    XXH3_64bits_update(state, REX_KERNEL_MEMORY()->TranslatePhysical<const uint8_t*>(address), size);
+  };
+  take(desc.base_address, desc.base_size);
+  take(desc.mip_address, desc.mip_size);
+  const uint64_t hash = XXH3_64bits_digest(state);
+  XXH3_freeState(state);
+  return hash ^ desc.base_size;
 }
 
 // Hashes 32 stripes of 128 bytes spread over the texture's base and mip ranges: the per-frame change check for
@@ -675,9 +692,16 @@ TextureBinding FinishBinding(TextureBinding out, uint64_t key, TextureCacheEntry
   const auto state = memory::Query(desc.base_address, std::max(desc.base_size, 1u), entry.range_cache);
   const uint64_t frame = FrameIndex();
   uint64_t sample = 0;
+  uint64_t content = 0;
   bool upload = !entry.version;
-  if (!upload) {
-    if (state.registered) upload = state.generation != entry.generation;
+  // The zeros an unresolved depth texture gets never go stale, so its bytes are not watched.
+  const bool watched = !UnresolvedDepth(desc);
+  if (!upload && watched) {
+    if (state.registered && state.generation != entry.generation) {
+      content = HashTexture(desc);
+      upload = content != entry.content;
+      if (!upload) entry.generation = state.generation;
+    }
     // Owned textures are checked too: a streamer that writes texture memory without Lock/Unlock leaves the
     // generation untouched, and the stale copy shows as a blurred or wrong texture after minutes of play.
     if (!upload && entry.checked != frame) {
@@ -688,7 +712,7 @@ TextureBinding FinishBinding(TextureBinding out, uint64_t key, TextureCacheEntry
   }
   const bool paranoid = memory::Paranoid();
   const auto* bytes = paranoid ? REX_KERNEL_MEMORY()->TranslatePhysical<const uint8_t*>(desc.base_address) : nullptr;
-  if (!upload && paranoid) upload = !memory::CheckUnchanged(key, desc.base_address, desc.base_size, bytes);
+  if (!upload && paranoid && watched) upload = !memory::CheckUnchanged(key, desc.base_address, desc.base_size, bytes);
   if (!state.registered) memory::NoteUnregistered(desc.base_address, desc.base_size, "texture");
   if (upload && entry.uploaded == frame) {
     // The host applies a frame's uploads before its draws, so a second rewrite of the same memory within one frame
@@ -704,7 +728,10 @@ TextureBinding FinishBinding(TextureBinding out, uint64_t key, TextureCacheEntry
   }
   if (upload) {
     entry.uploaded = frame;
-    entry.sample = sample ? sample : SampleTexture(desc);
+    if (watched) {
+      entry.sample = sample ? sample : SampleTexture(desc);
+      entry.content = content ? content : HashTexture(desc);
+    }
     entry.checked = frame;
     const auto started = std::chrono::steady_clock::now();
     out.upload = DecodeTextureAsync(desc);

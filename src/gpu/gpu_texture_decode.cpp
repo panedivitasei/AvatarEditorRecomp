@@ -559,7 +559,34 @@ DecodePool& Pool() {
 
 }  // namespace
 
+bool UnresolvedDepth(const GuestTextureDesc& desc) {
+  return desc.fetch.format == xenos::TextureFormat::k_24_8 || desc.fetch.format == xenos::TextureFormat::k_24_8_FLOAT;
+}
+
+// Zeroed host levels in the layout the decoder would produce.
+std::shared_ptr<TextureUpload> ZeroTexture(const GuestTextureDesc& desc) {
+  auto upload = std::make_shared<TextureUpload>();
+  const uint32_t host_bpb = HostBlockBytes(desc.host_format);
+  const uint32_t host_block = HostBlockSize(desc.host_format);
+  const bool per_texel = desc.decompress || desc.expand;
+  const bool is_3d = desc.shape == TextureShape::k3D;
+  for (uint32_t layer = 0; layer < desc.layers; ++layer) {
+    for (uint32_t level = 0; level < desc.mip_levels; ++level) {
+      const uint32_t lw = std::max(desc.width >> level, 1u);
+      const uint32_t lh = std::max(desc.height >> level, 1u);
+      const uint32_t ld = is_3d ? std::max(desc.depth >> level, 1u) : 1u;
+      const uint32_t out_w = per_texel ? lw : (lw + host_block - 1) / host_block;
+      const uint32_t out_h = per_texel ? lh : (lh + host_block - 1) / host_block;
+      const uint32_t out_pitch = out_w * host_bpb;
+      upload->levels.emplace_back(size_t(out_pitch) * out_h * ld, uint8_t(0));
+      upload->row_pitch.push_back(out_pitch);
+    }
+  }
+  return upload;
+}
+
 std::shared_ptr<TextureUpload> DecodeTexture(const GuestTextureDesc& desc) {
+  if (UnresolvedDepth(desc)) return ZeroTexture(desc);
   auto upload = std::make_shared<TextureUpload>();
   if (!DecodeInto(desc, nullptr, *upload)) return nullptr;
   return upload;
@@ -568,7 +595,7 @@ std::shared_ptr<TextureUpload> DecodeTexture(const GuestTextureDesc& desc) {
 std::shared_ptr<TextureUpload> DecodeTextureAsync(const GuestTextureDesc& desc) {
   constexpr uint32_t kInlineBytes = 16 * 1024;
   const uint64_t total = uint64_t(desc.base_size) + desc.mip_size;
-  if (total <= kInlineBytes || total > (64u << 20)) return DecodeTexture(desc);
+  if (UnresolvedDepth(desc) || total <= kInlineBytes || total > (64u << 20)) return DecodeTexture(desc);
   auto snap = std::make_shared<Snapshot>();
   snap->base = desc.base_address;
   snap->base_size = desc.base_size;

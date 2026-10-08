@@ -436,30 +436,6 @@ const AvatarComponentAssetInfo kAvatarComponentAssetInfos[] = {
 // capture/cache and the custom-avatar substitution.
 static constexpr uint64_t kRandomAvatarXuid = 0x4E50435241564154ull;  // "NPCRAVAT"
 
-REXCVAR_DEFINE_INT32(avatar_bake_pace_ms, 16, "Kernel",
-                     "Minimum gap between non-player XamAvatarGetAssets completions. A "
-                     "catalog page fires 8 back-to-back mannequin builds whose tile bakes "
-                     "otherwise pile into 1-2 frames (the grid-flip fps dip); pacing "
-                     "completions spreads the bakes one per frame. Player builds (equips) "
-                     "are never paced. 0 = off.");
-
-// Bake pacing (see avatar_bake_pace_ms): called at the tail of a non-player
-// GetAssets build, before its completion is signaled. The guest kicks each
-// tile bake off that completion, so spacing completions spaces the bakes.
-static void PaceBakeCompletion() {
-  const int32_t pace = REXCVAR_GET(avatar_bake_pace_ms);
-  if (pace <= 0) return;
-  static std::mutex pace_mx;
-  static std::chrono::steady_clock::time_point pace_next{};
-  std::chrono::steady_clock::time_point wait_until;
-  {
-    std::lock_guard<std::mutex> lk(pace_mx);
-    const auto now = std::chrono::steady_clock::now();
-    wait_until = pace_next > now ? pace_next : now;
-    pace_next = wait_until + std::chrono::milliseconds(pace);
-  }
-  std::this_thread::sleep_until(wait_until);
-}
 // The GUID `d` tail every constructed pack-asset id carries (matches the
 // stock bodies and the ids inside the Avatar Editor's shipped presets).
 static constexpr uint8_t kPackAssetGuidTail[8] = {0xC1, 0xC8, 0xF1, 0x09,
@@ -1005,7 +981,6 @@ u32 XamAvatarGetAssets_entry(ppc_ptr_t<X_AVATAR_METADATA> avatar_metadata_ptr,
                      budget_gpu);
       }
     }
-    if (!is_player_build) PaceBakeCompletion();
     return X_ERROR_SUCCESS;
   };
 
