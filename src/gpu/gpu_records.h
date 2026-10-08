@@ -274,7 +274,15 @@ struct ReleaseRecord {
   std::vector<uint32_t> ids;
 };
 
-using Record = std::variant<ClearRecord, ResolveRecord, SwapRecord, ReadbackRecord, DrawRecord, ReleaseRecord>;
+// New contents for a sampled texture, sent on its own so a dropped draw cannot lose them.
+struct TextureUploadRecord {
+  ResourceDesc texture;
+  uint32_t version = 0;
+  std::shared_ptr<const TextureUpload> upload;
+};
+
+using Record =
+    std::variant<ClearRecord, ResolveRecord, SwapRecord, ReadbackRecord, DrawRecord, ReleaseRecord, TextureUploadRecord>;
 
 // One queue item: the records since the last hand-off, ending at a Swap or a readback request.
 struct Packet {

@@ -420,6 +420,8 @@ class Backend {
   void Execute(const SwapRecord& r);
   void Execute(const ReadbackRecord& r);
   void Execute(const ReleaseRecord& r);
+  void Execute(const TextureUploadRecord&) {}
+  void ApplyUpload(const ResourceDesc& desc, uint32_t version, const TextureUpload& upload);
   void DestroyResource(std::unordered_map<uint32_t, HostResource>::iterator it);
   void RecycleDescriptor(uint32_t index);
   void ForgetFramebuffers(uint32_t id);
@@ -1745,6 +1747,14 @@ void Backend::PrepareUploads(Packet& packet) {
   bool any = false;
   frame_ranges_.clear();
   for (auto& record : packet.records) {
+    if (auto* sent = std::get_if<TextureUploadRecord>(&record)) {
+      if (!any) {
+        BeginList();
+        any = true;
+      }
+      if (sent->upload) ApplyUpload(sent->texture, sent->version, *sent->upload);
+      continue;
+    }
     auto* draw = std::get_if<DrawRecord>(&record);
     if (!draw || !draw->constants) continue;
     if (!any) {
@@ -1770,15 +1780,7 @@ void Backend::PrepareUploads(Packet& packet) {
       continue;
     }
     for (auto& binding : draw->textures) {
-      if (!binding.upload) continue;
-      HostResource* texture = Get(binding.texture);
-      if (!texture || !texture->sampled_only() || texture->version == binding.version) continue;
-      const auto wait_start = std::chrono::steady_clock::now();
-      binding.upload->Wait();
-      const auto copy_start = std::chrono::steady_clock::now();
-      frame_cost_.decode_wait_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(copy_start - wait_start).count());
-      CopyTexture(*texture, *binding.upload, binding.version);
-      frame_cost_.texture_copy_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - copy_start).count());
+      if (binding.upload) ApplyUpload(binding.texture, binding.version, *binding.upload);
     }
   }
   for (size_t i = 0; i < copies.size(); ++i) stats_.upload_bytes += copy_sizes[i];
@@ -1794,6 +1796,18 @@ void Backend::PrepareUploads(Packet& packet) {
   }
   list->barriers(plume::RenderBarrierStage::GRAPHICS_AND_COMPUTE,
                  plume::RenderBufferBarrier(shared_memory_.get(), plume::RenderBufferAccess::READ));
+}
+
+// Lands decoded contents on the host texture unless that version is already there.
+void Backend::ApplyUpload(const ResourceDesc& desc, uint32_t version, const TextureUpload& upload) {
+  HostResource* texture = Get(desc);
+  if (!texture || !texture->sampled_only() || texture->version == version) return;
+  const auto wait_start = std::chrono::steady_clock::now();
+  upload.Wait();
+  const auto copy_start = std::chrono::steady_clock::now();
+  frame_cost_.decode_wait_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(copy_start - wait_start).count());
+  CopyTexture(*texture, upload, version);
+  frame_cost_.texture_copy_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - copy_start).count());
 }
 
 // Copies a decoded texture into the host texture and stamps it with that upload's version.
@@ -2053,6 +2067,9 @@ void Backend::Execute(DrawRecord& r) {
       if (!(texture->sampled_only() && texture->version == 0)) {
         Transition(*texture, plume::RenderTextureLayout::SHADER_READ);
         index = DescriptorFor(*texture, binding.dimension, binding.swizzle);
+      } else {
+        // No contents landed for this id, so the guest is told to send them again rather than trust its cache.
+        NoteEvicted(kEvictedTextureTag | binding.texture.id);
       }
     } else if (texture) {
       index = kBlank2D;
