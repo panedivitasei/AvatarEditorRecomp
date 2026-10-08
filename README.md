@@ -14,7 +14,7 @@ This project doesn't include the Avatar Editor or assets. You must provide a cop
 Press `Ctrl+F` to search avatar item catalogs and styles.
 
 **Native rendering**  
-The editor renders through a native D3D12 renderer.
+Renders through a native D3D12 renderer.
 
 **Input**  
 XInput controller and keyboard support.
