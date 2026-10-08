@@ -104,31 +104,7 @@ class AvatareditorApp : public rex::ReXApp {
       const char* profile = std::getenv("USERPROFILE");
       paths.user_data_root =
           (profile ? std::filesystem::path(profile) : rex::filesystem::GetUserFolder()) / "JMstudios";
-      MigrateUserData(paths.user_data_root);
     }
-  }
-
-  // One-time move from the old Documents\ReXGlue\userdata layout, renamed in place when the volume allows it
-  // (the avatar pack alone is gigabytes) and copied otherwise, with the avatar folder landing at avatar\manifest.
-  static void MigrateUserData(const std::filesystem::path& root) {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    const fs::path old_root = rex::filesystem::GetUserFolder() / "ReXGlue" / "userdata";
-    if (fs::exists(root, ec) || !fs::is_directory(old_root, ec)) return;
-    fs::create_directories(root.parent_path(), ec);
-    fs::rename(old_root, root, ec);
-    if (ec) {
-      fs::copy(old_root, root, fs::copy_options::recursive, ec);
-      if (ec) {
-        REXLOG_WARN("[userdata] copy of {} to {} failed: {}", old_root.string(), root.string(), ec.message());
-        return;
-      }
-    }
-    if (fs::is_directory(root / "avatars", ec)) {
-      fs::create_directories(root / "avatar", ec);
-      fs::rename(root / "avatars", root / "avatar" / "manifest", ec);
-    }
-    REXLOG_INFO("[userdata] migrated {} to {}", old_root.string(), root.string());
   }
 
   void OnPreSetup(rex::RuntimeConfig& config) override {
