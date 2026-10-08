@@ -33,6 +33,7 @@
 #endif
 
 REXCVAR_DECLARE(std::string, user_data_root);
+REXCVAR_DECLARE(std::string, log_file);
 
 // Shader pack generation input: the pack builder recompiles the shaders
 // embedded in the decrypted image, and this is the only place the decrypted
@@ -89,6 +90,14 @@ class AvatareditorApp : public rex::ReXApp {
     // harmless reapply.
     if (std::filesystem::exists(paths.config_path)) {
       rex::cvar::LoadConfig(paths.config_path);
+    }
+    // A toml that names the log file gets one fresh log per launch, no rotation history.
+    const std::string log = REXCVAR_GET(log_file);
+    if (!log.empty()) {
+      std::error_code ec;
+      std::filesystem::remove(log, ec);
+      const std::filesystem::path rotated = std::filesystem::path(log).replace_extension(".1.log");
+      std::filesystem::remove(rotated, ec);
     }
     std::string game_root = REXCVAR_GET(game_data_root);
     if (!game_root.empty()) {
