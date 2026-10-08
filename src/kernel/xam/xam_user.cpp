@@ -53,9 +53,9 @@ REXCVAR_DEFINE_STRING(user_gamerpic, "", "Kernel",
                       "(64x64 recommended). Relative paths resolve against the exe folder. "
                       "Empty keeps the title's default tile.");
 
-// The one online switch: the store section opens against the JM Studios marketplace server below.
-REXCVAR_DEFINE_BOOL(jmstudios_online, false, "Kernel",
-                    "Connect the Avatar Editor's marketplace to JM Studios online.");
+// The one online switch; the store section opens against avatar_marketplace_server, so both are needed.
+REXCVAR_DEFINE_BOOL(online_mode, false, "Kernel",
+                    "Connect the Avatar Editor's marketplace to the server below.");
 
 // The store's server. Every hive value the store reads is derived from
 // this: the catalog host and port, the Epix root the storefront manifest
@@ -67,6 +67,10 @@ REXCVAR_DEFINE_STRING(avatar_marketplace_server, "http://127.0.0.1:8080", "Kerne
                       "Marketplace server as scheme://host[:port], e.g. http://127.0.0.1:8080 or "
                       "https://example.org. https means port 443. It is the only host the "
                       "store will talk to.");
+
+bool OnlineMode() {
+  return REXCVAR_GET(online_mode) && !REXCVAR_GET(avatar_marketplace_server).empty();
+}
 
 namespace rex {
 namespace kernel {
@@ -1192,7 +1196,7 @@ u32 XamGetLiveHiveValueA_entry(mapped_string name, mapped_string buffer, u32 buf
   std::string value;
   if (key == "AvatarPhotoBoothEnabled") {
     value = "1";
-  } else if (REXCVAR_GET(jmstudios_online)) {
+  } else if (OnlineMode()) {
     const MarketplaceServer server = GetMarketplaceServer();
     if (key == "AvatarMarketplaceEnabled") {
       value = "1";
@@ -1252,7 +1256,7 @@ u32 XamGetLiveHiveValueW_entry(mapped_wstring name, mapped_wstring buffer, u32 b
   }
 
   std::string value;
-  if (REXCVAR_GET(jmstudios_online)) {
+  if (OnlineMode()) {
     if (key == "EpixUriRoot" || key == "EpixPreviewUriRoot") {
       value = GetMarketplaceServer().base + "/epix/";
     } else if (key == "EpixManifestUriPath") {
