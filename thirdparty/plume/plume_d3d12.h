@@ -212,6 +212,7 @@ namespace plume {
         void setScissors(const RenderRect *scissorRects, uint32_t count) override;
         void setFramebuffer(const RenderFramebuffer *framebuffer) override;
         void setDepthBias(float depthBias, float depthBiasClamp, float slopeScaledDepthBias) override;
+        void setBlendFactor(const float *rgba) override;
         void clearColor(uint32_t attachmentIndex, RenderColor colorValue, const RenderRect *clearRects, uint32_t clearRectsCount) override;
         void clearDepthStencil(bool clearDepth, bool clearStencil, float depthValue, uint32_t stencilValue, const RenderRect *clearRects, uint32_t clearRectsCount) override;
         void copyBufferRegion(RenderBufferReference dstBuffer, RenderBufferReference srcBuffer, uint64_t size) override;
@@ -309,8 +310,6 @@ namespace plume {
         ~D3D12Texture() override;
         std::unique_ptr<RenderTextureView> createTextureView(const RenderTextureViewDesc &desc) const override;
         void setName(const std::string &name) override;
-        // REXGLUE: expose the barrier-tracked layout (see RenderTexture).
-        RenderTextureLayout getKnownLayout() const override { return layout; }
     };
 
     struct D3D12TextureView : RenderTextureView {
@@ -429,6 +428,7 @@ namespace plume {
         std::vector<std::pair<uint32_t, RenderRootDescriptorType>> rootDescriptorRootIndicesAndTypes;
         uint32_t setCount = 0;
         uint32_t rootCount = 0;
+        uint64_t signatureHash = 0;  // REXGLUE: part of the pipeline library key
 
         D3D12PipelineLayout(D3D12Device *device, const RenderPipelineLayoutDesc &desc);
         ~D3D12PipelineLayout() override;
@@ -451,6 +451,16 @@ namespace plume {
         RenderDeviceDescription description;
         uint64_t timestampFrequency = 1;
         bool gpuUploadHeapFallback = false;
+
+        // REXGLUE: on-disk PSO cache, one file per adapter and driver version. The loaded blob must outlive the library.
+        ID3D12PipelineLibrary *pipelineLibrary = nullptr;
+        std::vector<uint8_t> pipelineLibraryBlob;
+        std::mutex pipelineLibraryMutex;
+        uint32_t pipelineLibraryVendor = 0;
+        uint32_t pipelineLibraryDevice = 0;
+        void openPipelineLibrary();
+        void savePipelineLibrary();
+        std::string pipelineLibraryPath() const;
 
         D3D12Device(D3D12Interface *renderInterface, const std::string &preferredDeviceName);
         ~D3D12Device() override;

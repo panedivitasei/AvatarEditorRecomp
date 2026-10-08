@@ -22,3 +22,17 @@ option. Keep this copy self-contained.
 
 Local patch: CMakeLists.txt links d3d12+dxgi on WIN32 (upstream expects
 the consuming app to do it).
+
+Local patch: D3D12Device keeps an ID3D12PipelineLibrary in
+%TEMP%\rexglue_d3d12_pipelines_<vendor>_<device>_<driver>.bin, loaded at
+device creation and saved once a second while PSOs compile and on release
+(the D3D12 counterpart of the Vulkan pipeline cache file).
+
+Local patch: RenderCommandList::setBlendFactor (D3D12 OMSetBlendFactor, Vulkan
+vkCmdSetBlendConstants); every Vulkan graphics pipeline declares
+VK_DYNAMIC_STATE_BLEND_CONSTANTS so the constant blend colour is per draw.
+
+Local patch: D3D12 stencil-plane texture views support preserving stencil contents when render targets resize.
+
+Local patch: D3D12GraphicsPipeline copies RenderGraphicsPipelineDesc::stencilReference into stencilRef
+(upstream leaves it 0, so OMSetStencilRef never saw the requested reference).

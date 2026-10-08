@@ -329,6 +329,7 @@ namespace plume {
         void setScissors(const RenderRect *scissorRects, uint32_t count) override;
         void setFramebuffer(const RenderFramebuffer *framebuffer) override;
         void setDepthBias(float depthBias, float depthBiasClamp, float slopeScaledDepthBias) override;
+        void setBlendFactor(const float *rgba) override;
         void clearColor(uint32_t attachmentIndex, RenderColor colorValue, const RenderRect *clearRects, uint32_t clearRectsCount) override;
         void clearDepthStencil(bool clearDepth, bool clearStencil, float depthValue, uint32_t stencilValue, const RenderRect *clearRects, uint32_t clearRectsCount) override;
         void copyBufferRegion(RenderBufferReference dstBuffer, RenderBufferReference srcBuffer, uint64_t size) override;
@@ -408,6 +409,11 @@ namespace plume {
         VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
         VkPhysicalDeviceProperties physicalDeviceProperties = {};
         VmaAllocator allocator = VK_NULL_HANDLE;
+        // REXGLUE: device-wide pipeline cache (disk-backed). Passed to every
+        // vkCreate*Pipelines so the driver dedupes/reuses shader compilation
+        // within a session and across launches — kills the multi-hundred-ms
+        // course/flyby stutters from compiling SPIR-V on the render thread.
+        VkPipelineCache pipelineCache = VK_NULL_HANDLE;
         uint32_t queueFamilyIndices[3] = {};
         std::vector<VulkanQueueFamily> queueFamilies;
         RenderDeviceCapabilities capabilities;
@@ -420,6 +426,8 @@ namespace plume {
 
         VulkanDevice(VulkanInterface *renderInterface, const std::string &preferredDeviceName);
         ~VulkanDevice() override;
+        void savePipelineCache();
+        std::string pipelineCachePath() const;  // REXGLUE: per-GPU disk cache for the pipeline cache
         std::unique_ptr<RenderDescriptorSet> createDescriptorSet(const RenderDescriptorSetDesc &desc) override;
         std::unique_ptr<RenderShader> createShader(const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) override;
         std::unique_ptr<RenderSampler> createSampler(const RenderSamplerDesc &desc) override;

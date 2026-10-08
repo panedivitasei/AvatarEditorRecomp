@@ -7,7 +7,7 @@
  * items in the scoped catalog channel are enumerated (other categories pass
  * through unfiltered), so the browsed grid shows exactly the matches. The guest
  * enumerates only during its catalog rebuild-all, so the title tick
- * (video_hooks.cpp AeXuiSearchTick) drives that rebuild on apply/clear and then
+ * (xui_hooks.cpp AeXuiSearchTick) drives that rebuild on apply/clear and then
  * latches the registry's dirty flags so the open grid re-pushes natively.
  *
  * Set/cleared by the Ctrl+F overlay (ui side, wired through ReXApp);

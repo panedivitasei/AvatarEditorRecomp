@@ -1036,6 +1036,7 @@ namespace plume {
     };
 
     struct RenderTextureViewDesc {
+        bool stencilAspect = false;
         RenderFormat format = RenderFormat::UNKNOWN;
         RenderTextureViewDimension dimension = RenderTextureViewDimension::UNKNOWN;
         uint32_t mipLevels = UINT32_MAX;

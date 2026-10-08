@@ -130,7 +130,11 @@ void AE_MktChannelValidate(PPCRegister& r3) {
 // Net driver probes. The XHTTP pump struct (sub_9228EF10's int array) lives
 // at driver+840: [0] state, [2] request handle, [4] read buffer, [6..7] content
 // length, [8] pending result.
+REXCVAR_DEFINE_BOOL(ae_mkt_trace, false, "AE",
+                    "Log every marketplace network poll step (two lines per millisecond).");
+
 void AE_MktNetPoll(PPCRegister& r3, PPCRegister& r4) {
+  if (!REXCVAR_GET(ae_mkt_trace)) return;
   const uint32_t obj = r3.u32, pump = obj + 840;
   REXKRNL_INFO("[mkt-net] poll obj={:#x} target={} abort={:#x} pump.state={} req={:#x} buf={:#x} "
                "len={} result={:#x}",

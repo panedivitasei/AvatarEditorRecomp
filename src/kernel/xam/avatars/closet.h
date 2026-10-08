@@ -6,7 +6,7 @@
  * A closet directory holds one <product-guid>.bin (the marketplace item's raw
  * YTGR/STRB asset_v2.bin) per item plus closet_index.tsv
  * (guid TAB categories-hex TAB bodies TAB name), produced by
- * `avatarextract --closet-import`. Items are enumerated into the Avatar
+ * the Avatar Aura import. Items are enumerated into the Avatar
  * Editor's selection grids alongside the stock asset pack and resolve by their
  * full product GUID; stock pack ids resolve by pack index and always carry the
  * C1C8F109A19CB2E0 tail, while marketplace ids end in the item's title id, so
