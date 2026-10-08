@@ -134,6 +134,7 @@ class AvatareditorApp : public rex::ReXApp {
       return false;
     }
     window()->SetTitle("Avatar Editor");
+    key_feed_.window = window();
     window()->AddInputListener(&key_feed_, 0);
     ae_search::Get().Attach(window());
     // The device comes up here, before any guest thread exists, so the first Swap already has a swap chain.
@@ -163,8 +164,20 @@ class AvatareditorApp : public rex::ReXApp {
   // Separate input listener feeding the keystroke synthesizer
   // (input_hooks.cpp); the base app's own listener keeps the overlay binds.
   class KeyFeed : public rex::ui::WindowInputListener {
-    // Typing into the search box is not navigation.
+   public:
+    rex::ui::Window* window = nullptr;
+
+   private:
+    // F11 flips the window and the fullscreen cvar together, so the settings page and the toml stay in step.
     void OnKeyDown(rex::ui::KeyEvent& e) override {
+      if (e.virtual_key() == rex::ui::VirtualKey::kF11 && window) {
+        const bool on = !window->IsFullscreen();
+        rex::cvar::SetFlagByName("fullscreen", on ? "true" : "false");
+        window->SetFullscreen(on);
+        e.set_handled(true);
+        return;
+      }
+      // Typing into the search box is not navigation.
       if (ae_search::Get().open()) return;
       ae_input::OnHostKey(e.virtual_key(), true, e.is_shift_pressed(),
                           e.is_ctrl_pressed(), e.is_alt_pressed());
