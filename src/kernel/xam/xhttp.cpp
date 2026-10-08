@@ -24,6 +24,8 @@
 #define NOMINMAX
 #include <windows.h>
 #include <winhttp.h>
+
+#include "marketplace_key.h"
 #pragma comment(lib, "winhttp.lib")
 
 #include <algorithm>
@@ -59,7 +61,6 @@
 REXCVAR_DECLARE(std::string, game_data_root);
 // The store's server, defined next to the hive values in xam_user.cpp.
 REXCVAR_DECLARE(std::string, avatar_marketplace_server);
-REXCVAR_DECLARE(std::string, avatar_marketplace_key);
 
 namespace rex {
 namespace kernel {
@@ -178,7 +179,7 @@ static bool HttpFetch(const std::string& host, uint16_t port, bool secure,
     if (request) {
       // The shared key rides on every request. Only the configured server ever
       // gets this far, so it goes nowhere else.
-      const std::string key = REXCVAR_GET(avatar_marketplace_key);
+      const std::string& key = ae::marketplace::Key();
       const std::wstring extra =
           key.empty() ? std::wstring() : L"X-Marketplace-Key: " + Widen(key) + L"\r\n";
       if (WinHttpSendRequest(request, extra.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : extra.c_str(),

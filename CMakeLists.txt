@@ -45,6 +45,7 @@ set(AVATAREDITOR_SOURCES
     src/kernel/xam/xam_loader.cpp
     src/kernel/xam/xam_ui.cpp
     src/kernel/xam/xhttp.cpp
+    src/kernel/xam/marketplace_key.cpp
     src/kernel/xam/apps/xlivebase_app.cpp
     ${AVATAR_LIB_SOURCES}
 )
