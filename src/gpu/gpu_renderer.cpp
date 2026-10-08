@@ -1415,7 +1415,7 @@ void Backend::EvictIdleTextures() {
     ++released;
   }
   if (dropped || released) {
-    REXGPU_INFO("[gpu] dropped {} idle sampled textures and {} released resolve targets ({:.1f} MB); {} host "
+    REXGPU_DEBUG("[gpu] dropped {} idle sampled textures and {} released resolve targets ({:.1f} MB); {} host "
                 "textures remain, {} table slots free",
                 dropped, released, bytes / 1048576.0, resources_.size(), recycled_descriptors_.size());
   }
@@ -1725,7 +1725,7 @@ bool Backend::EvictPersistent(uint64_t size, uint64_t& offset) {
     // Retire hands the freed ranges back at once because their frames are already complete.
     persistent_.Retire(retired);
     if (freed >= size && persistent_.Allocate(size, offset)) {
-      REXGPU_INFO("[gpu] evicted {} idle owned ranges ({:.2f} MB) from persistent shared memory", evicted,
+      REXGPU_DEBUG("[gpu] evicted {} idle owned ranges ({:.2f} MB) from persistent shared memory", evicted,
                   freed / 1048576.0);
       return true;
     }
@@ -2423,7 +2423,7 @@ void Backend::Execute(Packet& packet) {
     if (swap) {
       const uint64_t host = ns(t0, Clock::now());
       if (host > kSlowFrameNs) {
-        REXGPU_INFO("[gpu] slow host frame {}: {:.1f} ms, prepare {:.1f} ms, {} new pipelines {:.1f} ms (longest "
+        REXGPU_DEBUG("[gpu] slow host frame {}: {:.1f} ms, prepare {:.1f} ms, {} new pipelines {:.1f} ms (longest "
                     "{:.1f} ms), {} new shaders {:.1f} ms",
                     frame_counter_, host / 1e6, ns(t0, t1) / 1e6, frame_cost_.pipelines, frame_cost_.pipeline_ns / 1e6,
                     frame_cost_.longest_pipeline_ns / 1e6, frame_cost_.shaders, frame_cost_.shader_ns / 1e6);
@@ -2443,7 +2443,7 @@ void Backend::ReportStats() {
     std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
     for (size_t i = 0; i < std::min<size_t>(ranked.size(), 15); ++i) {
       const auto& [shaders, cost] = ranked[i];
-      REXGPU_INFO("[gpu] draw profile #{}: VS {:016X} PS {:016X}: {:.2f} ms/frame, {:.1f} draws/frame ({} sampled frames)",
+      REXGPU_DEBUG("[gpu] draw profile #{}: VS {:016X} PS {:016X}: {:.2f} ms/frame, {:.1f} draws/frame ({} sampled frames)",
                   i + 1, shaders.first, shaders.second, cost.ns / double(draw_gpu_frames_) / 1e6,
                   cost.draws / double(draw_gpu_frames_), draw_gpu_frames_);
     }
@@ -2452,22 +2452,22 @@ void Backend::ReportStats() {
   }
   if (REXCVAR_GET(gpu_host_profile)) {
     const double g = double(std::max<uint64_t>(stats_.gpu_frames, 1)) * 1e6;
-    REXGPU_INFO("[gpu] host profile: acquire {:.2f} ms, submit {:.2f} ms, Present {:.2f} ms; "
+    REXGPU_DEBUG("[gpu] host profile: acquire {:.2f} ms, submit {:.2f} ms, Present {:.2f} ms; "
                 "GPU uploads {:.2f}, draws {:.2f}, clears {:.2f}, resolves {:.2f}, final blit {:.2f} ms ({} frames)",
                 stats_.acquire_ns / f / 1e6, stats_.submit_ns / f / 1e6, stats_.dxgi_ns / f / 1e6,
                 stats_.gpu_ns[0] / g, stats_.gpu_ns[1] / g, stats_.gpu_ns[2] / g,
                 stats_.gpu_ns[3] / g, stats_.gpu_ns[4] / g, stats_.gpu_frames);
   }
-  REXGPU_INFO("[gpu] float uploads/frame: {:.0f} uploaded, {:.0f} reused ({:.2f} MB avoided)",
+  REXGPU_DEBUG("[gpu] float uploads/frame: {:.0f} uploaded, {:.0f} reused ({:.2f} MB avoided)",
               stats_.constant_uploads / f, stats_.constant_reuses / f, stats_.constant_reuses * 4096.0 / f / 1048576.0);
   const uint64_t capture_ns = g_capture_ns.exchange(0);
   const uint64_t capture_bytes = g_capture_bytes.exchange(0);
   uint64_t section[4];
   for (int i = 0; i < 4; ++i) section[i] = g_capture_section[i].exchange(0);
-  REXGPU_INFO("[gpu] stats/{} frames: capture split shaders+state {:.2f} ms, constants {:.2f} ms, streams+textures "
+  REXGPU_DEBUG("[gpu] stats/{} frames: capture split shaders+state {:.2f} ms, constants {:.2f} ms, streams+textures "
               "{:.2f} ms, geometry {:.2f} ms",
               stats_.frames, section[0] / f / 1e6, section[1] / f / 1e6, section[2] / f / 1e6, section[3] / f / 1e6);
-  REXGPU_INFO(
+  REXGPU_DEBUG(
       "[gpu] stats/{} frames: guest capture {:.2f} ms ({:.2f} MB copied), host prepare {:.2f} ms, record {:.2f} ms, "
       "present {:.2f} ms, uploads {:.1f} ({:.2f} MB), draws {:.0f}, new pipelines {} ({:.1f} ms sync), new shaders {}, "
       "draws skipped while a pipeline compiled {}, transient peak {:.2f} MB, host textures {} using {} of {} table slots",
@@ -2480,7 +2480,7 @@ void Backend::ReportStats() {
   const uint64_t long_frames = g_long_frames.exchange(0), pace = g_pace_ns.exchange(0);
   const uint64_t queue_wait = g_queue_wait_ns.exchange(0);
   const double logic = std::max(0.0, (double(interval) - double(capture_ns) - double(pace) - double(queue_wait)) / f);
-  REXGPU_INFO("[gpu] stats/{} frames: pacing: frame {:.2f} ms ({:.1f} fps, max {:.1f} ms, {} over 20 ms), guest logic "
+  REXGPU_DEBUG("[gpu] stats/{} frames: pacing: frame {:.2f} ms ({:.1f} fps, max {:.1f} ms, {} over 20 ms), guest logic "
               "{:.2f} ms, cap sleep {:.2f} ms, queue wait {:.2f} ms, host gpu wait {:.2f} ms",
               stats_.frames, interval / f / 1e6, interval ? f * 1e9 / double(interval) : 0.0, interval_max / 1e6,
               long_frames, logic / 1e6, pace / f / 1e6, queue_wait / f / 1e6, stats_.gpu_wait_ns / f / 1e6);
@@ -2711,20 +2711,20 @@ void EndFrame() {
     calls[i] = g_frame_guest_count[i].exchange(0);
   }
   if (BurstTimingEnabled() && (capture > 20'000'000 || decodes >= 100)) {
-    REXGPU_INFO("[gpu] burst frame {}: capture {:.2f} ms; indices {:.2f} ({}), streams {:.2f} ({}), "
+    REXGPU_DEBUG("[gpu] burst frame {}: capture {:.2f} ms; indices {:.2f} ({}), streams {:.2f} ({}), "
                 "describe {:.2f} ({}), texture key {:.2f} ({}), resource lookup {:.2f} ({}), "
                 "shader lookup {:.2f} ({}), preparation finish {:.2f} ({}), texture binding {:.2f} ({}), "
                 "registration {:.2f} ({}); inclusive ms, nested costs overlap",
                 frame, capture / 1e6, burst[2], calls[2], burst[3], calls[3], burst[4], calls[4],
                 burst[5], calls[5], burst[6], calls[6], burst[7], calls[7], burst[8], calls[8],
                 burst[9], calls[9], burst[10], calls[10]);
-    REXGPU_INFO("[gpu] burst streams {}: copy {:.2f} ms ({}), query {:.2f} ms ({}), "
+    REXGPU_DEBUG("[gpu] burst streams {}: copy {:.2f} ms ({}), query {:.2f} ms ({}), "
                 "unowned checks {:.2f} ms ({}), {:.3f} MB copied",
                 frame, burst[11], calls[11], burst[12], calls[12], burst[13], calls[13], burst[14]);
-    REXGPU_INFO("[gpu] burst shader pack {}: {:.2f} ms ({})", frame, burst[15], calls[15]);
+    REXGPU_DEBUG("[gpu] burst shader pack {}: {:.2f} ms ({})", frame, burst[15], calls[15]);
   }
   if (capture > kSlowFrameNs) {
-    REXGPU_INFO("[gpu] slow guest frame {}: capture {:.1f} ms, runtime translation {:.1f} ms ({}), texture decode "
+    REXGPU_DEBUG("[gpu] slow guest frame {}: capture {:.1f} ms, runtime translation {:.1f} ms ({}), texture decode "
                 "{:.1f} ms ({})",
                 frame, capture / 1e6, translate / 1e6, translations, decode / 1e6, decodes);
   }

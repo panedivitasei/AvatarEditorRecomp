@@ -946,7 +946,7 @@ static X_RESULT ReadTileImage(uint32_t tile_type, uint32_t game_id, uint64_t ite
     static std::atomic<uint32_t> tile_calls{0};
     const uint32_t n = tile_calls.fetch_add(1, std::memory_order_relaxed);
     if (n < 16 || (n & 0x3F) == 0) {
-      REXKRNL_INFO("[tile] #{} type={} game={:08X} art={} bytes={}", n, tile_type, game_id,
+      REXKRNL_DEBUG("[tile] #{} type={} game={:08X} art={} bytes={}", n, tile_type, game_id,
                    have_art, file.size());
     }
   }
@@ -1220,7 +1220,7 @@ u32 XamGetLiveHiveValueA_entry(mapped_string name, mapped_string buffer, u32 buf
     }
   }
   if (!value.empty()) {
-    REXKRNL_INFO("[hive] {} -> '{}' ({:#x})", key, value, result);
+    REXKRNL_DEBUG("[hive] {} -> '{}' ({:#x})", key, value, result);
   }
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
@@ -1275,7 +1275,7 @@ u32 XamGetLiveHiveValueW_entry(mapped_wstring name, mapped_wstring buffer, u32 b
     }
   }
   // Log misses too: an unserved key here is the next thing the store trips on.
-  REXKRNL_INFO("[hive-w] {} -> '{}' ({:#x})", key, value, result);
+  REXKRNL_DEBUG("[hive-w] {} -> '{}' ({:#x})", key, value, result);
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
@@ -1294,7 +1294,7 @@ static constexpr uint32_t kXnSysUi = 0x00000009;
 
 static u32 ShowMarketplaceUI(const char* which, u32 user_index, u32 ui_type, u64 offer_id,
                              u32 content_types) {
-  REXKRNL_INFO("[hive] {}(user={}, type={}, offer={:#018x}, categories={:#x}) served locally",
+  REXKRNL_DEBUG("[hive] {}(user={}, type={}, offer={:#018x}, categories={:#x}) served locally",
                which, user_index, ui_type, offer_id, content_types);
   auto* kernel_state = REX_KERNEL_STATE();
   kernel_state->BroadcastNotification(kXnSysUi, 1);
