@@ -741,6 +741,8 @@ TextureBinding FinishBinding(TextureBinding out, uint64_t key, TextureCacheEntry
     entry.version++;
     entry.generation = state.generation;
     if (paranoid) memory::NoteUploaded(key, desc.base_address, desc.base_size, bytes);
+    // The draw may still be dropped after this point, so the upload travels as its own record ahead of it.
+    if (out.upload) ae::gpu::Submit(TextureUploadRecord{entry.desc, entry.version, out.upload});
   }
   entry.frame = frame;
   out.version = entry.version;
@@ -748,8 +750,8 @@ TextureBinding FinishBinding(TextureBinding out, uint64_t key, TextureCacheEntry
   return out;
 }
 
-// Vertex ranges the host holds: registered ones persist across frames at the tracker generation; unregistered ones
-// are uploaded once per frame and shared by that frame's draws.
+// Vertex ranges the host holds: registered ones persist across frames by content hash, since the title writes
+// into its avatar blocks without a lock the tracker could see; unregistered ones are uploaded once per frame.
 struct SentRange {
   uint32_t version = 0;
   uint64_t frame = UINT64_MAX;
@@ -808,10 +810,16 @@ StreamData CaptureStream(uint32_t fetch_index, uint32_t guest_base, uint32_t siz
   const uint8_t* bytes = paranoid ? REX_KERNEL_MEMORY()->TranslatePhysical<const uint8_t*>(guest_base) : nullptr;
   bool send;
   if (state.registered) {
-    send = sent.frame == UINT64_MAX || sent.version != state.generation;
-    if (!send && paranoid && !memory::CheckUnchanged(s.key, guest_base, size, bytes)) {
-      send = true;
-      s.version = state.generation + 0x80000000u;
+    if (sent.frame == frame) {
+      s.version = sent.version;
+      send = false;
+    } else {
+      // The version is the hash itself, so the host's resident copy matches the bytes or is replaced.
+      if (!bytes) bytes = REX_KERNEL_MEMORY()->TranslatePhysical<const uint8_t*>(guest_base);
+      const uint64_t hash = XXH3_64bits(bytes, size);
+      s.version = uint32_t(hash ^ (hash >> 32)) | 1u;
+      send = sent.frame == UINT64_MAX || sent.version != s.version;
+      sent.frame = frame;
     }
   } else {
     BurstTiming unowned_timing(13);
@@ -1605,8 +1613,9 @@ void Submit(DrawRecord&& r) {
                 r.state.stencil_read_mask, r.state.stencil_write_mask, r.state.blend[0], r.state.blend_enable[0],
                 r.state.write_mask[0]);
     for (const auto& t : r.textures) {
-      REXGPU_INFO("[gpu]   tex stage {} slot {} dim {} host {} {} {}x{} upload {}", t.stage, t.slot, t.dimension,
-                  t.texture.id, HostFormatName(t.texture.format), t.texture.width, t.texture.height, t.upload != nullptr);
+      REXGPU_INFO("[gpu]   tex stage {} slot {} dim {} host {} v{} {} {}x{} upload {}", t.stage, t.slot, t.dimension,
+                  t.texture.id, t.version, HostFormatName(t.texture.format), t.texture.width, t.texture.height,
+                  t.upload != nullptr);
     }
   }
   ae::gpu::Submit(std::move(r));

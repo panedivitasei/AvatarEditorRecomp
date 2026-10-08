@@ -184,6 +184,7 @@ class AvatareditorApp : public rex::ReXApp {
         e.set_handled(true);
         return;
       }
+
       // Typing into the search box is not navigation.
       if (ae_search::Get().open()) return;
       ae_input::OnHostKey(e.virtual_key(), true, e.is_shift_pressed(),
