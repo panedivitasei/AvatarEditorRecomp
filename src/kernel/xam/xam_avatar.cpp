@@ -49,6 +49,7 @@
 #include <rex/system/xtypes.h>
 #include <rex/types.h>
 
+#include "gpu/gpu.h"
 #include "avatars/asset_pack.h"
 #include "avatars/closet.h"
 #include "marketplace.h"
@@ -62,14 +63,6 @@
 // read here to locate the title's AI avatar looks under data/art/_avatar/.
 REXCVAR_DECLARE(std::string, game_data_root);
 REXCVAR_DECLARE(bool, avatar_marketplace);
-
-// Native-renderer guest-texture notifications, called on the rexvideonative
-// renderer queues directly. The exe links the videonative static lib; both
-// functions only append to queues and are safe with no active renderer.
-namespace rex::videonative::renderer {
-void QueueGuestTextureFreeze(uint32_t guest_address, uint32_t size);
-void QueueGuestTextureInvalidate(uint32_t guest_address, uint32_t size);
-}  // namespace rex::videonative::renderer
 
 // Enable Avatar Initialization. Some games require a full avatar implementation
 // and may crash; enabled by default in this build so avatar-using titles boot.
@@ -91,7 +84,7 @@ REXCVAR_DEFINE_STRING(avatar_asset_pack_dir, "", "Kernel",
 // game_data_root (same convention as content_root).
 REXCVAR_DEFINE_STRING(avatar_closet_dir, "", "Kernel",
                       "Directory with imported closet items (<guid>.bin + closet_index.tsv, "
-                      "built by avatarextract --closet-import). Empty = "
+                      "built by the Avatar Aura import). Empty = "
                       "<avatar_asset_pack_dir>\\closet. Relative paths resolve against "
                       "game_data_root.");
 
@@ -121,8 +114,8 @@ static const char* kLegacyMetaCachePath = "legacy_avatar_meta.bin";
 REXCVAR_DEFINE_STRING(avatar_data_dir, "", "Kernel",
                       "Shared cross-title folder for persisted avatar data: the manifest the "
                       "Avatar Editor saves and every game then loads as the local user's "
-                      "avatar. Empty = <user_data_root>\\avatars (the shared "
-                      "Documents\\ReXGlue\\userdata\\avatars by default).");
+                      "avatar. Empty = <user_data_root>\\avatar\\manifest (the shared "
+                      "%USERPROFILE%\\JMstudios\\avatar\\manifest by default).");
 
 static std::string AvatarManifestPath() {
   std::string dir = REXCVAR_GET(avatar_data_dir);
@@ -131,13 +124,13 @@ static std::string AvatarManifestPath() {
     // folder (and any user_data_root override carries the avatar with it).
     const auto& root = REX_KERNEL_STATE()->emulator()->user_data_root();
     if (!root.empty()) {
-      dir = (root / "avatars").string();
+      dir = (root / "avatar" / "manifest").string();
     }
   }
   if (dir.empty()) {
     const char* profile = std::getenv("USERPROFILE");
-    dir = profile ? std::string(profile) + "\\Documents\\ReXGlue\\userdata\\avatars"
-                  : std::string("avatars");
+    dir = profile ? std::string(profile) + "\\JMstudios\\avatar\\manifest"
+                  : std::string("avatar\\manifest");
   }
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
@@ -279,9 +272,7 @@ static bool LoadAvatarAssetPack() {
     avatars::SetLegacyAssetPack(
         g_legacy_avatar_asset_pack.is_loaded() ? &g_legacy_avatar_asset_pack : nullptr);
   }
-  // Imported marketplace/award items (avatarextract --closet-import): by
-  // default a closet/ subdirectory next to the pack; avatar_closet_dir
-  // relocates it (e.g. into the Avatar Editor's shipped assets folder).
+  // Avatar Aura import items live in closet/ next to the pack unless avatar_closet_dir relocates them.
   std::filesystem::path closet_dir = std::filesystem::path(dir) / "closet";
   const std::string closet_override = REXCVAR_GET(avatar_closet_dir);
   if (!closet_override.empty()) {
@@ -1002,34 +993,20 @@ u32 XamAvatarGetAssets_entry(ppc_ptr_t<X_AVATAR_METADATA> avatar_metadata_ptr,
         }
       }
     }
-    // The title recycles a small set of GPU resource buffers across avatar
-    // builds (the editor ping-pongs two of them, one GetAssets call per
-    // selection-grid tile), so the rewrite below can land while GPU-side
-    // texture loads for the previous build at the same addresses are still
-    // pending. The command processor lives inside the GPU plugin and exposes
-    // no drain to the app, so the emulated-GPU path has no sync here; the
-    // freeze and invalidate bracket below protects the native-renderer path,
-    // which is the shipped configuration.
     avatars::MemoryBlock cpu_memory(cpu_host, 16);
     avatars::MemoryBlock gpu_memory(gpu_host, 4096);
-    // Freeze bracket: the rewrite below takes milliseconds while the render
-    // thread keeps drawing; without this, content heals can re-upload
-    // half-rewritten textures (random corruption on item select). The
-    // exact extent is unknown until the load finishes, so freeze a generous
-    // span; the paired invalidate below thaws by overlap.
-    rex::videonative::renderer::QueueGuestTextureFreeze(gpu_addr, 0x400000u);
     bool ok = avatars::LoadAssetsToGuest(*build_meta, avatar_component_mask, flags, pack,
                                          &cpu_memory, &gpu_memory, skeleton_version,
                                          g_coordinate_system);
     if (!ok) {
       REXKRNL_WARN("[avatar] GetAssets: LoadAssetsToGuest failed (mask={:#x})",
                    avatar_component_mask);
-      // Thaw the freeze bracket even on failure (partial writes possible).
-      rex::videonative::renderer::QueueGuestTextureInvalidate(gpu_addr, 0x400000u);
       return X_ERROR_FUNCTION_FAILED;
     }
     cpu_memory.ResolvePointers(cpu_addr);
     gpu_memory.ResolvePointers(gpu_addr);
+    // The title recycles a few GPU buffers across builds, so cached host textures over this range are retired here.
+    ae::gpu::MarkRangeDirty(gpu_addr, static_cast<uint32_t>(gpu_memory.used()));
     {
       // Past the budget means the title's neighbouring data is already gone.
       uint32_t budget_cpu = 0, budget_gpu = 0;
@@ -1041,14 +1018,6 @@ u32 XamAvatarGetAssets_entry(ppc_ptr_t<X_AVATAR_METADATA> avatar_metadata_ptr,
                      budget_gpu);
       }
     }
-    // The title recycles a handful of GPU resource buffers across builds (each
-    // grid tile is one GetAssets call into one of a few addresses). The native
-    // renderer's texture cache keys on the fetch header, which is identical
-    // across builds at the same address, and its polling heals are windowed, so
-    // report the rewritten range explicitly to retire overlapping cache entries
-    // before the next draw. No-op when no native renderer is attached.
-    rex::videonative::renderer::QueueGuestTextureInvalidate(
-        gpu_addr, static_cast<uint32_t>(gpu_memory.used()));
     if (!is_player_build) PaceBakeCompletion();
     return X_ERROR_SUCCESS;
   };
@@ -1302,7 +1271,7 @@ u32 XamAvatarGetInstrumentation_entry(u64 unk1, mapped_u32 unk2) {
 // global 0x9457D05C is never written (re/subsystems/09_item_grid_tiles.md §4).
 //
 // Icon art comes from closet icons/<guid>.png, the marketplace package's own
-// ICON.PNG, imported by `avatarextract --closet-import` / `--closet-icons`.
+// ICON.PNG, copied in by the Avatar Aura import.
 
 // Store items the closet does not hold come from the marketplace server, art
 // and bytes alike. Each id is asked for once per session.

@@ -1129,7 +1129,7 @@ bool LoadAssetsToGuest(const X_AVATAR_METADATA& metadata,
                blend_shape.first.to_string(),
                source_component.first.asset_id.to_string());
       }
-      REXKRNL_ERROR("Applied blend shape {} to asset {}.",
+      REXKRNL_DEBUG("Applied blend shape {} to asset {}.",
              blend_shape.first.to_string(),
              source_component.first.asset_id.to_string());
     }
