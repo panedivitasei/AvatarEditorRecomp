@@ -2,7 +2,7 @@
   <img src="assets/ae.png" width="2554" alt="AE recomp png">
 </p>
 
-# Avatar Editor Recomp
+# AvatarEditorRecomp
 
 An unofficial PC port of the Fall 2010 Kinect-preview Avatar Editor created through static recompilation using the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk).
 
