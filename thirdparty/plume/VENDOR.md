@@ -36,3 +36,6 @@ Local patch: D3D12 stencil-plane texture views support preserving stencil conten
 
 Local patch: D3D12GraphicsPipeline copies RenderGraphicsPipelineDesc::stencilReference into stencilRef
 (upstream leaves it 0, so OMSetStencilRef never saw the requested reference).
+
+Local patch: the present-failure dump to plume_present_dbg.txt and the per-300-frame DXGI statistics line are
+removed; shipped builds write no debug files.

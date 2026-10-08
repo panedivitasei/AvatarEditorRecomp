@@ -39,6 +39,7 @@ set(AVATAREDITOR_SOURCES
     src/gpu/gpu_texture_decode.cpp
     src/gpu/gpu_tracker.cpp
     src/fault_diag.cpp
+    src/dll_dir.cpp
     src/kernel/xam/xam_avatar.cpp
     src/kernel/xam/xam_user.cpp
     src/kernel/xam/xam_loader.cpp
@@ -97,7 +98,7 @@ add_subdirectory("${XENOS_RECOMP_THIRDPARTY_ROOT}" xenosrecomp_thirdparty EXCLUD
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/tools/XenosRecomp/XenosRecomp" xenosrecomp EXCLUDE_FROM_ALL)
 target_link_libraries(avatareditor PRIVATE xenosrecomp_core xxHash::xxhash)
 if(WIN32)
-    target_link_options(avatareditor PRIVATE "LINKER:/DELAYLOAD:dxcompiler.dll" "LINKER:/DELAYLOAD:dxil.dll")
+    target_link_options(avatareditor PRIVATE "LINKER:/DELAYLOAD:rexruntime.dll" "LINKER:/DELAYLOAD:dxcompiler.dll" "LINKER:/DELAYLOAD:dxil.dll")
     target_link_libraries(avatareditor PRIVATE delayimp)
     add_custom_command(TARGET avatareditor POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${XENOS_RECOMP_THIRDPARTY_ROOT}/dxc-bin/bin/x64/dxcompiler.dll"
