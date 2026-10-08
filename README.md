@@ -13,24 +13,14 @@ This project doesn't include the Avatar Editor or assets. You must provide a cop
 **Search**  
 Press `Ctrl+F` to search avatar item catalogs and styles.
 
-**Native rendering (WIP)**  
-For best performance and compatibility.
+**Native rendering**  
+The editor renders through a native D3D12 renderer.
 
 **Input**  
 XInput controller and keyboard support.
 
 **Fullscreen toggle**  
 Press `F11` to toggle between window and fullscreen modes.
-
-## Tools
-
-**Dry Cleaner**  
-Used to import avatar items and avatar awards into the Avatar Editor.
-
-**Avatar Export**  
-Used to export your avatar to various external file types.
-
-See [tools/README.md](tools/README.md) for usage.
 
 ## Building
 
@@ -42,10 +32,10 @@ The config file `avatareditor.toml` is expected to be in the build's root folder
 
 The asset and closet directories can be set in the config. 
 
-Saves and profile data live in `Documents\ReXGlue\userdata`
+Saves and profile data live in `%USERPROFILE%\JMstudios`
 
-- `avatars\avatar_manifest.bin`, the saved avatar
-- `avatars\gamerpic.png`, the AE gamer pic 
+- `avatar\manifest\avatar_manifest.bin`, the saved avatar
+- `avatar\manifest\gamerpic.png`, the AE gamer pic 
 - `user.toml`, set gamertag and path to gamer pic
 
 ## Credits
