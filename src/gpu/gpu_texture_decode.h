@@ -31,6 +31,10 @@ struct GuestTextureDesc {
   bool expand = false;        // per-component conversion to float (signs, gamma, packed or depth formats)
 };
 
+// A depth-format texture no resolve produced is a fresh allocation the title expects zeroed (reversed Z: nothing
+// occludes); the recomp recycles pages, so its guest bytes are stale data and are never decoded.
+bool UnresolvedDepth(const GuestTextureDesc& desc);
+
 // False for dimensions or formats the decoder does not handle; the reason is logged once per format.
 bool DescribeTexture(const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetch, GuestTextureDesc& out);
 

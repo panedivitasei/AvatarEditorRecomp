@@ -30,9 +30,11 @@ static const uint8_t* GuestDataPtrProbe(uint32_t addr, size_t bytes) {
   const auto readable = [&](uint32_t ea) {
     auto* heap = mem->LookupHeap(ea);
     rex::memory::HeapAllocationInfo info{};
-    uint32_t protect = 0;
-    return heap && heap->QueryRegionInfo(ea, &info) && (info.state & rex::memory::kMemoryAllocationCommit) &&
-           heap->QueryProtect(ea, &protect) && (protect & rex::memory::kMemoryProtectRead);
+    uint32_t size = 0, protect = 0;
+    // A free page is rejected by its zero region size first: QueryRegionInfo would walk the whole free run.
+    return heap && heap->QuerySize(ea, &size) && size && heap->QueryRegionInfo(ea, &info) &&
+           (info.state & rex::memory::kMemoryAllocationCommit) && heap->QueryProtect(ea, &protect) &&
+           (protect & rex::memory::kMemoryProtectRead);
   };
   const uint32_t last = addr + uint32_t(bytes - 1);
   if (last < addr || !readable(addr) || !readable(last)) return nullptr;

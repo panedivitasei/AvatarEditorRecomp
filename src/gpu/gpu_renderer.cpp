@@ -451,6 +451,7 @@ class Backend {
   // Draw machinery.
   bool CreateDrawResources();
   void PrepareUploads(Packet& packet);
+  void CopyTexture(HostResource& texture, const TextureUpload& upload, uint32_t version);
   bool Place(StreamData& stream, uint64_t& offset, std::vector<std::pair<uint64_t, UploadSpan>>& copies,
              std::vector<uint64_t>& copy_sizes);
   UploadSpan Upload(uint64_t size, uint64_t align);
@@ -586,6 +587,8 @@ class Backend {
   uint64_t draws_dropped_ = 0;
   struct FrameCost {
     uint64_t start_ns = 0, pipelines = 0, pipeline_ns = 0, longest_pipeline_ns = 0, shaders = 0, shader_ns = 0;
+    // Where prepare went: the shader specialise/pipeline pass, decode waits, texture copies, stream placement.
+    uint64_t specialize_ns = 0, decode_wait_ns = 0, texture_copy_ns = 0, stream_ns = 0, textures = 0, texture_bytes = 0;
   } frame_cost_;
   struct Stats {
     uint64_t frames = 0, draws = 0, uploads = 0, upload_bytes = 0;
@@ -1750,6 +1753,7 @@ void Backend::PrepareUploads(Packet& packet) {
     }
     auto& fetch = draw->constants->fetch;
     bool ok = true;
+    const auto streams_start = std::chrono::steady_clock::now();
     for (auto& stream : draw->streams) {
       uint64_t offset = 0;
       if (!Place(stream, offset, copies, copy_sizes)) {
@@ -1759,6 +1763,7 @@ void Backend::PrepareUploads(Packet& packet) {
       const uint32_t at = (stream.fetch_index / 3) * 6 + (stream.fetch_index % 3) * 2;
       fetch[at] = uint32_t(offset) | (fetch[at] & 3);
     }
+    frame_cost_.stream_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - streams_start).count());
     if (ok && draw->indexed && !Place(draw->index, draw->index_offset, copies, copy_sizes)) ok = false;
     if (!ok) {
       draw->count = 0;
@@ -1768,37 +1773,12 @@ void Backend::PrepareUploads(Packet& packet) {
       if (!binding.upload) continue;
       HostResource* texture = Get(binding.texture);
       if (!texture || !texture->sampled_only() || texture->version == binding.version) continue;
+      const auto wait_start = std::chrono::steady_clock::now();
       binding.upload->Wait();
-      Transition(*texture, plume::RenderTextureLayout::COPY_DEST);
-      FlushTransitions();
-      const uint32_t block = HostBlockSize(binding.texture.format);
-      const uint32_t bpb = HostBlockBytes(binding.texture.format);
-      const uint32_t levels = texture->mips();
-      const uint32_t layers = texture->layers();
-      auto* list = lists_[slot_].get();
-      for (uint32_t layer = 0; layer < layers; ++layer) {
-        for (uint32_t level = 0; level < levels; ++level) {
-          const size_t i = size_t(layer) * levels + level;
-          if (i >= binding.upload->levels.size()) break;
-          const auto& bytes = binding.upload->levels[i];
-          const uint32_t src_pitch = binding.upload->row_pitch[i];
-          const uint32_t lw = std::max(binding.texture.width >> level, 1u);
-          const uint32_t lh = std::max(binding.texture.height >> level, 1u);
-          const uint32_t ld = texture->volume() ? std::max(binding.texture.depth >> level, 1u) : 1u;
-          // A 3D level holds its slices back to back; the footprint takes the rows of one slice.
-          const uint32_t rows = src_pitch ? uint32_t(bytes.size() / src_pitch) : 0;
-          const uint32_t pitch = (src_pitch + 255) & ~255u;
-          UploadSpan span = Upload(uint64_t(pitch) * rows, 512);
-          if (!span.data || !rows) continue;
-          for (uint32_t y = 0; y < rows; ++y) std::memcpy(span.data + size_t(y) * pitch, &bytes[size_t(y) * src_pitch], src_pitch);
-          stats_.upload_bytes += uint64_t(pitch) * rows;
-          ++stats_.uploads;
-          list->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(texture->texture.get(), level, layer),
-                                  plume::RenderTextureCopyLocation::PlacedFootprint(
-                                      span.buffer, texture->format, lw, lh, ld, pitch / bpb * block, span.offset));
-        }
-      }
-      texture->version = binding.version;
+      const auto copy_start = std::chrono::steady_clock::now();
+      frame_cost_.decode_wait_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(copy_start - wait_start).count());
+      CopyTexture(*texture, *binding.upload, binding.version);
+      frame_cost_.texture_copy_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - copy_start).count());
     }
   }
   for (size_t i = 0; i < copies.size(); ++i) stats_.upload_bytes += copy_sizes[i];
@@ -1814,6 +1794,43 @@ void Backend::PrepareUploads(Packet& packet) {
   }
   list->barriers(plume::RenderBarrierStage::GRAPHICS_AND_COMPUTE,
                  plume::RenderBufferBarrier(shared_memory_.get(), plume::RenderBufferAccess::READ));
+}
+
+// Copies a decoded texture into the host texture and stamps it with that upload's version.
+void Backend::CopyTexture(HostResource& texture, const TextureUpload& upload, uint32_t version) {
+  ++frame_cost_.textures;
+  Transition(texture, plume::RenderTextureLayout::COPY_DEST);
+  FlushTransitions();
+  const ResourceDesc& desc = texture.desc;
+  const uint32_t block = HostBlockSize(desc.format);
+  const uint32_t bpb = HostBlockBytes(desc.format);
+  const uint32_t levels = texture.mips();
+  const uint32_t layers = texture.layers();
+  auto* list = lists_[slot_].get();
+  for (uint32_t layer = 0; layer < layers; ++layer) {
+    for (uint32_t level = 0; level < levels; ++level) {
+      const size_t i = size_t(layer) * levels + level;
+      if (i >= upload.levels.size()) break;
+      const auto& bytes = upload.levels[i];
+      const uint32_t src_pitch = upload.row_pitch[i];
+      const uint32_t lw = std::max(desc.width >> level, 1u);
+      const uint32_t lh = std::max(desc.height >> level, 1u);
+      const uint32_t ld = texture.volume() ? std::max(desc.depth >> level, 1u) : 1u;
+      // A 3D level holds its slices back to back; the footprint takes the rows of one slice.
+      const uint32_t rows = src_pitch ? uint32_t(bytes.size() / src_pitch) : 0;
+      const uint32_t pitch = (src_pitch + 255) & ~255u;
+      UploadSpan span = Upload(uint64_t(pitch) * rows, 512);
+      if (!span.data || !rows) continue;
+      for (uint32_t y = 0; y < rows; ++y) std::memcpy(span.data + size_t(y) * pitch, &bytes[size_t(y) * src_pitch], src_pitch);
+      stats_.upload_bytes += uint64_t(pitch) * rows;
+      ++stats_.uploads;
+      list->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(texture.texture.get(), level, layer),
+                              plume::RenderTextureCopyLocation::PlacedFootprint(
+                                  span.buffer, texture.format, lw, lh, ld, pitch / bpb * block, span.offset));
+      frame_cost_.texture_bytes += bytes.size();
+    }
+  }
+  texture.version = version;
 }
 
 plume::RenderShader* Backend::Shader(const ShaderEntry* entry, bool trimmed) {
@@ -2401,6 +2418,7 @@ void Backend::Execute(Packet& packet) {
       if (REXCVAR_GET(gpu_async_pipelines)) DrawPipeline(*draw, HostSamples(target), false);
     }
   }
+  frame_cost_.specialize_ns = ns(t0, Clock::now());
   if (frame_packet) MarkGpu(0);
   if (draws_ready_) PrepareUploads(packet);
   const auto t1 = Clock::now();
@@ -2423,10 +2441,14 @@ void Backend::Execute(Packet& packet) {
     if (swap) {
       const uint64_t host = ns(t0, Clock::now());
       if (host > kSlowFrameNs) {
-        REXGPU_DEBUG("[gpu] slow host frame {}: {:.1f} ms, prepare {:.1f} ms, {} new pipelines {:.1f} ms (longest "
+        REXGPU_DEBUG("[gpu] slow host frame {}: {:.1f} ms, prepare {:.1f} ms (specialise {:.1f}, decode wait {:.1f}, "
+                    "texture copy {:.1f} over {} textures {:.2f} MB, streams {:.1f}), {} new pipelines {:.1f} ms (longest "
                     "{:.1f} ms), {} new shaders {:.1f} ms",
-                    frame_counter_, host / 1e6, ns(t0, t1) / 1e6, frame_cost_.pipelines, frame_cost_.pipeline_ns / 1e6,
-                    frame_cost_.longest_pipeline_ns / 1e6, frame_cost_.shaders, frame_cost_.shader_ns / 1e6);
+                    frame_counter_, host / 1e6, ns(t0, t1) / 1e6, frame_cost_.specialize_ns / 1e6,
+                    frame_cost_.decode_wait_ns / 1e6, frame_cost_.texture_copy_ns / 1e6, frame_cost_.textures,
+                    frame_cost_.texture_bytes / 1048576.0, frame_cost_.stream_ns / 1e6, frame_cost_.pipelines,
+                    frame_cost_.pipeline_ns / 1e6, frame_cost_.longest_pipeline_ns / 1e6, frame_cost_.shaders,
+                    frame_cost_.shader_ns / 1e6);
       }
       ReportStats();
     }
