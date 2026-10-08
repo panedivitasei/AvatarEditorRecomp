@@ -35,7 +35,7 @@
 REXCVAR_DEFINE_INT32(gpu_trace_frame, -1, "GPU", "Log every captured record during this frame number, -1 = off");
 REXCVAR_DEFINE_INT32(gpu_trace_frames, 1, "GPU", "How many consecutive frames a trace covers from gpu_trace_frame");
 REXCVAR_DEFINE_INT32(gpu_fps_cap, 60, "GPU", "Pace D3DDevice_Swap to this many frames per second; 0 leaves the title unpaced");
-REXCVAR_DEFINE_BOOL(gpu_fps_title, false, "GPU", "Show the guest frame rate in the window title");
+REXCVAR_DEFINE_BOOL(gpu_fps_counter, false, "GPU", "Show the guest frame rate in the window title");
 REXCVAR_DEFINE_INT32(gpu_trace_at_second, 0, "GPU",
                      "Trace the first frame presented after this many seconds, for screens reached by hand; 0 = off");
 REXCVAR_DEFINE_INT32(gpu_dump_every, 0, "GPU",
@@ -394,7 +394,7 @@ REX_HOOK_RAW(sub_9211DA80) {
       deadline = now;
     }
   }
-  if (REXCVAR_GET(gpu_fps_title)) {
+  if (REXCVAR_GET(gpu_fps_counter)) {
     static Clock::time_point window_start = Clock::now();
     static uint32_t window_frames = 0;
     ++window_frames;
