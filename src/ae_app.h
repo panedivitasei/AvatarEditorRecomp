@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -21,9 +22,10 @@
 #include <rex/system/xmemory.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
-#include <video_native.h>
 
 #include "catalog_search.h"
+#include "fault_diag.h"
+#include "gpu/gpu.h"
 #include "input_hooks.h"
 
 #if REX_PLATFORM_WIN32
@@ -97,14 +99,42 @@ class AvatareditorApp : public rex::ReXApp {
       paths.game_data_root = p.lexically_normal();
     }
     // Profiles, saves, and the avatar manifest are shared with the other
-    // recomps through one userdata folder.
+    // JMstudios titles through %USERPROFILE%\JMstudios.
     if (REXCVAR_GET(user_data_root).empty()) {
+      const char* profile = std::getenv("USERPROFILE");
       paths.user_data_root =
-          rex::filesystem::GetUserFolder() / "ReXGlue" / "userdata";
+          (profile ? std::filesystem::path(profile) : rex::filesystem::GetUserFolder()) / "JMstudios";
+      MigrateUserData(paths.user_data_root);
     }
   }
 
+  // One-time move from the old Documents\ReXGlue\userdata layout, renamed in place when the volume allows it
+  // (the avatar pack alone is gigabytes) and copied otherwise, with the avatar folder landing at avatar\manifest.
+  static void MigrateUserData(const std::filesystem::path& root) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path old_root = rex::filesystem::GetUserFolder() / "ReXGlue" / "userdata";
+    if (fs::exists(root, ec) || !fs::is_directory(old_root, ec)) return;
+    fs::create_directories(root.parent_path(), ec);
+    fs::rename(old_root, root, ec);
+    if (ec) {
+      fs::copy(old_root, root, fs::copy_options::recursive, ec);
+      if (ec) {
+        REXLOG_WARN("[userdata] copy of {} to {} failed: {}", old_root.string(), root.string(), ec.message());
+        return;
+      }
+    }
+    if (fs::is_directory(root / "avatars", ec)) {
+      fs::create_directories(root / "avatar", ec);
+      fs::rename(root / "avatars", root / "avatar" / "manifest", ec);
+    }
+    REXLOG_INFO("[userdata] migrated {} to {}", old_root.string(), root.string());
+  }
+
   void OnPreSetup(rex::RuntimeConfig& config) override {
+    // No emulated GPU: D3D runs recompiled against the title's edge layer and nothing reads the ring.
+    config.graphics = nullptr;
+    config.gpu_plugin.clear();
 #if REX_PLATFORM_WIN32
     // Title XAudio2 backend in place of the SDK's SDL default.
     config.audio_factory = REX_AUDIO_BACKEND(xaudio2::XAudio2AudioSystem);
@@ -118,25 +148,41 @@ class AvatareditorApp : public rex::ReXApp {
                                 rex::system::KernelState* kernel_state) {
       rex::kernel::xam::apps::InitializeTitleKernel(runtime, kernel_state);
       MountFontDevice(runtime);
+      ae::diag::InstallFaultReporter();
     };
   }
 
-  // Retitle the window the base created. With native video on, detach the
-  // GPU plugin's presenter from the window: the plugin stays loaded so the
-  // command processor consumes the ring and delivers fences and vblanks,
-  // but the native renderer's swapchain owns the window surface.
+  // Retitle the window the base created and hook up the key listeners.
   bool SetupPresentation() override {
     if (!rex::ReXApp::SetupPresentation()) {
       return false;
     }
     window()->SetTitle("Avatar Editor");
-    if (rex::videonative::Enabled()) {
-      window()->SetPresenter(nullptr);
-    }
     window()->AddInputListener(&key_feed_, 0);
     ae_search::Get().Attach(window());
+    // The device comes up here, before any guest thread exists, so the first Swap already has a swap chain.
+    ae::gpu::Initialize(window());
     return true;
   }
+
+  void OnWindowPixelSizeChanged(uint32_t, uint32_t) override { ae::gpu::RequestResize(); }
+
+  // SDL quit callbacks hold the event-watch lock, so the renderer teardown and the final close wait for the UI loop.
+  bool OnWindowCloseRequested() override {
+    if (!close_queued_) {
+      close_queued_ = true;
+      if (!app_context().CallInUIThreadDeferred([this] {
+            ae::gpu::Shutdown();
+            window()->RequestClose();
+          })) {
+        close_queued_ = false;
+        REXLOG_ERROR("Could not queue window close");
+      }
+    }
+    return false;
+  }
+
+  void OnShutdown() override { ae::gpu::Shutdown(); }
 
   // Separate input listener feeding the keystroke synthesizer
   // (input_hooks.cpp); the base app's own listener keeps the overlay binds.
@@ -211,6 +257,8 @@ class AvatareditorApp : public rex::ReXApp {
   }
 
  private:
+  bool close_queued_ = false;
+
   // Commit the table the generated code reads and copy the shadow table
   // into it, so everything registered before launch stays on the fast path.
   void MirrorDispatchTable() {
