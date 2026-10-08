@@ -53,11 +53,9 @@ REXCVAR_DEFINE_STRING(user_gamerpic, "", "Kernel",
                       "(64x64 recommended). Relative paths resolve against the exe folder. "
                       "Empty keeps the title's default tile.");
 
-// The editor's store section is gated on a single live hive flag. Opening it
-// makes the storelist scenes reachable again; everything behind them comes
-// from the one server below.
-REXCVAR_DEFINE_BOOL(avatar_marketplace, true, "Kernel",
-                    "Enable the Avatar Editor's marketplace section.");
+// The one online switch: the store section opens against the JM Studios marketplace server below.
+REXCVAR_DEFINE_BOOL(jmstudios_online, false, "Kernel",
+                    "Connect the Avatar Editor's marketplace to JM Studios online.");
 
 // The store's server. Every hive value the store reads is derived from
 // this: the catalog host and port, the Epix root the storefront manifest
@@ -1194,7 +1192,7 @@ u32 XamGetLiveHiveValueA_entry(mapped_string name, mapped_string buffer, u32 buf
   std::string value;
   if (key == "AvatarPhotoBoothEnabled") {
     value = "1";
-  } else if (REXCVAR_GET(avatar_marketplace)) {
+  } else if (REXCVAR_GET(jmstudios_online)) {
     const MarketplaceServer server = GetMarketplaceServer();
     if (key == "AvatarMarketplaceEnabled") {
       value = "1";
@@ -1254,7 +1252,7 @@ u32 XamGetLiveHiveValueW_entry(mapped_wstring name, mapped_wstring buffer, u32 b
   }
 
   std::string value;
-  if (REXCVAR_GET(avatar_marketplace)) {
+  if (REXCVAR_GET(jmstudios_online)) {
     if (key == "EpixUriRoot" || key == "EpixPreviewUriRoot") {
       value = GetMarketplaceServer().base + "/epix/";
     } else if (key == "EpixManifestUriPath") {

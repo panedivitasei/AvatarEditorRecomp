@@ -62,7 +62,7 @@
 // game_data_root is defined in the runtime (runtime.cpp, global namespace);
 // read here to locate the title's AI avatar looks under data/art/_avatar/.
 REXCVAR_DECLARE(std::string, game_data_root);
-REXCVAR_DECLARE(bool, avatar_marketplace);
+REXCVAR_DECLARE(bool, jmstudios_online);
 
 // Enable Avatar Initialization. Some games require a full avatar implementation
 // and may crash; enabled by default in this build so avatar-using titles boot.
@@ -1271,7 +1271,7 @@ static std::string RemoteItemPath(const avatars::AssetId& id) {
 }
 
 static bool FetchRemoteIcon(const avatars::AssetId& id, std::vector<uint8_t>& png) {
-  if (avatars::IsStockPackId(id) || !REXCVAR_GET(avatar_marketplace)) {
+  if (avatars::IsStockPackId(id) || !REXCVAR_GET(jmstudios_online)) {
     return false;
   }
   const std::string guid = id.to_string();
@@ -1333,7 +1333,7 @@ static std::string PercentDecode(const std::string& text) {
 }
 
 static bool FetchRemoteItem(const avatars::AssetId& id, RemoteItem& item) {
-  if (avatars::IsStockPackId(id) || !REXCVAR_GET(avatar_marketplace)) {
+  if (avatars::IsStockPackId(id) || !REXCVAR_GET(jmstudios_online)) {
     return false;
   }
   const std::string guid = id.to_string();
@@ -1408,7 +1408,7 @@ static void RunPrefetch(std::vector<avatars::AssetId> ids, size_t max_workers, b
 }
 
 void MarketplacePrefetchIcons(const std::vector<std::string>& guids, bool wait) {
-  if (!REXCVAR_GET(avatar_marketplace)) {
+  if (!REXCVAR_GET(jmstudios_online)) {
     return;
   }
   auto ids = PrefetchCandidates(guids, true);
@@ -1423,7 +1423,7 @@ void MarketplacePrefetchIcons(const std::vector<std::string>& guids, bool wait) 
 }
 
 void MarketplacePrefetchItems(const std::vector<std::string>& guids) {
-  if (!REXCVAR_GET(avatar_marketplace)) {
+  if (!REXCVAR_GET(jmstudios_online)) {
     return;
   }
   auto ids = PrefetchCandidates(guids, false);
