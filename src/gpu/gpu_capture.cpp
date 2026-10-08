@@ -414,7 +414,7 @@ REX_HOOK_RAW(sub_9211DA80) {
   record.frame = frame;
   if (Tracing()) REXGPU_INFO("[gpu] swap front host {}", record.front.id);
   if (frame == 1 || frame % 600 == 0) {
-    REXGPU_INFO("[gpu] swap {} front {:#010x} host {} {}x{}", frame, ctx.r4.u32, record.front.id, record.front.width,
+    REXGPU_DEBUG("[gpu] swap {} front {:#010x} host {} {}x{}", frame, ctx.r4.u32, record.front.id, record.front.width,
                 record.front.height);
   }
   ae::gpu::WaitForWarmup();

@@ -104,14 +104,14 @@ void AE_MktParserEvent(PPCRegister& r3) {
   const uint32_t lr = rex::runtime::ThreadState::Get()
                           ? uint32_t(rex::runtime::current_ppc_context()->lr)
                           : 0;
-  REXKRNL_INFO("[mkt-parse] state={} start={} end={} name='{}' value='{}' from lr={:#x}",
+  REXKRNL_DEBUG("[mkt-parse] state={} start={} end={} name='{}' value='{}' from lr={:#x}",
                MktGuestU32(ctx + 0x560), MktGuestU32(ctx + 0x548), MktGuestU32(ctx + 0x54C),
                MktGuestAnsi(ctx + 0x428, 32), MktGuestAnsi(ctx + 0x448, 96), lr);
 }
 
 void AE_MktSlotValidate(PPCRegister& r3) {
   const uint32_t ctx = r3.u32;
-  REXKRNL_INFO(
+  REXKRNL_DEBUG(
       "[mkt-slot] action='{}' desc='{}' img='{}' spare147C={:#x} flag187C={} slots={}/{}",
       MktGuestAnsi(ctx + 0xEFC), MktGuestWide(ctx + 0xF7C), MktGuestAnsi(ctx + 0x107C),
       MktGuestAnsi(ctx + 0x147C, 1).empty() ? 0 : 1, MktGuestU32(ctx + 0x187C),
@@ -120,7 +120,7 @@ void AE_MktSlotValidate(PPCRegister& r3) {
 
 void AE_MktChannelValidate(PPCRegister& r3) {
   const uint32_t ctx = r3.u32;
-  REXKRNL_INFO(
+  REXKRNL_DEBUG(
       "[mkt-channel] action='{}' desc='{}' bg='{}' spare6F4={} committed={} slots={}/{}",
       MktGuestAnsi(ctx + 0x574), MktGuestWide(ctx + 0x5F4), MktGuestAnsi(ctx + 0xAF4),
       MktGuestAnsi(ctx + 0x6F4, 1).empty() ? 0 : 1, MktGuestU32(ctx + 0xEF4),
@@ -136,14 +136,14 @@ REXCVAR_DEFINE_BOOL(ae_mkt_trace, false, "AE",
 void AE_MktNetPoll(PPCRegister& r3, PPCRegister& r4) {
   if (!REXCVAR_GET(ae_mkt_trace)) return;
   const uint32_t obj = r3.u32, pump = obj + 840;
-  REXKRNL_INFO("[mkt-net] poll obj={:#x} target={} abort={:#x} pump.state={} req={:#x} buf={:#x} "
+  REXKRNL_DEBUG("[mkt-net] poll obj={:#x} target={} abort={:#x} pump.state={} req={:#x} buf={:#x} "
                "len={} result={:#x}",
                obj, r4.u32, MktGuestU32(obj + 288), MktGuestU32(pump), MktGuestU32(pump + 8),
                MktGuestU32(pump + 16), MktGuestU32(pump + 28), MktGuestU32(pump + 32));
 }
 
 void AE_MktNetHeaders(PPCRegister& r3, PPCRegister& r4) {
-  REXKRNL_INFO("[mkt-net] headers-stage obj={:#x} hr={:#x}", r3.u32, r4.u32);
+  REXKRNL_DEBUG("[mkt-net] headers-stage obj={:#x} hr={:#x}", r3.u32, r4.u32);
 }
 
 void AE_MktNetTeardown(PPCRegister& r3) {
@@ -152,12 +152,12 @@ void AE_MktNetTeardown(PPCRegister& r3) {
   const uint32_t lr = rex::runtime::ThreadState::Get()
                           ? uint32_t(rex::runtime::current_ppc_context()->lr)
                           : 0;
-  REXKRNL_INFO("[mkt-net] TEARDOWN obj={:#x} abort={:#x} pump.state={} result={:#x} from lr={:#x}",
+  REXKRNL_DEBUG("[mkt-net] TEARDOWN obj={:#x} abort={:#x} pump.state={} result={:#x} from lr={:#x}",
                obj, MktGuestU32(obj + 288), MktGuestU32(pump), MktGuestU32(pump + 32), lr);
 }
 
 void AE_MktNetClose(PPCRegister& r3) {
-  REXKRNL_INFO("[mkt-net] close conn={:#x}", r3.u32);
+  REXKRNL_DEBUG("[mkt-net] close conn={:#x}", r3.u32);
 }
 
 // Store navigation. sub_920D2EF0 looks a scene/slot up by its action string;
@@ -172,16 +172,16 @@ void AE_MktSceneLookup(PPCRegister& r3, PPCRegister& r4, PPCRegister& r5) {
   if (!dumped.exchange(true)) {
     const auto* p = rex::system::kernel_memory()->TranslateVirtual<const uint8_t*>(0x94249EA8);
     if (p) {
-      REXKRNL_INFO("[mkt-gate] 94249EA8={} A9={} AA={} AB={} AC={}", p[0], p[1], p[2], p[3], p[4]);
+      REXKRNL_DEBUG("[mkt-gate] 94249EA8={} A9={} AA={} AB={} AC={}", p[0], p[1], p[2], p[3], p[4]);
     }
   }
-  REXKRNL_INFO("[mkt-nav] lookup registry={:#x} name='{}' flags={}", r3.u32,
+  REXKRNL_DEBUG("[mkt-nav] lookup registry={:#x} name='{}' flags={}", r3.u32,
                MktGuestAnsi(r4.u32, 128), r5.u32);
 }
 
 void AE_MktPreviewLoad(PPCRegister& r3) {
   const uint32_t obj = r3.u32;
-  REXKRNL_INFO("[mkt-nav] preview-load obj={:#x} ready={} name='{}' state={:#x}", obj,
+  REXKRNL_DEBUG("[mkt-nav] preview-load obj={:#x} ready={} name='{}' state={:#x}", obj,
                MktGuestAnsi(obj + 3008, 1).empty() ? 0 : 1, MktGuestAnsi(obj + 572, 128),
                MktGuestU32(obj + 3012));
 }
@@ -201,7 +201,7 @@ void MktResetFetchers(const char* prefix) {
     if (name.compare(0, std::strlen(prefix), prefix) != 0 || !MktPlausible(fetcher)) continue;
     if (MktGuestU32(fetcher + 12) == 1) continue;  // in flight, leave it
     MktGuestWriteU32(fetcher + 12, 0);
-    REXKRNL_INFO("[xuisearch] fetcher '{}' reset", name);
+    REXKRNL_DEBUG("[xuisearch] fetcher '{}' reset", name);
   }
 }
 
@@ -212,7 +212,7 @@ void AE_MktItemFetch(PPCRegister& r3, PPCRegister& r4) {
     std::lock_guard<std::mutex> lock(g_mkt_fetcher_mu);
     g_mkt_fetchers[MktGuestAnsi(r4.u32, 96)] = fetcher;
   }
-  REXKRNL_INFO("[mkt-fetch] fetcher={:#x} plausible={} vtable={:#x} vtable+8={:#x} state={} name='{}'",
+  REXKRNL_DEBUG("[mkt-fetch] fetcher={:#x} plausible={} vtable={:#x} vtable+8={:#x} state={} name='{}'",
                fetcher, MktPlausible(fetcher), vtable, MktGuestU32Safe(vtable + 8),
                MktPlausible(fetcher) ? MktGuestU32(fetcher + 12) : 0xBADF00Du,
                MktPlausible(r4.u32) ? MktGuestAnsi(r4.u32, 96) : "?");
@@ -223,7 +223,7 @@ void AE_MktItemFetch(PPCRegister& r3, PPCRegister& r4) {
 // and a page still without items after a second (17). The word lands in
 // unk_94249EC0 and the page shows "Can't retrieve Avatar Marketplace data".
 void AE_MktPageError(PPCRegister& r11, PPCRegister& r30) {
-  REXKRNL_INFO("[mkt-page] error {} raised for '{}'", r11.u32,
+  REXKRNL_DEBUG("[mkt-page] error {} raised for '{}'", r11.u32,
                MktPlausible(r30.u32) ? MktGuestAnsi(r30.u32, 96) : "?");
 }
 
@@ -245,7 +245,7 @@ void AE_MktCatFetch(PPCRegister& r3, PPCRegister& r4, PPCRegister& r5, PPCRegist
                            std::to_string(MktGuestU32Safe(f + 2600));
   if (line == last) return;
   last = line;
-  REXKRNL_INFO("[mkt-cat] fetch {:#x} name='{}'", f, line);
+  REXKRNL_DEBUG("[mkt-cat] fetch {:#x} name='{}'", f, line);
 }
 
 // sub_920D4C70(fetcher, request): the request's scene kind lives at +136 and
@@ -254,7 +254,7 @@ void AE_MktCatFetch(PPCRegister& r3, PPCRegister& r4, PPCRegister& r5, PPCRegist
 void AE_MktQueryIssue(PPCRegister& r3, PPCRegister& r4) {
   const uint32_t fetcher = r3.u32, request = r4.u32;
   const uint32_t handle = MktPlausible(fetcher) ? MktGuestU32(fetcher + 8) : 0xBADF00Du;
-  REXKRNL_INFO("[mkt-query] fetcher={:#x} request={:#x} kind={} handle={:#x} handle.vtable={:#x}",
+  REXKRNL_DEBUG("[mkt-query] fetcher={:#x} request={:#x} kind={} handle={:#x} handle.vtable={:#x}",
                fetcher, request, MktPlausible(request) ? MktGuestU32(request + 136) : 0xBADF00Du,
                handle, MktGuestU32Safe(handle));
 }
@@ -273,7 +273,7 @@ void AE_MktRatingArgFix(PPCRegister& r1) {
 // Kinds 13..23 map to real descriptors; 0..12 all fall through to 13, which is
 // the out-of-range error value.
 void AE_MktDispatchKind(PPCRegister& r4) {
-  REXKRNL_INFO("[mkt-query] dispatch kind={}{}", r4.u32, r4.u32 > 0x17 || r4.u32 < 13
+  REXKRNL_DEBUG("[mkt-query] dispatch kind={}{}", r4.u32, r4.u32 > 0x17 || r4.u32 < 13
                                                              ? " (INVALID -> 13)" : "");
 }
 
@@ -282,7 +282,7 @@ void AE_MktDispatchKind(PPCRegister& r4) {
 void AE_MktTitleQuery(PPCRegister& r3, PPCRegister& r4) {
   const uint32_t client = r3.u32, request = r4.u32;
   const uint32_t name_ptr = MktPlausible(request) ? MktGuestU32(request + 16) : 0;
-  REXKRNL_INFO("[mkt-title] client={:#x} request={:#x} name={:#x} '{}'", client, request, name_ptr,
+  REXKRNL_DEBUG("[mkt-title] client={:#x} request={:#x} name={:#x} '{}'", client, request, name_ptr,
                MktPlausible(name_ptr) ? MktGuestAnsi(name_ptr, 96) : "?");
 }
 
@@ -293,7 +293,7 @@ void AE_MktMarshal(PPCRegister& r3, PPCRegister& r5) {
   const uint32_t handle = r3.u32;
   const bool ok = MktPlausible(handle);
   const uint32_t iface = ok ? MktGuestU32(handle + 4) : 0xBADF00Du;
-  REXKRNL_INFO("[mkt-marshal] handle={:#x} vptr={:#x} iface={:#x}{} refs={:#x} xuid={:#x}:{:08x} "
+  REXKRNL_DEBUG("[mkt-marshal] handle={:#x} vptr={:#x} iface={:#x}{} refs={:#x} xuid={:#x}:{:08x} "
                "inner={:#x} id={}",
                handle, ok ? MktGuestU32(handle) : 0xBADF00Du, iface, MktFloatTag(iface),
                ok ? MktGuestU32(handle + 12) : 0xBADF00Du,
@@ -311,7 +311,7 @@ void AE_MktWearStart(PPCRegister& r3) {
   if (logged.fetch_add(1) >= 40) {
     return;
   }
-  REXKRNL_INFO("[mkt-wear] start obj={:#x} err={}", r3.u32, MktGuestU32Safe(0x94249EC0));
+  REXKRNL_DEBUG("[mkt-wear] start obj={:#x} err={}", r3.u32, MktGuestU32Safe(0x94249EC0));
 }
 
 void AE_MktWearStep(PPCRegister& r3) {
@@ -319,7 +319,7 @@ void AE_MktWearStep(PPCRegister& r3) {
   if (logged.fetch_add(1) >= 40) {
     return;
   }
-  REXKRNL_INFO("[mkt-wear] step obj={:#x} err={}", r3.u32, MktGuestU32Safe(0x94249EC0));
+  REXKRNL_DEBUG("[mkt-wear] step obj={:#x} err={}", r3.u32, MktGuestU32Safe(0x94249EC0));
 }
 
 // The purchase-history manager lives at unk_945065F0; the class is shared
@@ -381,7 +381,7 @@ void AE_MktHoverTryOn(PPCRegister& r3) {
     return;
   }
   MktGuestWriteU32(0x9452E398u, 1u);
-  REXKRNL_INFO("[mkt-wear] hover try-on enabled (generation seeded) tile={:#x}", r3.u32);
+  REXKRNL_DEBUG("[mkt-wear] hover try-on enabled (generation seeded) tile={:#x}", r3.u32);
 }
 
 bool AE_MktNoParentalGate(PPCRegister& r3) {
@@ -391,7 +391,7 @@ bool AE_MktNoParentalGate(PPCRegister& r3) {
 
 void AE_MktPreviewApply(PPCRegister& r3, PPCRegister& r4) {
   const uint32_t obj = r3.u32, record = r4.u32;
-  REXKRNL_INFO("[mkt-nav] preview-apply obj={:#x} record={:#x} rec.name='{}' rec+384='{}'", obj,
+  REXKRNL_DEBUG("[mkt-nav] preview-apply obj={:#x} record={:#x} rec.name='{}' rec+384='{}'", obj,
                record, MktGuestAnsi(record, 96), MktGuestAnsi(record + 384, 128));
 }
 

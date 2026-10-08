@@ -570,7 +570,7 @@ void CensusTexture(const xenos::xe_gpu_texture_fetch_t& f, uint8_t binding_dimen
                        (uint64_t(f.mip_max_level != 0) << 14) | (uint64_t(f.tiled) << 13) |
                        (uint64_t(binding_dimension) << 8) | (resolved ? 1 : 0);
   if (!FirstTime(key)) return;
-  REXGPU_INFO("[gpu] texture census: format {} dimension {} stacked {} signs {}{}{}{} mips {}-{} packed {} tiled {} "
+  REXGPU_DEBUG("[gpu] texture census: format {} dimension {} stacked {} signs {}{}{}{} mips {}-{} packed {} tiled {} "
               "endian {} binding {} source {}",
               uint32_t(f.format), uint32_t(f.dimension), uint32_t(f.stacked), signs & 3, (signs >> 2) & 3,
               (signs >> 4) & 3, (signs >> 6) & 3, uint32_t(f.mip_min_level), uint32_t(f.mip_max_level),
@@ -1252,7 +1252,7 @@ void PrepareDraw(DrawWork& work) {
                                     uint32_t(b.mag) | uint32_t(b.min) << 8 | uint32_t(b.mip) << 16 |
                                         uint32_t(b.aniso) << 24};
         if (FirstTime(XXH3_64bits(census, sizeof(census)) ^ 0x73616D706C657200ull)) {
-          REXGPU_INFO("[gpu] sampler census: clamp {}/{}/{} filter mag {} min {} mip {} aniso {} border {} mips {}-{} "
+          REXGPU_DEBUG("[gpu] sampler census: clamp {}/{}/{} filter mag {} min {} mip {} aniso {} border {} mips {}-{} "
                       "overrides {}/{}/{}/{}",
                       uint32_t(f.clamp_x), uint32_t(f.clamp_y), uint32_t(f.clamp_z), uint32_t(f.mag_filter),
                       uint32_t(f.min_filter), uint32_t(f.mip_filter), uint32_t(f.aniso_filter),
@@ -1688,12 +1688,12 @@ void FinishPreparation(Packet& packet) {
       snapshots.requests += count.requests;
       snapshots.reused += count.reused;
     }
-    REXGPU_INFO("[gpu] constants/300 frames: {} of {} snapshots reused, {:.3f} MB/frame copied",
+    REXGPU_DEBUG("[gpu] constants/300 frames: {} of {} snapshots reused, {:.3f} MB/frame copied",
                 snapshots.reused, snapshots.requests,
                 (snapshots.requests - snapshots.reused) * sizeof(FloatConstantBlock) / 300e6);
     if (g_prepare_queue) {
       const auto stats = g_prepare_queue->TakeStats();
-      REXGPU_INFO("[gpu] preparation/300 frames: jobs {} queued, {} inline, work {:.3f} ms/frame, "
+      REXGPU_DEBUG("[gpu] preparation/300 frames: jobs {} queued, {} inline, work {:.3f} ms/frame, "
                   "guest finish {:.3f} ms/frame", stats.queued, stats.inline_jobs,
                   stats.work_ns / 300e6, finish_total / 300e6);
     }

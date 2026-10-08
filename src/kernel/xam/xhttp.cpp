@@ -446,7 +446,7 @@ u32 NetDll_XHttpConnect_entry(u32 caller, u32 session_handle, mapped_string host
   XHttpConnection connection;
   connection.host = host ? static_cast<const char*>(host) : "";
   connection.port = port ? static_cast<uint16_t>(port) : uint16_t(80);
-  REXKRNL_INFO("XHttpConnect(session={:#x}, host='{}', port={}) -> connect={:#x}", session_handle,
+  REXKRNL_DEBUG("XHttpConnect(session={:#x}, host='{}', port={}) -> connect={:#x}", session_handle,
                connection.host, connection.port, handle);
   {
     std::lock_guard<std::mutex> lock(g_xhttp_mu);
@@ -501,7 +501,7 @@ u32 NetDll_XHttpOpenRequestUsingMemory_entry(u32 caller, u32 connect_handle, map
 // XHttpSetStatusCallback(caller, handle, callback, flags, reserved) -> prev callback.
 u32 NetDll_XHttpSetStatusCallback_entry(u32 caller, u32 handle, u32 callback_ptr, u32 flags,
                                         u32 reserved) {
-  REXKRNL_INFO("XHttpSetStatusCallback(handle={:#x}, callback={:#x}, flags={:#x})", handle,
+  REXKRNL_DEBUG("XHttpSetStatusCallback(handle={:#x}, callback={:#x}, flags={:#x})", handle,
                callback_ptr, flags);
   std::lock_guard<std::mutex> lock(g_xhttp_mu);
   auto it = g_requests.find(handle);
@@ -618,7 +618,7 @@ u32 NetDll_XHttpSendRequest_entry(u32 caller, u32 request_handle, mapped_string 
 // Async: headers become available, and the title's callback then issues its
 // read (it does not poll QueryDataAvailable).
 u32 NetDll_XHttpReceiveResponse_entry(u32 caller, u32 request_handle, u32 reserved) {
-  REXKRNL_INFO("XHttpReceiveResponse(request={:#x})", request_handle);
+  REXKRNL_DEBUG("XHttpReceiveResponse(request={:#x})", request_handle);
   std::lock_guard<std::mutex> lock(g_xhttp_mu);
   auto it = g_requests.find(request_handle);
   if (it == g_requests.end()) {
@@ -637,7 +637,7 @@ u32 NetDll_XHttpReceiveResponse_entry(u32 caller, u32 request_handle, u32 reserv
 // = buffer, dwStatusInformationLength = bytes read; 0 bytes => end of data).
 u32 NetDll_XHttpReadData_entry(u32 caller, u32 request_handle, u32 buffer_guest,
                                u32 bytes_to_read, u32 bytes_read_ptr) {
-  REXKRNL_INFO("XHttpReadData(request={:#x}, buffer={:#x}, to_read={})", request_handle,
+  REXKRNL_DEBUG("XHttpReadData(request={:#x}, buffer={:#x}, to_read={})", request_handle,
                buffer_guest, bytes_to_read);
   std::lock_guard<std::mutex> lock(g_xhttp_mu);
   auto it = g_requests.find(request_handle);
@@ -660,7 +660,7 @@ u32 NetDll_XHttpReadData_entry(u32 caller, u32 request_handle, u32 buffer_guest,
   }
   // Async: report the read result. A subsequent read returning 0 bytes signals
   // EOF (READ_COMPLETE with length 0). No DATA_AVAILABLE, see ReceiveResponse.
-  REXKRNL_INFO("XHttpReadData(request={:#x}) -> {} bytes, offset {}/{}", request_handle, n,
+  REXKRNL_DEBUG("XHttpReadData(request={:#x}) -> {} bytes, offset {}/{}", request_handle, n,
                r.read_offset, r.body.size());
   g_notifications.push_back({request_handle, kCbReadComplete, buffer_guest, n, 0});
   return 1;
@@ -670,7 +670,7 @@ u32 NetDll_XHttpReadData_entry(u32 caller, u32 request_handle, u32 buffer_guest,
 u32 NetDll_XHttpQueryHeaders_entry(u32 caller, u32 request_handle, u32 info_level,
                                    mapped_string name, mapped_void buffer,
                                    mapped_u32 buffer_len_ptr, mapped_u32 index_ptr) {
-  REXKRNL_INFO("XHttpQueryHeaders(request={:#x}, info_level={:#x}, name='{}')", request_handle,
+  REXKRNL_DEBUG("XHttpQueryHeaders(request={:#x}, info_level={:#x}, name='{}')", request_handle,
                info_level, name ? static_cast<const char*>(name) : "");
   std::lock_guard<std::mutex> lock(g_xhttp_mu);
   auto it = g_requests.find(request_handle);
@@ -733,7 +733,7 @@ u32 NetDll_XHttpQueryHeaders_entry(u32 caller, u32 request_handle, u32 info_leve
     const uint64_t value = is_status ? uint64_t(req.status) : uint64_t(req.body.size());
     const uint32_t buf_len = buffer_len_ptr ? uint32_t(*buffer_len_ptr) : 0;
     const uint32_t width = buf_len >= sizeof(uint64_t) ? 8u : buf_len >= sizeof(uint32_t) ? 4u : 0u;
-    REXKRNL_INFO("  QueryHeaders num: level={:#x} is_status={} value={} buf_len={} -> {}", level,
+    REXKRNL_DEBUG("  QueryHeaders num: level={:#x} is_status={} value={} buf_len={} -> {}", level,
                  is_status, value, buf_len, width ? "OK" : "FAIL");
     if (!buffer || !buffer_len_ptr || !width) {
       if (buffer_len_ptr) {
@@ -809,7 +809,7 @@ u32 NetDll_XHttpDoWork_entry(u32 caller, u32 handle, u32 reserved) {
       REXKRNL_WARN("XHttpDoWork: unresolved status callback {:#x}", callback);
       continue;
     }
-    REXKRNL_INFO("XHttp callback(request={:#x}, status={:#x}, info={:#x}, len={})",
+    REXKRNL_DEBUG("XHttp callback(request={:#x}, status={:#x}, info={:#x}, len={})",
                  n.request_handle, n.status, n.info_ptr, n.info_len);
     // WINHTTP_STATUS_CALLBACK(hInternet, dwContext, dwInternetStatus,
     //                         lpvStatusInformation, dwStatusInformationLength)
@@ -824,7 +824,7 @@ u32 NetDll_XHttpDoWork_entry(u32 caller, u32 handle, u32 reserved) {
 
 // XHttpCloseHandle(caller, handle) -> BOOL.
 u32 NetDll_XHttpCloseHandle_entry(u32 caller, u32 handle) {
-  REXKRNL_INFO("XHttpCloseHandle(handle={:#x})", handle);
+  REXKRNL_DEBUG("XHttpCloseHandle(handle={:#x})", handle);
   std::lock_guard<std::mutex> lock(g_xhttp_mu);
   g_requests.erase(handle);
   g_connections.erase(handle);
@@ -844,10 +844,10 @@ u32 NetDll_XHttpQueryOption_entry(u32 caller, u32 handle, u32 option, mapped_voi
   if ((option == 22 || option == 23) && buffer && buffer_len_ptr && buf_len >= sizeof(uint32_t)) {
     *reinterpret_cast<rex::be<uint32_t>*>(static_cast<uint8_t*>(buffer)) = 1u;
     *buffer_len_ptr = sizeof(uint32_t);
-    REXKRNL_INFO("XHttpQueryOption(handle={:#x}, option={}) -> 1", handle, option);
+    REXKRNL_DEBUG("XHttpQueryOption(handle={:#x}, option={}) -> 1", handle, option);
     return 1;
   }
-  REXKRNL_INFO("XHttpQueryOption(handle={:#x}, option={}, buf_len={}) unsupported", handle, option,
+  REXKRNL_DEBUG("XHttpQueryOption(handle={:#x}, option={}, buf_len={}) unsupported", handle, option,
                buf_len);
   return 0;
 }
@@ -1069,13 +1069,13 @@ u32 NetDll_XHttpCrackUrl_entry(u32 caller, u32 url_guest, u32 url_length, u32 fl
 u32 NetDll_XHttpCrackUrlW_entry(u32 caller, u32 url_guest, u32 url_length, u32 flags,
                                 u32 components_guest) {
   auto* mem = REX_KERNEL_MEMORY();
-  REXKRNL_INFO("XHttpCrackUrlW(url={:#x}, len={}, flags={:#x}, comp={:#x})", url_guest, url_length,
+  REXKRNL_DEBUG("XHttpCrackUrlW(url={:#x}, len={}, flags={:#x}, comp={:#x})", url_guest, url_length,
                flags, components_guest);
   if (!url_guest || !components_guest) {
     return 0;
   }
   auto* comp = mem->TranslateVirtual<rex::kernel::XHTTP_URL_COMPONENTS*>(components_guest);
-  REXKRNL_INFO("  struct_size={} host(ptr={:#x} len={}) path(ptr={:#x} len={}) extra(ptr={:#x} len={})",
+  REXKRNL_DEBUG("  struct_size={} host(ptr={:#x} len={}) path(ptr={:#x} len={}) extra(ptr={:#x} len={})",
                uint32_t(comp->struct_size), uint32_t(comp->host_name_ptr),
                uint32_t(comp->host_name_length), uint32_t(comp->url_path_ptr),
                uint32_t(comp->url_path_length), uint32_t(comp->extra_info_ptr),
@@ -1094,7 +1094,7 @@ u32 NetDll_XHttpCrackUrlW_entry(u32 caller, u32 url_guest, u32 url_length, u32 f
     }
     url.push_back(static_cast<char16_t>(c));
   }
-  REXKRNL_INFO("XHttpCrackUrlW('{}')", rex::string::to_utf8(url));
+  REXKRNL_DEBUG("XHttpCrackUrlW('{}')", rex::string::to_utf8(url));
 
   size_t scheme_off = 0, scheme_len = 0, host_off = 0, host_len = 0;
   size_t path_off = 0, path_len = 0, query_off = 0, query_len = 0;
@@ -1195,7 +1195,7 @@ u32 NetDll_XHttpCrackUrlW_entry(u32 caller, u32 url_guest, u32 url_length, u32 f
   if (path_len) ok &= emit(comp->url_path_ptr, comp->url_path_length, path_off, path_len);
   if (query_len) ok &= emit(comp->extra_info_ptr, comp->extra_info_length, query_off, query_len);
 
-  REXKRNL_INFO("XHttpCrackUrlW -> {} (host_len={}, path_len={}, port={})", ok, host_len, path_len,
+  REXKRNL_DEBUG("XHttpCrackUrlW -> {} (host_len={}, path_len={}, port={})", ok, host_len, path_len,
                port);
   return ok ? 1 : 0;
 }
