@@ -3,10 +3,24 @@ game_data_root = "../../../assets"
 content_root = "outfits" #Relative to game_data_root
 avatar_closet_dir = "closet" #Relative to game_data_root
 
+user_name = "User" #15 chars max
+
 fullscreen = false
 mnk_mode = true      # keyboard controls
 mnk_mouse = false
 
 avatar_eye_whites = false
-log_single_file = true
 model_shadows = true
+
+log_file = "avatareditor.log"
+log_max_files = 1
+log_max_file_size_mb = 20
+
+gpu_fps_cap = 60
+gpu_fps_counter = true
+gpu_resolution_scale = 100 #1-200
+gpu_vsync = false
+gpu_adapter = ""
+
+online_mode = false
+avatar_marketplace_server = ""
