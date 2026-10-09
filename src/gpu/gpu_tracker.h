@@ -22,7 +22,7 @@ ResourceDesc Texture(uint32_t texture_address);
 ResourceDesc FindResolved(uint32_t base_address, uint32_t width, uint32_t height, uint32_t guest_format);
 
 // A CPU write or new resource owner invalidates host-only resolve contents overlapping this physical range.
-void InvalidateResolved(uint32_t base, uint32_t size);
+void InvalidateResolved(uint32_t base, uint32_t size, const char* why = "");
 // The host destroyed this resolve destination; its alias goes so the next resolve makes a new one.
 void ForgetResolved(uint32_t id);
 // Resolve destination ids that lost their alias since the last call, for the host to destroy.
@@ -30,6 +30,9 @@ void TakeRetiredResolves(std::vector<uint32_t>& ids);
 
 // Bumps whenever a resolve or swap texture is created or retired, so cached FindResolved answers know when to ask again.
 uint32_t ResolveEpoch();
+
+// The resolve alias a texture header's memory holds, if any; nothing is created.
+ResourceDesc ResolvedForHeader(uint32_t texture_address);
 
 // A fresh host resource id, shared with the surface and texture ids above.
 uint32_t NewId();

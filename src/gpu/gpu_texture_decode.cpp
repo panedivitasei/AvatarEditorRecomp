@@ -143,6 +143,8 @@ void ReportOnce(const char* what, uint32_t value) {
   REXGPU_ERROR("[gpu] texture {} {} is not decoded yet; it samples as magenta", what, value);
 }
 
+}  // namespace
+
 void SwapBlock(xenos::Endian endian, uint8_t* out, const uint8_t* in, uint32_t size) {
   switch (endian) {
     case xenos::Endian::k8in16:
@@ -163,6 +165,8 @@ void SwapBlock(xenos::Endian endian, uint8_t* out, const uint8_t* in, uint32_t s
       break;
   }
 }
+
+namespace {
 
 uint8_t Expand(uint32_t v, uint32_t bits) { return uint8_t((v * 255 + ((1u << bits) - 1) / 2) / ((1u << bits) - 1)); }
 

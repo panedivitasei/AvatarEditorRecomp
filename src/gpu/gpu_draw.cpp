@@ -750,11 +750,12 @@ TextureBinding FinishBinding(TextureBinding out, uint64_t key, TextureCacheEntry
   return out;
 }
 
-// Vertex ranges the host holds: registered ones persist across frames by content hash, since the title writes
-// into its avatar blocks without a lock the tracker could see; unregistered ones are uploaded once per frame.
+// Vertex ranges the host holds, kept honest by a content hash because the title writes its avatar blocks without
+// a lock and, with fences completing at once, rewrites a dynamic ring between the draws of one frame.
 struct SentRange {
   uint32_t version = 0;
   uint64_t frame = UINT64_MAX;
+  uint64_t hash = 0;
   memory::QueryCache range_cache;
 };
 std::unordered_map<uint64_t, SentRange> g_sent_streams;
@@ -798,6 +799,7 @@ StreamData CaptureStream(uint32_t fetch_index, uint32_t guest_base, uint32_t siz
   s.size = size;
   const uint64_t frame = FrameIndex();
   s.key = (uint64_t(guest_base) << 32) | size;
+  const uint64_t packet = PacketEpoch();
   ForgetEvicted();
   SentRange& sent = StreamRange(fetch_index, s.key);
   const auto state = [&] {
@@ -809,26 +811,20 @@ StreamData CaptureStream(uint32_t fetch_index, uint32_t guest_base, uint32_t siz
   const bool paranoid = memory::Paranoid();
   const uint8_t* bytes = paranoid ? REX_KERNEL_MEMORY()->TranslatePhysical<const uint8_t*>(guest_base) : nullptr;
   bool send;
+  if (!bytes) bytes = REX_KERNEL_MEMORY()->TranslatePhysical<const uint8_t*>(guest_base);
+  const uint64_t hash = XXH3_64bits(bytes, size);
   if (state.registered) {
-    if (sent.frame == frame) {
-      s.version = sent.version;
-      send = false;
-    } else {
-      // The version is the hash itself, so the host's resident copy matches the bytes or is replaced.
-      if (!bytes) bytes = REX_KERNEL_MEMORY()->TranslatePhysical<const uint8_t*>(guest_base);
-      const uint64_t hash = XXH3_64bits(bytes, size);
-      s.version = uint32_t(hash ^ (hash >> 32)) | 1u;
-      send = sent.frame == UINT64_MAX || sent.version != s.version;
-      sent.frame = frame;
-    }
+    // The version is the hash itself, so the host's resident copy matches the bytes or is replaced.
+    s.version = uint32_t(hash ^ (hash >> 32)) | 1u;
+    send = sent.frame == UINT64_MAX || sent.version != s.version;
   } else {
     BurstTiming unowned_timing(13);
     memory::NoteUnregistered(guest_base, size, "vertex range");
-    s.version = uint32_t(frame);
-    send = sent.frame != frame;
+    s.version = uint32_t(packet);
+    send = sent.frame != packet || sent.hash != hash;
   }
+  sent.hash = hash;
   if (send) {
-    if (!bytes) bytes = REX_KERNEL_MEMORY()->TranslatePhysical<const uint8_t*>(guest_base);
     {
       BurstTiming copy_timing(11);
       if (REXCVAR_GET(gpu_stream_snapshot_pool) && REXCVAR_GET(gpu_parallel_prepare)) {
@@ -841,7 +837,7 @@ StreamData CaptureStream(uint32_t fetch_index, uint32_t guest_base, uint32_t siz
     if (BurstTimingEnabled()) AddGuestTiming(14, size);
     g_captured_bytes += size;
     sent.version = s.version;
-    sent.frame = frame;
+    sent.frame = packet;
     if (paranoid) memory::NoteUploaded(s.key, guest_base, size, bytes);
   }
   return s;
@@ -986,14 +982,15 @@ void ForgetIndex(uint64_t key) {
 // a restart split changed the topology) only when this version has not been converted yet.
 template <typename GetState, typename MakeConvert>
 void PlaceIndices(DrawRecord& r, uint64_t key, GetState get_state, MakeConvert make_convert,
-                  xenos::PrimitiveType type, size_t input_bytes) {
+                  xenos::PrimitiveType type, size_t input_bytes, uint64_t hash) {
   BurstTiming timing(2);
-  const uint64_t frame = FrameIndex();
+  const uint64_t frame = PacketEpoch();
   ForgetEvicted();
   if (g_index_runs.size() > 8192) g_index_runs.clear();
   IndexRun& run = g_index_runs[key];
   const auto state = get_state(run.sent.range_cache);
-  const uint32_t version = state.registered ? state.generation : uint32_t(frame);
+  // The version follows the bytes, so a rewrite of the same range within a frame converts and sends again.
+  const uint32_t version = uint32_t(hash ^ (hash >> 32)) | 1u;
   if ((!run.prepared.valid() && !run.ready) || run.version != version) {
     run.ready.reset();
     run.prepared = {};
@@ -1026,7 +1023,7 @@ void PlaceIndices(DrawRecord& r, uint64_t key, GetState get_state, MakeConvert m
   r.index.version = version;
   r.index.persistent = state.registered;
   SentRange& sent = run.sent;
-  const bool send = state.registered ? (sent.frame == UINT64_MAX || sent.version != version) : sent.frame != frame;
+  const bool send = sent.frame == UINT64_MAX || sent.version != version || (!state.registered && sent.frame != frame);
   if (send) {
     r.send_prepared_indices = true;
     sent.version = version;
@@ -1529,18 +1526,19 @@ bool Build(PPCContext& ctx, uint8_t* base, const DrawArgs& a, DrawRecord& r, con
     const uint32_t reset = RestartIndex(*device, a.type);
     const uint64_t parts[4] = {address, uint64_t(a.count) | uint64_t(reset) << 32,
                                uint64_t(index32) | uint64_t(endian) << 8 | uint64_t(a.type) << 16, 0x494E4458};
+    const uint32_t index_bytes = a.count * (index32 ? 4 : 2);
     PlaceIndices(r, XXH3_64bits(parts, sizeof(parts)) | 1, [&](memory::QueryCache& cached) {
-      return memory::Query(address, a.count * (index32 ? 4 : 2), cached);
+      return memory::Query(address, index_bytes, cached);
     }, [&] {
       const auto* src = Guest<uint8_t>(address);
-      std::vector<uint8_t> snapshot(src, src + size_t(a.count) * (index32 ? 4 : 2));
+      std::vector<uint8_t> snapshot(src, src + index_bytes);
       return [snapshot = std::move(snapshot), count = a.count, type = a.type, index32, endian, reset] {
         auto indices = ReadIndices(snapshot.data(), count, index32, endian);
         if (NeedsExpansion(type)) indices = Expand(type, indices);
         const bool split = reset != UINT32_MAX && SplitAtRestart(type, reset, indices);
         return std::make_pair(std::move(indices), split);
       };
-    }, a.type, size_t(a.count) * 32);
+    }, a.type, size_t(a.count) * 32, XXH3_64bits(Guest<uint8_t>(address), index_bytes));
   } else if (!a.indexed && NeedsExpansion(a.type)) {
     const uint64_t parts[2] = {uint64_t(a.count) | uint64_t(a.type) << 32, 0x455850};
     r.indexed = true;
@@ -1552,7 +1550,7 @@ bool Build(PPCContext& ctx, uint8_t* base, const DrawArgs& a, DrawRecord& r, con
         for (uint32_t i = 0; i < count; ++i) seq[i] = i;
         return std::make_pair(Expand(type, seq), false);
       };
-    }, a.type, size_t(a.count) * 32);
+    }, a.type, size_t(a.count) * 32, 1);
   }
   std::memcpy(&work->device.m_ControlPacket, &device->m_ControlPacket, sizeof(device->m_ControlPacket));
   std::memcpy(&work->device.m_ValuesPacket, &device->m_ValuesPacket, sizeof(device->m_ValuesPacket));

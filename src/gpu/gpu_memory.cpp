@@ -190,7 +190,7 @@ void RegisterResource(uint32_t resource_address) {
   uint32_t base[2], size[2];
   const int n = ResourceRanges(resource_address, base, size);
   for (int i = 0; i < n; ++i) {
-    tracker::InvalidateResolved(base[i], size[i]);
+    tracker::InvalidateResolved(base[i], size[i], "header");
     Register(base[i], size[i]);
   }
 }
@@ -199,7 +199,7 @@ void DirtyResource(uint32_t resource_address) {
   uint32_t base[2], size[2];
   const int n = ResourceRanges(resource_address, base, size);
   for (int i = 0; i < n; ++i) {
-    tracker::InvalidateResolved(base[i], size[i]);
+    tracker::InvalidateResolved(base[i], size[i], "lock");
     MarkDirty(base[i], size[i]);
   }
 }
@@ -253,7 +253,7 @@ void MarkRangeDirty(uint32_t base, uint32_t size) {
   if (!base || !size) return;
   // Vertex and texture ranges are keyed physical, index buffers virtual, so both spellings get dirtied.
   memory::MarkDirty(base, size);
-  tracker::InvalidateResolved(base, size);
+  tracker::InvalidateResolved(base, size, "build");
   if (base >= 0x20000000) {
     const uint32_t physical = REX_KERNEL_MEMORY()->GetPhysicalAddress(base);
     const uint32_t key = physical != UINT32_MAX ? physical : base & 0x1FFFFFFF;
@@ -311,12 +311,14 @@ REX_HOOK_RAW(sub_9211F500) {
 // argument the texture.
 REX_HOOK_RAW(sub_9211AFB8) {
   const uint32_t resource = ctx.r3.u32;
+  ae::gpu::WritebackBeforeLock(resource);
   __imp__sub_9211AFB8(ctx, base);
   memory::DirtyResource(resource);
 }
 
 REX_HOOK_RAW(sub_9211B090) {
   const uint32_t resource = ctx.r3.u32;
+  ae::gpu::WritebackBeforeLock(resource);
   __imp__sub_9211B090(ctx, base);
   memory::DirtyResource(resource);
 }

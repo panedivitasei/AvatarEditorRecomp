@@ -31,6 +31,9 @@ struct GuestTextureDesc {
   bool expand = false;        // per-component conversion to float (signs, gamma, packed or depth formats)
 };
 
+// The Xenos endian swap of a fetch constant applied to a run of bytes; its own inverse.
+void SwapBlock(rex::graphics::xenos::Endian endian, uint8_t* out, const uint8_t* in, uint32_t size);
+
 // A depth-format texture no resolve produced is a fresh allocation the title expects zeroed (reversed Z: nothing
 // occludes); the recomp recycles pages, so its guest bytes are stale data and are never decoded.
 bool UnresolvedDepth(const GuestTextureDesc& desc);
