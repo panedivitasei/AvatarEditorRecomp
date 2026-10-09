@@ -124,11 +124,11 @@ static std::string AvatarManifestPath() {
     // folder (and any user_data_root override carries the avatar with it).
     const auto& root = REX_KERNEL_STATE()->emulator()->user_data_root();
     if (!root.empty()) {
-      dir = (root / "avatar" / "manifest").string();
+      dir = (root / "avatar").string();
     }
   }
   if (dir.empty()) {
-    dir = (rex::filesystem::GetUserFolder() / "JMstudios" / "userdata" / "avatar" / "manifest").string();
+    dir = (rex::filesystem::GetUserFolder() / "JMstudios" / "userdata" / "avatar").string();
   }
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
