@@ -28,15 +28,11 @@ See [BUILDING.md](BUILDING.md).
 
 ## Config
 
-The config file `avatareditor.toml` is expected to be in the build's root folder.
+Settings can be configured via `avatareditor.toml`
 
-The asset and closet directories can be set in the config. 
-
-Saves and profile data live in `Documents\JMstudios\userdata`
-
-- `avatar\manifest\avatar_manifest.bin`, the saved avatar
-- `avatar\manifest\gamerpic.png`, the AE gamer pic 
-- `user.toml`, set gamertag and path to gamer pic
+- `Documents\JMstudios\userdata`, save data 
+- `userdata\avatar\avatar_manifest.bin`, the saved avatar
+- `userdata\avatar\gamerpic.png`, the saved AE gamer pic 
 
 ## Credits
 
@@ -45,6 +41,7 @@ Saves and profile data live in `Documents\JMstudios\userdata`
 - [UnleashedRecomp](https://github.com/hedge-dev/UnleashedRecomp)
 - [XenosRecomp](https://github.com/hedge-dev/XenosRecomp)
 - [plume](https://github.com/renderbag/plume)
+- [360css](https://github.com/Tarmo1/360css)
 
 Special thanks to [Sherlyn](https://x.com/sherlyn_marsh) for the original artwork. 
 
