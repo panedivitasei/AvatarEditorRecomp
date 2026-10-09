@@ -150,6 +150,21 @@ ResourceDesc Texture(uint32_t texture_address) {
   return want;
 }
 
+ResourceDesc ResolvedForHeader(uint32_t texture_address) {
+  if (!texture_address) return {};
+  const auto* texture = Guest<guest::D3DBaseTexture>(texture_address);
+  xenos::xe_gpu_texture_fetch_t fetch;
+  for (int i = 0; i < 6; ++i) (&fetch.dword_0)[i] = texture->Format.dword[i];
+  uint32_t base = fetch.base_address << 12;
+  if (base >= 0x20000000) {
+    const uint32_t physical = REX_KERNEL_MEMORY()->GetPhysicalAddress(base);
+    base = physical != UINT32_MAX ? physical : base & 0x1FFFFFFF;
+  }
+  if (!base || fetch.dimension != xenos::DataDimension::k2DOrStacked) return {};
+  std::lock_guard lock(g_mutex);
+  return g_textures.Find(base, fetch.size_2d.width + 1, fetch.size_2d.height + 1, uint32_t(fetch.format));
+}
+
 uint32_t ResolveEpoch() { return g_textures.Epoch(); }
 
 ResourceDesc FindResolved(uint32_t base_address, uint32_t width, uint32_t height, uint32_t guest_format) {
@@ -167,12 +182,12 @@ void TakeRetiredResolves(std::vector<uint32_t>& ids) {
   g_textures.TakeRetired(ids);
 }
 
-void InvalidateResolved(uint32_t base, uint32_t size) {
+void InvalidateResolved(uint32_t base, uint32_t size, const char* why) {
   if (!base || !size) return;
   std::lock_guard lock(g_mutex);
   const uint32_t removed = g_textures.Invalidate(base, size);
   if (removed) {
-    REXGPU_DEBUG("[gpu] retired {} resolve aliases for reused/dirty memory {:#010x}+{:#x}", removed, base, size);
+    REXGPU_DEBUG("[gpu] retired {} resolve aliases for reused/dirty memory {:#010x}+{:#x} ({})", removed, base, size, why);
   }
 }
 

@@ -34,6 +34,9 @@
 #include "gpu/gpu_draw.h"
 #include "gpu/gpu_shader_pack.h"
 #include "gpu/gpu_texture_decode.h"
+#include "gpu/guest/d3d_device.h"
+#include <rex/system/kernel_state.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include "gpu/gpu_tracker.h"
 #include "gpu/precise_sleep.h"
 #include "gpu/shaders/blit_shaders.h"
@@ -404,6 +407,7 @@ constexpr uint64_t kSlowFrameNs = 30'000'000;
 std::atomic<uint64_t> g_capture_bytes{0};
 std::atomic<uint64_t> g_capture_section[4]{};  // draw-build sections, see AddCaptureBreakdown
 std::atomic<uint64_t> g_frame_index{0};
+std::atomic<uint64_t> g_packet_epoch{0};
 
 class Backend {
  public:
@@ -421,6 +425,7 @@ class Backend {
   void Execute(const ReadbackRecord& r);
   void Execute(const ReleaseRecord& r);
   void Execute(const TextureUploadRecord&) {}
+  void Execute(const WritebackRecord& r);
   void ApplyUpload(const ResourceDesc& desc, uint32_t version, const TextureUpload& upload);
   void DestroyResource(std::unordered_map<uint32_t, HostResource>::iterator it);
   void RecycleDescriptor(uint32_t index);
@@ -1455,6 +1460,55 @@ void Backend::Execute(const ReleaseRecord& r) {
     retiring_.emplace_back(frame_counter_, std::move(it->second));
     resources_.erase(it);
   }
+}
+
+void Backend::Execute(const WritebackRecord& r) {
+  auto finish = [&] {
+    std::lock_guard lock(r.slot->mutex);
+    r.slot->done = true;
+    r.slot->done_cv.notify_all();
+  };
+  auto it = resources_.find(r.texture.id);
+  if (it == resources_.end() || !it->second.texture || !r.width || !r.height) return finish();
+  HostResource& alias = it->second;
+  const uint32_t w = r.width, h = r.height;
+  const uint32_t row_texels = (w + 63) & ~63u;
+  auto target = device_->createTexture(plume::RenderTextureDesc::ColorTarget(w, h, kReadbackFormat));
+  const plume::RenderTexture* attachments[1] = {target.get()};
+  auto framebuffer = target ? device_->createFramebuffer(plume::RenderFramebufferDesc(attachments, 1)) : nullptr;
+  auto buffer = device_->createBuffer(plume::RenderBufferDesc::ReadbackBuffer(uint64_t(row_texels) * h * 4));
+  if (!target || !framebuffer || !buffer) return finish();
+  BeginList();
+  auto* list = lists_[slot_].get();
+  Blit(alias, plume::RenderRect(0, 0, int32_t(alias.width), int32_t(alias.height)), target.get(), framebuffer.get(),
+       kReadbackFormat, plume::RenderRect(0, 0, int32_t(w), int32_t(h)), 1.0f, false);
+  Unbind();
+  list->barriers(plume::RenderBarrierStage::COPY,
+                 plume::RenderTextureBarrier(target.get(), plume::RenderTextureLayout::COPY_SOURCE));
+  list->copyTextureRegion(
+      plume::RenderTextureCopyLocation::PlacedFootprint(buffer.get(), kReadbackFormat, w, h, 1, row_texels),
+      plume::RenderTextureCopyLocation::Subresource(target.get()));
+  SubmitAndWait();
+  const auto* pixels = static_cast<const uint8_t*>(buffer->map());
+  uint8_t* guest = REX_KERNEL_MEMORY()->TranslatePhysical<uint8_t*>(r.base);
+  if (pixels && guest) {
+    // Host R,G,B,A back to the texture's memory order: channel order first, then the fetch endian swap, then tiling.
+    for (uint32_t y = 0; y < h; ++y) {
+      for (uint32_t x = 0; x < w; ++x) {
+        const uint8_t* p = pixels + (size_t(y) * row_texels + x) * 4;
+        uint8_t texel[4] = {p[0], p[1], p[2], p[3]};
+        if (r.swap_rb) std::swap(texel[0], texel[2]);
+        uint8_t swapped[4];
+        SwapBlock(xenos::Endian(r.endian), swapped, texel, 4);
+        const uint32_t offset = r.tiled ? uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+                                              int32_t(x), int32_t(y), r.pitch_texels, 2))
+                                        : (y * r.pitch_texels + x) * 4;
+        std::memcpy(guest + offset, swapped, 4);
+      }
+    }
+    buffer->unmap();
+  }
+  finish();
 }
 
 void Backend::Execute(const ReadbackRecord& r) {
@@ -2555,6 +2609,11 @@ void FailReadbacks(Packet& packet) {
       readback->slot->done = true;
       readback->slot->done_cv.notify_all();
     }
+    if (auto* writeback = std::get_if<WritebackRecord>(&record)) {
+      std::lock_guard lock(writeback->slot->mutex);
+      writeback->slot->done = true;
+      writeback->slot->done_cv.notify_all();
+    }
   }
 }
 
@@ -2656,6 +2715,7 @@ void Submit(Record record) {
 }
 
 uint64_t FrameIndex() { return g_frame_index.load(std::memory_order_relaxed); }
+uint64_t PacketEpoch() { return g_packet_epoch.load(std::memory_order_relaxed); }
 
 // Blocks the first presented frame until the start-up warm-up has compiled, so a first run after a pack change
 // spends its compile time on the boot screen and never mid-level. Later frames never wait here.
@@ -2729,6 +2789,7 @@ void EndFrame() {
       r->building = {};
       r->building.records.reserve(packet.records.size());
     }
+    g_packet_epoch.fetch_add(1, std::memory_order_relaxed);
     draw::FinishPreparation(packet);
   }
   static Clock::time_point last = Clock::now();
@@ -2771,6 +2832,42 @@ void EndFrame() {
   const auto before = Clock::now();
   Push(r, std::move(packet), true);
   AddFrameTiming(1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - before).count()));
+}
+
+void WritebackBeforeLock(uint32_t texture_address) {
+  Renderer* r = g_renderer;
+  if (!r) return;
+  const ResourceDesc alias = tracker::ResolvedForHeader(texture_address);
+  if (!alias.id) return;
+  const auto* texture = REX_KERNEL_MEMORY()->TranslateVirtual<const guest::D3DBaseTexture*>(texture_address);
+  xenos::xe_gpu_texture_fetch_t fetch;
+  for (int i = 0; i < 6; ++i) (&fetch.dword_0)[i] = texture->Format.dword[i];
+  GuestTextureDesc desc;
+  if (!DescribeTexture(fetch, desc) || desc.host_format != HostFormat::kRGBA8) return;
+  WritebackRecord record;
+  record.texture = alias;
+  record.base = desc.base_address;
+  record.width = desc.width;
+  record.height = desc.height;
+  record.pitch_texels = uint32_t(fetch.pitch) * 32;
+  record.tiled = fetch.tiled;
+  record.endian = uint8_t(fetch.endianness);
+  record.swap_rb = ((fetch.swizzle >> 0) & 7) == 2;
+  record.slot = std::make_shared<WritebackSlot>();
+  auto slot = record.slot;
+  // The frame so far goes with it, so the resolve that filled the alias runs before the readback.
+  Packet packet;
+  {
+    std::lock_guard lock(r->build_mutex);
+    packet = std::move(r->building);
+    r->building = {};
+  }
+  g_packet_epoch.fetch_add(1, std::memory_order_relaxed);
+  draw::FinishPreparation(packet);
+  packet.records.push_back(std::move(record));
+  Push(r, std::move(packet), false);
+  std::unique_lock lock(slot->mutex);
+  slot->done_cv.wait(lock, [&] { return slot->done; });
 }
 
 bool ReadbackFrontBuffer(rex::ui::RawImage& image) {

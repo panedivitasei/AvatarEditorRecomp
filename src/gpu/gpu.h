@@ -32,6 +32,14 @@ void EndFrame();
 // Frames handed to the render thread so far; the capture keys per-frame upload coalescing on it.
 uint64_t FrameIndex();
 
+// Packets handed to the render thread so far, frames and mid-frame flushes alike; unregistered ranges are sent once
+// per packet, since the host places them per packet.
+uint64_t PacketEpoch();
+
+// Guest thread: if the texture header's memory is a resolve alias, flushes the frame so far and blocks until the
+// host has written the alias pixels into guest memory. Called before the title locks a texture for the CPU.
+void WritebackBeforeLock(uint32_t texture_address);
+
 // Guest thread: adds capture time and captured upload bytes to the frame statistics.
 void AddCaptureStats(uint64_t nanoseconds, uint64_t bytes);
 

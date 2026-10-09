@@ -281,8 +281,28 @@ struct TextureUploadRecord {
   std::shared_ptr<const TextureUpload> upload;
 };
 
-using Record =
-    std::variant<ClearRecord, ResolveRecord, SwapRecord, ReadbackRecord, DrawRecord, ReleaseRecord, TextureUploadRecord>;
+// A resolve destination the title is about to lock for the CPU: the host writes its pixels into guest memory in
+// the texture's own layout, then releases the guest thread waiting on the slot.
+struct WritebackSlot {
+  std::mutex mutex;
+  std::condition_variable done_cv;
+  bool done = false;
+};
+
+struct WritebackRecord {
+  ResourceDesc texture;       // the resolve alias
+  uint32_t base = 0;          // physical address of the texture data
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t pitch_texels = 0;  // row pitch of the guest layout
+  bool tiled = false;
+  uint8_t endian = 0;         // xenos::Endian of the fetch constant
+  bool swap_rb = false;       // the fetch swizzle reads red from Z, so memory holds B,G,R,A
+  std::shared_ptr<WritebackSlot> slot;
+};
+
+using Record = std::variant<ClearRecord, ResolveRecord, SwapRecord, ReadbackRecord, DrawRecord, ReleaseRecord,
+                            TextureUploadRecord, WritebackRecord>;
 
 // One queue item: the records since the last hand-off, ending at a Swap or a readback request.
 struct Packet {
