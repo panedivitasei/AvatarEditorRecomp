@@ -48,6 +48,7 @@
 #include "stb_image.h"
 
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
+REXCVAR_DEFINE_STRING(user_name, "User", "Kernel", "Gamertag, max 15 chars; set in avatareditor.toml");
 REXCVAR_DEFINE_STRING(user_gamerpic, "", "Kernel",
                       "Path to an image (PNG/JPG/BMP/TGA) served as the profile's gamer picture "
                       "(64x64 recommended). Relative paths resolve against the exe folder. "
@@ -138,6 +139,16 @@ typedef struct {
 } X_USER_SIGNIN_INFO;
 static_assert_size(X_USER_SIGNIN_INFO, 40);
 
+// The shown gamertag only; the profile keeps its own name so saves under profile/User stay put.
+std::string Gamertag() {
+  std::string name;
+  for (char c : REXCVAR_GET(user_name)) {
+    if (c >= 0x20 && c <= 0x7E) name += c;
+    if (name.size() == 15) break;
+  }
+  return name.empty() ? "User" : name;
+}
+
 i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNIN_INFO> info) {
   if (!info) {
     return X_E_INVALIDARG;
@@ -159,7 +170,7 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   // profile is "Xbox live enabled"; with it clear they reject the profile.
   // Set it whenever the user is SignedInToLive (state 2).
   info->info_flags = (signin_state == 2) ? 0x00000001u : 0u;
-  rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
+  rex::string::copy_truncating(info->name, Gamertag(), rex::countof(info->name));
   return X_E_SUCCESS;
 }
 
@@ -172,9 +183,7 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
     return X_E_NO_SUCH_USER;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  const auto& user_name = user_profile->name();
-  rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
+  rex::string::copy_truncating(buffer, Gamertag(), std::min(buffer_len, uint32_t(16)));
   return X_E_SUCCESS;
 }
 
@@ -191,8 +200,7 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
     return X_E_INVALIDARG;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  auto user_name = rex::string::to_utf16(user_profile->name());
+  auto user_name = rex::string::to_utf16(Gamertag());
   rex::string::copy_and_swap_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
   return X_E_SUCCESS;
 }
