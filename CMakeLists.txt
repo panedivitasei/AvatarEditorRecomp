@@ -34,6 +34,7 @@ set(AVATAREDITOR_SOURCES
     src/gpu/gpu_draw.cpp
     src/gpu/gpu_formats.cpp
     src/gpu/gpu_memory.cpp
+    src/gpu/gpu_overlay.cpp
     src/gpu/gpu_renderer.cpp
     src/gpu/gpu_shader_pack.cpp
     src/gpu/gpu_texture_decode.cpp

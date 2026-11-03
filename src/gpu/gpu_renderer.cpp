@@ -32,6 +32,7 @@
 
 #include "gpu/gpu.h"
 #include "gpu/gpu_draw.h"
+#include "gpu/gpu_overlay_pass.h"
 #include "gpu/gpu_shader_pack.h"
 #include "gpu/gpu_texture_decode.h"
 #include "gpu/guest/d3d_device.h"
@@ -463,6 +464,12 @@ class Backend {
              std::vector<uint64_t>& copy_sizes);
   UploadSpan Upload(uint64_t size, uint64_t align);
   void ResetUploads(uint32_t slot);
+  OverlayAllocator OverlayUploads() {
+    return [this](uint64_t size, uint64_t align) {
+      const UploadSpan span = Upload(size, align);
+      return OverlayUpload{span.buffer, span.offset, span.data};
+    };
+  }
   bool AllocateTransient(uint64_t size, uint64_t& offset);
   uint32_t DescriptorFor(HostResource& resource, uint8_t dimension, const std::array<uint8_t, 4>& swizzle);
   uint32_t AllocateDescriptor();
@@ -518,6 +525,7 @@ class Backend {
   std::unique_ptr<plume::RenderSampler> linear_sampler_;
   plume::RenderDescriptorSetBuilder sample_set_builder_;
   std::unique_ptr<plume::RenderPipelineLayout> layout_;
+  OverlayPass overlay_;
   std::unique_ptr<plume::RenderShader> vs_;
   std::unique_ptr<plume::RenderShader> ps_;
   std::unique_ptr<plume::RenderShader> resolve_vs_;
@@ -690,6 +698,7 @@ bool Backend::Create(rex::ui::Window* window) {
     REXGPU_ERROR("[gpu] cannot build the blit pipeline");
     return false;
   }
+  if (!overlay_.Create(device_.get(), kSwapChainFormat)) REXGPU_WARN("[gpu] overlay pipeline unavailable; no ImGui overlay");
 
   scale_pct_ = ResolutionScale();
   // The forced sample count must be supported by every format a render target can have, so passes stay compatible.
@@ -850,6 +859,7 @@ void Backend::Destroy() {
     if (list_open_) SubmitAndWait();
     WaitAll();
   }
+  overlay_.Destroy();
   for (auto& timing : gpu_timing_) timing.queries.reset();
   if (draws_executed_ || draws_dropped_) {
     REXGPU_INFO("[gpu] draws executed {}, dropped {}; sampler slots {}/{}, evictions {}, table fallbacks {}",
@@ -1349,6 +1359,8 @@ void Backend::Execute(const SwapRecord& r) {
     const uint32_t bh = swap_chain_->getHeight();
     FlushTransitions();
     Unbind();
+    const OverlayAllocator overlay_uploads = OverlayUploads();
+    const bool overlay = overlay_.Prepare(list, slot_, overlay_uploads);
     list->barriers(plume::RenderBarrierStage::GRAPHICS,
                    plume::RenderTextureBarrier(back, plume::RenderTextureLayout::COLOR_WRITE));
     list->setFramebuffer(back_framebuffer);
@@ -1360,6 +1372,13 @@ void Backend::Execute(const SwapRecord& r) {
       FitRect(bw, bh, front->desc.width, front->desc.height, fit);
       Blit(*front, plume::RenderRect(0, 0, int32_t(front->width), int32_t(front->height)), back, back_framebuffer,
            kSwapChainFormat, fit, 1.0f, true);
+    }
+    if (overlay) {
+      if (bound_ != back_framebuffer) {
+        list->setFramebuffer(back_framebuffer);
+        bound_ = back_framebuffer;
+      }
+      overlay_.Draw(list, bw, bh, overlay_uploads);
     }
     Unbind();
     list->barriers(plume::RenderBarrierStage::GRAPHICS,
@@ -1387,6 +1406,7 @@ void Backend::Execute(const SwapRecord& r) {
   list_open_ = false;
   slot_ = (slot_ + 1) % kFramesInFlight;
   last_presented_ = front ? r.front.id : kNoResource;
+  NotifyOverlayPresented();
   ++frame_counter_;
   // A frame's persistent frees are safe once every slot has cycled past it.
   if (frame_counter_ > kFramesInFlight) persistent_.Retire(frame_counter_ - kFramesInFlight - 1);
