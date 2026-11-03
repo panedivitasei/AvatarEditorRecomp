@@ -1,17 +1,9 @@
 # Save-and-Exit null-op guard: the save flow's UI states 76/77 poll a
-# GamerPicManager op object; if its creation fails the slot stays null and the
-# pollers deref op+12. With r3 == 0 skip the body; r3 already holds the correct
-# idle return. XamAvatarSetManifest persists the save data before these states
-# run, so a null op only skips the gamerpic upload.
-
-# sub_92201DF8: op-state getter `return *(op+12)`.
-[[midasm_hook]]
-address = 0x92201DF8
-name = "AE_GuardNullOpState"
-registers = ["r3"]
-return_on_true = true
-
-# sub_920C7680: op "is active (states 1..4)" check, same NULL deref.
+# GamerPicManager op object; if its creation fails the slot stays null.
+# sub_920C7680 is the op "is active (states 1..4)" check, which derefs it; with
+# r3 == 0 skip the body, r3 already holding the idle return. XamAvatarSetManifest
+# persists the save data before these states run, so a null op only skips the
+# gamerpic upload.
 [[midasm_hook]]
 address = 0x920C7680
 name = "AE_GuardNullOpActive"
@@ -52,122 +44,11 @@ name = "AE_HideIdentifyingGrp"
 registers = ["r31"]
 return_on_true = true
 
-# Marketplace manifest parser probes (observe-only, ae_mkt_trace). The channel
-# manifest goes through a SAX state machine (sub_922077B8, r3 = parser ctx);
-# these print the event stream and what its two validators see.
-[[midasm_hook]]
-address = 0x922077B8        # sub_922077B8 entry: one call per SAX event
-name = "AE_MktParserEvent"
-registers = ["r3"]
-
-[[midasm_hook]]
-address = 0x92207680        # sub_92207680 entry: per-slot validator
-name = "AE_MktSlotValidate"
-registers = ["r3"]
-
-[[midasm_hook]]
-address = 0x922075B8        # sub_922075B8 entry: channel validator at </manifest>
-name = "AE_MktChannelValidate"
-registers = ["r3"]
-
-# Net driver probes (observe-only). r3 = driver object; the XHTTP pump struct
-# sits at +840 and the abort flags at +288.
-[[midasm_hook]]
-address = 0x9220B2D8        # sub_9220B2D8 entry: poll step, r4 = target pump state
-name = "AE_MktNetPoll"
-registers = ["r3", "r4"]
-
-[[midasm_hook]]
-address = 0x9220B038        # sub_9220B038 entry: headers stage, r4 = hr
-name = "AE_MktNetHeaders"
-registers = ["r3", "r4"]
-
-[[midasm_hook]]
-address = 0x9220AE28        # sub_9220AE28 entry: driver teardown
-name = "AE_MktNetTeardown"
-registers = ["r3"]
-
-[[midasm_hook]]
-address = 0x9228E3F0        # sub_9228E3F0 entry: request/connection close
-name = "AE_MktNetClose"
-registers = ["r3"]
-
-# Store navigation probes (observe-only). Selecting a tile resolves its action
-# string against the category registry and then lazily builds a preview object;
-# the fault lands in that window.
-[[midasm_hook]]
-address = 0x920D2EF0        # sub_920D2EF0(registry, name, flags): scene/slot lookup
-name = "AE_MktSceneLookup"
-registers = ["r3", "r4", "r5"]
-
-[[midasm_hook]]
-address = 0x920E0620        # sub_920E0620(obj): lazy preview load on selection
-name = "AE_MktPreviewLoad"
-registers = ["r3"]
-
-[[midasm_hook]]
-address = 0x920E04B0        # sub_920E04B0(obj, record): applies the found record
-name = "AE_MktPreviewApply"
-registers = ["r3", "r4"]
-
+# Records each item-metadata fetcher by request name so a search can drop its cached answer.
 [[midasm_hook]]
 address = 0x920D4970        # sub_920D4970(fetcher, name, ...): item metadata fetch
 name = "AE_MktItemFetch"
 registers = ["r3", "r4"]
-
-# The store page loader's three error sites and the category fetcher the
-# pages share, enough to say why a store page gave up.
-[[midasm_hook]]
-address = 0x920E21AC        # sub_920E2080: error 11, LIVE session check timed out
-name = "AE_MktPageError"
-registers = ["r11", "r30"]
-
-[[midasm_hook]]
-address = 0x920E2340        # sub_920E2080: error 17, store list with no categories
-name = "AE_MktPageError"
-registers = ["r11", "r30"]
-
-[[midasm_hook]]
-address = 0x920E2400        # sub_920E2080: error 17, page with no items after a second
-name = "AE_MktPageError"
-registers = ["r11", "r30"]
-
-[[midasm_hook]]
-address = 0x920D4760        # sub_920D4760(fetcher, name, page, size, ...): category fetch step
-name = "AE_MktCatFetch"
-registers = ["r3", "r4", "r5", "r6"]
-
-[[midasm_hook]]
-address = 0x920D4C70        # sub_920D4C70(fetcher, request): issues the query
-name = "AE_MktQueryIssue"
-registers = ["r3", "r4"]
-
-[[midasm_hook]]
-address = 0x920D4548        # sub_920D4548(_, kind): scene kind -> query descriptor
-name = "AE_MktDispatchKind"
-registers = ["r4"]
-
-[[midasm_hook]]
-address = 0x92203D60        # sub_92203D60(client, req): builds the title:<id> query
-name = "AE_MktTitleQuery"
-registers = ["r3", "r4"]
-
-[[midasm_hook]]
-address = 0x922031E0        # sub_922031E0(handle, ...): marshals the query call
-name = "AE_MktMarshal"
-registers = ["r3", "r5"]
-
-# Try-on pipeline probes (observe-only): does hovering a store item ask for a
-# preview at all, and what error does the pipeline record if it refuses.
-[[midasm_hook]]
-address = 0x920DFDF0        # sub_920DFDF0: gated preview/try-on start
-name = "AE_MktWearStart"
-registers = ["r3"]
-
-[[midasm_hook]]
-address = 0x920E0680        # sub_920E0680: preview pipeline continuation
-name = "AE_MktWearStep"
-registers = ["r3"]
 
 # The FindGameOffers URL formatter passes nine arguments to _snwprintf; the
 # ninth (the RatingIds tail, its sixth vararg) travels in the first stack
