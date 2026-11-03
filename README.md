@@ -45,6 +45,7 @@ Settings can be configured via `avatareditor.toml`
 - [XenosRecomp](https://github.com/hedge-dev/XenosRecomp)
 - [plume](https://github.com/renderbag/plume)
 - [360css](https://github.com/Tarmo1/360css)
+- [RexLiveless](https://github.com/SolarCookies/RexLiveless)
 
 Special thanks to [Sherlyn](https://x.com/sherlyn_marsh) for the original artwork. 
 
