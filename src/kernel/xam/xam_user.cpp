@@ -54,8 +54,8 @@ REXCVAR_DEFINE_STRING(user_gamerpic, "", "Kernel",
                       "(64x64 recommended). Relative paths resolve against the exe folder. "
                       "Empty keeps the title's default tile.");
 
-// The one online switch; the store section opens against avatar_marketplace_server, so both are needed.
-REXCVAR_DEFINE_BOOL(online_mode, false, "Kernel",
+// The store section opens against avatar_marketplace_server, so both are needed.
+REXCVAR_DEFINE_BOOL(marketplace, false, "Kernel",
                     "Connect the Avatar Editor's marketplace to the server below.");
 
 // The store's server. Every hive value the store reads is derived from
@@ -69,8 +69,8 @@ REXCVAR_DEFINE_STRING(avatar_marketplace_server, "http://127.0.0.1:8080", "Kerne
                       "https://example.org. https means port 443. It is the only host the "
                       "store will talk to.");
 
-bool OnlineMode() {
-  return REXCVAR_GET(online_mode) && !REXCVAR_GET(avatar_marketplace_server).empty();
+bool MarketplaceOn() {
+  return REXCVAR_GET(marketplace) && !REXCVAR_GET(avatar_marketplace_server).empty();
 }
 
 namespace rex {
@@ -1204,7 +1204,7 @@ u32 XamGetLiveHiveValueA_entry(mapped_string name, mapped_string buffer, u32 buf
   std::string value;
   if (key == "AvatarPhotoBoothEnabled") {
     value = "1";
-  } else if (OnlineMode()) {
+  } else if (MarketplaceOn()) {
     const MarketplaceServer server = GetMarketplaceServer();
     if (key == "AvatarMarketplaceEnabled") {
       value = "1";
@@ -1264,7 +1264,7 @@ u32 XamGetLiveHiveValueW_entry(mapped_wstring name, mapped_wstring buffer, u32 b
   }
 
   std::string value;
-  if (OnlineMode()) {
+  if (MarketplaceOn()) {
     if (key == "EpixUriRoot" || key == "EpixPreviewUriRoot") {
       value = GetMarketplaceServer().base + "/epix/";
     } else if (key == "EpixManifestUriPath") {

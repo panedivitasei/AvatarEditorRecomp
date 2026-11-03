@@ -22,5 +22,5 @@ gpu_resolution_scale = 100 #1-200
 gpu_vsync = false
 gpu_adapter = ""
 
-online_mode = false
+marketplace = false
 avatar_marketplace_server = ""
