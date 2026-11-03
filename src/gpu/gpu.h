@@ -9,7 +9,6 @@
 
 namespace rex::ui {
 class Window;
-struct RawImage;
 }  // namespace rex::ui
 
 namespace ae::gpu {
@@ -47,9 +46,7 @@ void AddCaptureStats(uint64_t nanoseconds, uint64_t bytes);
 // textures, 3 geometry), reported per frame in the statistics window.
 void AddCaptureBreakdown(int section, uint64_t nanoseconds);
 
-// Frame timings: 0 translation, 1 decode, 2 indices, 3 streams, 4 texture description, 5 texture key,
-// 6 resource lookup, 7 shader lookup, 8 preparation finish, 9 texture binding, 10 registration,
-// 11 stream copy, 12 stream query, 13 unowned checks; kind 14 accumulates copied bytes instead of nanoseconds.
+// Frame timings: 0 translation, 1 decode.
 void AddGuestTiming(int kind, uint64_t nanoseconds);
 // Range keys the host dropped from shared memory since the last call; the guest thread forgets it sent them. A key
 // carrying kEvictedTextureTag names a destroyed host texture id instead of a range.
@@ -68,9 +65,6 @@ void SetVsync(bool enabled);
 
 // Frame pacing on the guest thread: kind 0 = time slept for gpu_fps_cap, 1 = time waiting for queue room.
 void AddFrameTiming(int kind, uint64_t nanoseconds);
-
-// Guest thread: copies the last presented front buffer as RGBX8, waiting for the render thread.
-bool ReadbackFrontBuffer(rex::ui::RawImage& image);
 
 // Any thread: the guest wrote [base, base + size) behind the D3D runtime's back, so cached host copies are retired.
 void MarkRangeDirty(uint32_t base, uint32_t size);

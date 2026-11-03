@@ -28,7 +28,6 @@
 #include <xenosrecomp.h>
 
 #include "gpu/gpu.h"
-#include "gpu/gpu_burst_timing.h"
 #include "gpu/gpu_cmdbuf.h"
 #include "gpu/gpu_constant_snapshot.h"
 #include "gpu/gpu_draw.h"
@@ -44,8 +43,6 @@ REXCVAR_DEFINE_BOOL(gpu_draws, true, "GPU", "Render captured draws; off leaves o
 REXCVAR_DEFINE_BOOL(gpu_parallel_prepare, true, "GPU", "Prepare captured draw state, samplers, constants and indices on workers");
 REXCVAR_DEFINE_BOOL(gpu_stream_snapshot_pool, true, "GPU", "Reuse worker-prepared stream snapshot buffers");
 REXCVAR_DEFINE_BOOL(gpu_replay_cull, true, "GPU", "Apply the recorded cull mode to command-buffer replays; off draws both faces");
-REXCVAR_DECLARE(int32_t, gpu_trace_frame);
-REXCVAR_DECLARE(int32_t, gpu_trace_frames);
 
 extern "C" REX_FUNC(__imp__sub_92121380);
 extern "C" REX_FUNC(__imp__sub_92121798);
@@ -71,12 +68,6 @@ const T* Guest(uint32_t address) {
 }
 
 uint32_t Load32(uint32_t address) { return *Guest<rex::be<uint32_t>>(address); }
-
-bool Tracing() {
-  const int32_t frame = REXCVAR_GET(gpu_trace_frame);
-  const int32_t count = std::max<int32_t>(REXCVAR_GET(gpu_trace_frames), 1);
-  return frame >= 0 && ae::gpu::FrameIndex() >= uint64_t(frame) && ae::gpu::FrameIndex() < uint64_t(frame) + count;
-}
 
 // One log line per distinct key, for pack defects and other per-object problems.
 bool FirstTime(uint64_t key) {
@@ -222,7 +213,6 @@ bool LocateVs(const D3DDevice* device, uint32_t& vs, bool& variant1, uint32_t& c
 // does before its flush.
 const VsInfo* ResolveVs(PPCContext& ctx, uint8_t* base, DeviceState& ds, const D3DDevice* device, int up_stride_dwords,
                         const VsSnapshot* snap) {
-  BurstTiming timing(7);
   uint32_t vs, code, size;
   bool variant1;
   const uint8_t* raw = nullptr;
@@ -250,11 +240,6 @@ const VsInfo* ResolveVs(PPCContext& ctx, uint8_t* base, DeviceState& ds, const D
   std::memcpy(strides, device->stream_stride_dwords, 16);
   if (up_stride_dwords >= 0) strides[0] = uint8_t(up_stride_dwords);
   const uint32_t decl = device->vertex_declaration;
-  if (Tracing()) {
-    REXGPU_INFO("[gpu]   vs object {:#010x} variant {} code {:#010x}+{:#x} decl {:#010x} strides {} {} {} {}{}", vs,
-                variant1 ? 1 : 0, code, size, decl, strides[0], strides[1], strides[2], strides[3],
-                snap ? " (recorded)" : "");
-  }
   const uint64_t key = ds.vs_raw_hash ^ XXH3_64bits(strides, 16) * 31 ^ (uint64_t(vs) << 32 | decl) * 17 ^
                        (variant1 ? 0x9E3779B97F4A7C15ull : 0);
   auto it = g_vs_cache.find(key);
@@ -297,7 +282,6 @@ const VsInfo* ResolveVs(PPCContext& ctx, uint8_t* base, DeviceState& ds, const D
 }
 
 const PsInfo* ResolvePs(DeviceState& ds, const D3DDevice* device) {
-  BurstTiming timing(7);
   const uint32_t ps = device->pixel_shader;
   if (!ps) return nullptr;
   const uint32_t header = ps + guest::kPsHeader;
@@ -571,7 +555,6 @@ uint64_t SampleTexture(const GuestTextureDesc& desc) {
 // Everything that changes the decoded contents: pitch, tiling and signs, format and address, size, mip range and
 // dimension.
 uint64_t TextureKey(const xenos::xe_gpu_texture_fetch_t& f) {
-  BurstTiming timing(5);
   const uint32_t words[6] = {f.dword_0 & 0xFFC003FCu, f.dword_1, f.dword_2, 0, f.dword_4 & 0x3FCu,
                              f.dword_5 & 0xFFFFFE00u};
   return XXH3_64bits(words, sizeof(words));
@@ -596,7 +579,6 @@ void CensusTexture(const xenos::xe_gpu_texture_fetch_t& f, uint8_t binding_dimen
 }
 
 TextureBinding BindTexture(const D3DDevice* device, const PackBinding& b, uint8_t slot) {
-  BurstTiming timing(9);
   TextureBinding out;
   out.slot = slot;
   out.dimension = b.dimension ? b.dimension : 1;
@@ -666,10 +648,6 @@ TextureBinding BindTexture(const D3DDevice* device, const PackBinding& b, uint8_
     entry.desc.depth = desc.shape == TextureShape::k3D ? desc.depth : desc.shape == TextureShape::kStacked ? desc.layers
                                                                                                           : 1;
     entry.desc.mip_levels = desc.mip_levels;
-    if (Tracing()) {
-      REXGPU_INFO("[gpu] texture {:#010x} {}x{} guest format {} -> host {} {}", base_address, desc.width, desc.height,
-                  uint32_t(f.format), entry.desc.id, HostFormatName(desc.host_format));
-    }
   }
   out.texture = entry.desc;
   out.swizzle = ComposeSwizzle(entry.desc.format, out.swizzle);
@@ -792,7 +770,6 @@ SentRange& StreamRange(uint32_t fetch_index, uint64_t key) {
 }
 
 StreamData CaptureStream(uint32_t fetch_index, uint32_t guest_base, uint32_t size) {
-  BurstTiming timing(3);
   StreamData s;
   s.fetch_index = fetch_index;
   s.guest_base = guest_base;
@@ -802,10 +779,7 @@ StreamData CaptureStream(uint32_t fetch_index, uint32_t guest_base, uint32_t siz
   const uint64_t packet = PacketEpoch();
   ForgetEvicted();
   SentRange& sent = StreamRange(fetch_index, s.key);
-  const auto state = [&] {
-    BurstTiming query_timing(12);
-    return memory::Query(guest_base, size, sent.range_cache);
-  }();
+  const auto state = memory::Query(guest_base, size, sent.range_cache);
   s.persistent = state.registered;
   s.version = state.generation;
   const bool paranoid = memory::Paranoid();
@@ -818,23 +792,18 @@ StreamData CaptureStream(uint32_t fetch_index, uint32_t guest_base, uint32_t siz
     s.version = uint32_t(hash ^ (hash >> 32)) | 1u;
     send = sent.frame == UINT64_MAX || sent.version != s.version;
   } else {
-    BurstTiming unowned_timing(13);
     memory::NoteUnregistered(guest_base, size, "vertex range");
     s.version = uint32_t(packet);
     send = sent.frame != packet || sent.hash != hash;
   }
   sent.hash = hash;
   if (send) {
-    {
-      BurstTiming copy_timing(11);
-      if (REXCVAR_GET(gpu_stream_snapshot_pool) && REXCVAR_GET(gpu_parallel_prepare)) {
-        static StreamSnapshotPool snapshots;
-        s.bytes = snapshots.Copy(bytes, size);
-      } else {
-        s.bytes = std::make_shared<const std::vector<uint8_t>>(bytes, bytes + size);
-      }
+    if (REXCVAR_GET(gpu_stream_snapshot_pool) && REXCVAR_GET(gpu_parallel_prepare)) {
+      static StreamSnapshotPool snapshots;
+      s.bytes = snapshots.Copy(bytes, size);
+    } else {
+      s.bytes = std::make_shared<const std::vector<uint8_t>>(bytes, bytes + size);
     }
-    if (BurstTimingEnabled()) AddGuestTiming(14, size);
     g_captured_bytes += size;
     sent.version = s.version;
     sent.frame = packet;
@@ -983,7 +952,6 @@ void ForgetIndex(uint64_t key) {
 template <typename GetState, typename MakeConvert>
 void PlaceIndices(DrawRecord& r, uint64_t key, GetState get_state, MakeConvert make_convert,
                   xenos::PrimitiveType type, size_t input_bytes, uint64_t hash) {
-  BurstTiming timing(2);
   const uint64_t frame = PacketEpoch();
   ForgetEvicted();
   if (g_index_runs.size() > 8192) g_index_runs.clear();
@@ -1007,7 +975,7 @@ void PlaceIndices(DrawRecord& r, uint64_t key, GetState get_state, MakeConvert m
       prepared.bytes = std::move(bytes);
       return prepared;
     };
-    if (REXCVAR_GET(gpu_parallel_prepare) && !Tracing()) {
+    if (REXCVAR_GET(gpu_parallel_prepare)) {
       run.prepared = PrepareQueue().Post(std::move(work), input_bytes).share();
     } else {
       run.ready = work();
@@ -1434,7 +1402,7 @@ bool Build(PPCContext& ctx, uint8_t* base, const DrawArgs& a, DrawRecord& r, con
   // Constants: the shadow is byte-swapped per dword; literals override what the shader defines itself.
   auto c = AllocateConstants();
   const auto& k = device->m_Constants;
-  const bool parallel_constants = REXCVAR_GET(gpu_parallel_prepare) && !Tracing();
+  const bool parallel_constants = REXCVAR_GET(gpu_parallel_prepare);
   static_assert(sizeof(k.VertexShaderF) == 256 * 16 && sizeof(k.PixelShaderF) == 256 * 16);
   auto work = AllocateDrawWork();
   work->vs_constants = ds.float_snapshots.Capture(0, &k.VertexShaderF[0][0]);
@@ -1488,7 +1456,6 @@ bool Build(PPCContext& ctx, uint8_t* base, const DrawArgs& a, DrawRecord& r, con
     if ((d0 & 3) != uint32_t(xenos::FetchConstantType::kVertex)) continue;
     const uint32_t guest_base = d0 & ~3u;
     const uint32_t size = d1 & 0x3FFFFFC;
-    if (Tracing()) REXGPU_INFO("[gpu]   vfetch {} base {:#010x} size {:#x}", index, guest_base, size);
     if (!guest_base || !size) continue;
     r.streams.push_back(CaptureStream(index, guest_base & 0x1FFFFFFF, size));
   }
@@ -1597,25 +1564,6 @@ thread_local int t_depth = 0;
 
 void Submit(DrawRecord&& r) {
   if (r.prepared_state) QueueDrawWork(r.prepared_state);
-  if (Tracing()) {
-    FinishDrawState(r);
-    FinishIndices(r);
-    REXGPU_INFO("[gpu] draw vs {} ps {} topo {} count {} idx {} streams {} tex {} rt {} depth {} viewport ({},{} {}x{}) "
-                "scissor ({},{})-({},{}) depth {}/{}/{} stencil {}/{}/{} ops {}/{}/{} masks {:#x}/{:#x} blend {:#x}/{} "
-                "mask {:#x}",
-                r.state.vs_entry, r.state.ps_entry, r.state.topology, r.count, r.indexed, r.streams.size(),
-                r.textures.size(), r.color[0].id, r.depth.id, r.viewport[0], r.viewport[1], r.viewport[2], r.viewport[3],
-                r.scissor.left, r.scissor.top, r.scissor.right, r.scissor.bottom, r.state.depth_enable,
-                r.state.depth_write, r.state.depth_func, r.state.stencil_enable, r.state.stencil_func,
-                r.state.stencil_ref, r.state.stencil_fail, r.state.stencil_zfail, r.state.stencil_pass,
-                r.state.stencil_read_mask, r.state.stencil_write_mask, r.state.blend[0], r.state.blend_enable[0],
-                r.state.write_mask[0]);
-    for (const auto& t : r.textures) {
-      REXGPU_INFO("[gpu]   tex stage {} slot {} dim {} host {} v{} {} {}x{} upload {}", t.stage, t.slot, t.dimension,
-                  t.texture.id, t.version, HostFormatName(t.texture.format), t.texture.width, t.texture.height,
-                  t.upload != nullptr);
-    }
-  }
   ae::gpu::Submit(std::move(r));
 }
 
@@ -1698,7 +1646,6 @@ void BeginInline(PPCContext& ctx, uint8_t* base, const DrawArgs& a, uint32_t ver
 void FinishPending() { FinishInline(); }
 
 void FinishPreparation(Packet& packet) {
-  BurstTiming timing(8);
   std::lock_guard lock(g_mutex);
   CaptureTimer timer;
   const auto start = std::chrono::steady_clock::now();

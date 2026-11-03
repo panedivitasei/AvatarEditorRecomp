@@ -13,18 +13,12 @@
 #include <memory>
 #include <unordered_map>
 
-#include <rex/cvar.h>
-#include <rex/hash.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 
 #include "gpu/gpu.h"
 #include "gpu/gpu_memory.h"
 #include "gpu/guest/d3d_device.h"
-
-REXCVAR_DECLARE(int32_t, gpu_trace_frame);
-REXCVAR_DEFINE_BOOL(gpu_cmdbuf_watch, false, "GPU",
-                    "Log when the live texture fetch constants or palette stream a command-buffer replay inherits change");
 
 namespace ae::gpu::cmdbuf {
 
@@ -37,11 +31,6 @@ constexpr size_t kDeviceBytes = sizeof(D3DDevice);
 template <typename T>
 const T* Guest(uint32_t address) {
   return REX_KERNEL_MEMORY()->TranslateVirtual<const T*>(address);
-}
-
-bool Tracing() {
-  const int32_t frame = REXCVAR_GET(gpu_trace_frame);
-  return frame >= 0 && ae::gpu::FrameIndex() == uint64_t(frame);
 }
 
 struct Entry {
@@ -73,9 +62,9 @@ std::unordered_map<uint32_t, RecordingState> g_recording;  // by device
 std::unordered_map<uint32_t, Buffer> g_buffers;            // by buffer address
 std::atomic<bool> g_warn_inline{false};
 std::atomic<bool> g_warn_unknown{false};
-std::atomic<int> g_log_budget{80};   // the first recordings and runs are logged without the frame trace
+std::atomic<int> g_log_budget{80};   // the first recordings and runs are logged
 
-bool Loud() { return Tracing() || g_log_budget.fetch_sub(1) > 0; }
+bool Loud() { return g_log_budget.fetch_sub(1) > 0; }
 
 void ReadPending(uint32_t device, uint64_t (&out)[5]) {
   const auto* d = Guest<D3DDevice>(device);
@@ -266,23 +255,6 @@ void Run(PPCContext& ctx, uint8_t* base, uint32_t device, uint32_t buffer, uint3
     REXGPU_INFO("[gpu] run command buffer {:#010x} select {} on device {:#010x}: {} entries", buffer, select, device,
                 entries->size());
   }
-  if (!entries->empty() && REXCVAR_GET(gpu_cmdbuf_watch)) {
-    // Diagnostic: report when the live texture fetch constants a replay inherits change between runs, and when
-    // the palette stream does, so a face or pose that stays still can be told from a binding that never moves.
-    const auto* live = Guest<D3DDevice>(device);
-    const uint64_t fetch_hash = XXH3_64bits(&live->m_Constants.Fetch[0], sizeof(guest::FetchConstant) * 26);
-    const uint32_t palette = live->m_Constants.Fetch[30].dword[4];
-    static std::unordered_map<uint32_t, std::pair<uint64_t, uint32_t>> last;
-    static std::atomic<int> budget{200};
-    std::lock_guard lock(g_mutex);
-    auto& l = last[buffer];
-    if ((l.first != fetch_hash || l.second != palette) && budget.fetch_sub(1) > 0) {
-      REXGPU_INFO("[gpu] run {:#010x} frame {}: live texture fetches {:#018x}{}, palette {:#010x}{}", buffer,
-                  ae::gpu::FrameIndex(), fetch_hash, l.first != fetch_hash ? " (changed)" : "", palette,
-                  l.second != palette ? " (changed)" : "");
-    }
-    l = {fetch_hash, palette};
-  }
   // The avatar's bone palette (stream 3, fetch constant 92) is CPU-written every frame, so the
   // half the live device points at is dirtied before the replay reads it.
   {
@@ -292,12 +264,6 @@ void Run(PPCContext& ctx, uint8_t* base, uint32_t device, uint32_t buffer, uint3
     if (palette && bytes) memory::MarkDirty(palette & 0x1FFFFFFF, bytes);
   }
   for (const Entry& e : *entries) {
-    if (Tracing()) {
-      const auto* live = Guest<D3DDevice>(device);
-      REXGPU_INFO("[gpu]   entry {} tags {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} live fetch30 {:#010x} {:#010x}",
-                  e.clear ? "clear" : "draw", e.tags[0], e.tags[1], e.tags[2], e.tags[3], e.tags[4],
-                  uint32_t(live->m_Constants.Fetch[30].dword[4]), uint32_t(live->m_Constants.Fetch[30].dword[5]));
-    }
     const std::vector<uint8_t> merged = Merge(device, e, select);
     const auto* merged_device = reinterpret_cast<const D3DDevice*>(merged.data());
     if (e.clear) {

@@ -2,7 +2,6 @@
 // so the runtime's own header writes land before the range is read back out of the header.
 
 #include "gpu/gpu_memory.h"
-#include "gpu/gpu_burst_timing.h"
 
 #include <algorithm>
 #include <array>
@@ -125,7 +124,6 @@ int ResourceRanges(uint32_t resource_address, uint32_t (&base)[2], uint32_t (&si
 }  // namespace
 
 void Register(uint32_t base, uint32_t size) {
-  BurstTiming timing(10);
   if (!base || !size) return;
   std::lock_guard lock(g_mutex);
   // A header for a piece of a registered block keeps the block registered; only a range that does not fit inside

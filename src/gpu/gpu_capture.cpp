@@ -12,19 +12,15 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <filesystem>
 #include <string>
-#include <vector>
 
 #include <rex/cvar.h>
-#include <rex/filesystem.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
 #include <rex/system/kernel_state.h>
 #include <rex/types.h>
-#include <rex/ui/presenter.h>
 
 #include "gpu/gpu.h"
 #include "gpu/gpu_cmdbuf.h"
@@ -32,14 +28,8 @@
 #include "gpu/guest/d3d_device.h"
 #include "gpu/precise_sleep.h"
 
-REXCVAR_DEFINE_INT32(gpu_trace_frame, -1, "GPU", "Log every captured record during this frame number, -1 = off");
-REXCVAR_DEFINE_INT32(gpu_trace_frames, 1, "GPU", "How many consecutive frames a trace covers from gpu_trace_frame");
 REXCVAR_DEFINE_INT32(gpu_fps_cap, 60, "GPU", "Pace D3DDevice_Swap to this many frames per second; 0 leaves the title unpaced");
 REXCVAR_DEFINE_BOOL(gpu_fps_counter, false, "GPU", "Show the guest frame rate in the window title");
-REXCVAR_DEFINE_INT32(gpu_trace_at_second, 0, "GPU",
-                     "Trace the first frame presented after this many seconds, for screens reached by hand; 0 = off");
-REXCVAR_DEFINE_INT32(gpu_dump_every, 0, "GPU",
-                     "Write every N-th presented frame to gpu_dumps/frame_<n>.bmp next to the exe, at most 60 files; 0 = off");
 
 extern "C" REX_FUNC(__imp__sub_92124920);
 extern "C" REX_FUNC(__imp__sub_92123790);
@@ -88,11 +78,6 @@ Rect ClampRect(Rect r, uint32_t width, uint32_t height) {
   return r;
 }
 
-bool Tracing() {
-  const int32_t frame = REXCVAR_GET(gpu_trace_frame);
-  return frame >= 0 && ae::gpu::FrameIndex() == uint64_t(frame);
-}
-
 void Once(std::atomic<bool>& flag, const char* what, uint32_t value) {
   if (!flag.exchange(true)) REXGPU_ERROR("[gpu] {} ({:#x})", what, value);
 }
@@ -116,60 +101,6 @@ bool TileUnion(const D3DDevice* device, Rect& out) {
 // Set while BeginTiling 0x9211F940 runs, so its own ClearF is recognised.
 thread_local bool t_in_begin_tiling = false;
 
-// 24-bit bottom-up BMP from the RGBX readback.
-bool WriteBmp(const std::filesystem::path& path, const rex::ui::RawImage& image) {
-  const uint32_t w = image.width, h = image.height;
-  const uint32_t row = (w * 3 + 3) & ~3u;
-  const uint32_t pixels = row * h;
-  uint8_t header[54] = {'B', 'M'};
-  auto put = [&](size_t at, uint32_t v) {
-    for (int i = 0; i < 4; ++i) header[at + i] = uint8_t(v >> (8 * i));
-  };
-  put(2, 54 + pixels);
-  put(10, 54);
-  put(14, 40);
-  put(18, w);
-  put(22, h);
-  header[26] = 1;
-  header[28] = 24;
-  put(34, pixels);
-  FILE* f = std::fopen(path.string().c_str(), "wb");
-  if (!f) return false;
-  std::fwrite(header, 1, sizeof(header), f);
-  std::vector<uint8_t> line(row, 0);
-  for (uint32_t y = 0; y < h; ++y) {
-    const uint8_t* src = image.data.data() + size_t(h - 1 - y) * image.stride;
-    for (uint32_t x = 0; x < w; ++x) {
-      line[x * 3 + 0] = src[x * 4 + 2];
-      line[x * 3 + 1] = src[x * 4 + 1];
-      line[x * 3 + 2] = src[x * 4 + 0];
-    }
-    std::fwrite(line.data(), 1, row, f);
-  }
-  std::fclose(f);
-  return true;
-}
-
-// gpu_dump_every: reads back the frame queued last and writes it, stopping after 60 files.
-void MaybeDumpFrame(uint64_t frame) {
-  static std::atomic<int> s_written{0};
-  const int32_t every = REXCVAR_GET(gpu_dump_every);
-  if (every <= 0 || frame % uint64_t(every) != 0 || s_written.load() >= 60) return;
-  rex::ui::RawImage image;
-  if (!ae::gpu::ReadbackFrontBuffer(image) || !image.width || !image.height) {
-    REXGPU_WARN("[gpu] frame {} dump: readback failed", frame);
-    return;
-  }
-  const auto dir = rex::filesystem::GetExecutableFolder() / "gpu_dumps";
-  std::error_code ec;
-  std::filesystem::create_directories(dir, ec);
-  const auto path = dir / ("frame_" + std::to_string(frame) + ".bmp");
-  if (WriteBmp(path, image)) {
-    s_written.fetch_add(1);
-    REXGPU_INFO("[gpu] frame {} dumped to {} ({}x{})", frame, path.string(), image.width, image.height);
-  }
-}
-
 }  // namespace
 
 namespace ae::gpu::capture {
@@ -190,11 +121,6 @@ ClearRecord MakeClear(const D3DDevice* device, const ClearArgs& a) {
   record.depth_value = a.z;
   record.stencil_value = a.stencil & 0xFF;
   record.rects = a.rects;
-  if (Tracing()) {
-    REXGPU_INFO("[gpu] clear flags {:#x} colour {} {} {} {} z {} stencil {} rects {} -> rt0 {} depth {}", a.flags,
-                a.color[0], a.color[1], a.color[2], a.color[3],
-                record.depth_value, record.stencil_value, record.rects.size(), record.color[0].id, record.depth.id);
-  }
   return record;
 }
 
@@ -271,7 +197,7 @@ REX_HOOK_RAW(sub_9211F940) {
     std::lock_guard lock(s_seen_mutex);
     fresh = s_seen.insert(shape).second;
   }
-  if (fresh || Tracing()) {
+  if (fresh) {
     REXGPU_INFO("[gpu] tiling bracket: {} tiles over ({},{})-({},{}), rt0 {:#010x} depth {:#010x} flags {:#x}", count,
                 tiles.left, tiles.top, tiles.right, tiles.bottom, uint32_t(d->render_targets[0]),
                 uint32_t(d->depth_stencil), ctx.r4.u32);
@@ -352,13 +278,6 @@ REX_HOOK_RAW(sub_92123790) {
       record.clear_z = float(ctx.f1.f64);
       record.clear_stencil = *Guest<rex::be<uint32_t>>(ctx.r1.u32 + 0x5C) & 0xFF;
     }
-    if (Tracing()) {
-      REXGPU_INFO("[gpu] resolve flags {:#x} host {} ({},{})-({},{}) -> host {} at ({},{}) scale {} clear {} depth {} z {} "
-                  "stencil {}",
-                  flags, record.source.id, record.source_rect.left, record.source_rect.top, record.source_rect.right,
-                  record.source_rect.bottom, record.dest.id, record.dest_x, record.dest_y, record.scale,
-                  record.clear_color, record.clear_depth_target.id, record.clear_z, record.clear_stencil);
-    }
     ae::gpu::Submit(std::move(record));
   }
   __imp__sub_92123790(ctx, base);
@@ -371,16 +290,6 @@ REX_HOOK_RAW(sub_9211DA80) {
   using Clock = std::chrono::steady_clock;
   static const bool raised = (ae::thread::RaiseGuestThread(), true);
   (void)raised;
-  // A time-armed trace picks the frame after the deadline, so the owner can navigate to the screen first.
-  if (const int32_t at = REXCVAR_GET(gpu_trace_at_second); at > 0) {
-    static const Clock::time_point start = Clock::now();
-    static bool armed = false;
-    if (!armed && Clock::now() - start >= std::chrono::seconds(at)) {
-      armed = true;
-      REXCVAR_SET(gpu_trace_frame, int32_t(ae::gpu::FrameIndex() + 1));
-      REXGPU_INFO("[gpu] trace armed for frame {}", ae::gpu::FrameIndex() + 1);
-    }
-  }
   const int32_t cap = REXCVAR_GET(gpu_fps_cap);
   if (cap > 0) {
     const auto kFrame = std::chrono::nanoseconds(1'000'000'000 / cap);
@@ -412,7 +321,6 @@ REX_HOOK_RAW(sub_9211DA80) {
   ae::gpu::SwapRecord record;
   record.front = tracker::Texture(ctx.r4.u32);
   record.frame = frame;
-  if (Tracing()) REXGPU_INFO("[gpu] swap front host {}", record.front.id);
   if (frame == 1 || frame % 600 == 0) {
     REXGPU_DEBUG("[gpu] swap {} front {:#010x} host {} {}x{}", frame, ctx.r4.u32, record.front.id, record.front.width,
                 record.front.height);
@@ -420,6 +328,5 @@ REX_HOOK_RAW(sub_9211DA80) {
   ae::gpu::WaitForWarmup();
   ae::gpu::Submit(std::move(record));
   ae::gpu::EndFrame();
-  MaybeDumpFrame(frame);
   __imp__sub_9211DA80(ctx, base);
 }

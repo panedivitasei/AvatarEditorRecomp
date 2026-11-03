@@ -1,5 +1,4 @@
 #include "gpu/gpu_shader_pack.h"
-#include "gpu/gpu_burst_timing.h"
 
 #include <algorithm>
 #include <atomic>
@@ -316,7 +315,6 @@ std::filesystem::path ShaderPackSidecar(const char* name) {
 std::string ShaderPackName() { return g_source ? g_source->name : std::string("none"); }
 
 const ShaderEntry* FindShader(ShaderStage stage, uint64_t runtime_hash, uint64_t fp2) {
-  BurstTiming timing(15);
   if (!g_source) return nullptr;
   return g_source->Find(stage, g_source->uses_fp2 ? fp2 : runtime_hash);
 }

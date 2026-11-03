@@ -27,7 +27,6 @@
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/logging.h>
-#include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 
 #include "gpu/gpu.h"
@@ -52,9 +51,6 @@ REXCVAR_DEFINE_INT32(gpu_msaa, 0, "GPU",
                      "Host MSAA samples for the game's render targets: 0 = the game's own, 2, 4 or 8; read at device "
                      "creation");
 REXCVAR_DEFINE_STRING(gpu_adapter, "", "GPU", "Adapter name substring; empty picks plume's default adapter");
-REXCVAR_DEFINE_BOOL(gpu_burst_profile, false, "GPU", "Report inclusive capture costs on streaming frames");
-REXCVAR_DEFINE_BOOL(gpu_host_profile, false, "GPU", "Measure D3D12 GPU stages and presentation waits");
-REXCVAR_DEFINE_BOOL(gpu_draw_profile, false, "GPU", "Rank GPU shader pairs using one sampled frame in thirty");
 REXCVAR_DEFINE_BOOL(gpu_constant_reuse, true, "GPU", "Reuse identical float constant uploads within a packet");
 REXCVAR_DEFINE_BOOL(gpu_pipeline_warmup, true, "GPU",
                     "Record every draw pipeline beside the shader pack and compile the recorded set at start-up");
@@ -389,8 +385,8 @@ struct PersistentRange {
 constexpr uint64_t kStatsWindow = 300;
 std::atomic<uint64_t> g_capture_ns{0};
 std::atomic<uint64_t> g_frame_capture_ns{0};
-std::atomic<uint64_t> g_frame_guest_ns[16] = {};
-std::atomic<uint32_t> g_frame_guest_count[16] = {};
+std::atomic<uint64_t> g_frame_guest_ns[2] = {};
+std::atomic<uint32_t> g_frame_guest_count[2] = {};
 // Guest frame pacing for the stats window: Swap-to-Swap interval sum and max, frames over 20 ms, cap sleep, queue wait.
 std::mutex g_evicted_mutex;
 std::vector<uint64_t> g_evicted;  // keys dropped by EvictPersistent or found missing at Place
@@ -423,7 +419,6 @@ class Backend {
   void Execute(const ClearRecord& r);
   void Execute(const ResolveRecord& r);
   void Execute(const SwapRecord& r);
-  void Execute(const ReadbackRecord& r);
   void Execute(const ReleaseRecord& r);
   void Execute(const TextureUploadRecord&) {}
   void Execute(const WritebackRecord& r);
@@ -485,18 +480,6 @@ class Backend {
 
   void BeginList();
   void SubmitAndWait();
-  void MarkGpu(uint8_t category, const DrawRecord* draw = nullptr);
-  void CollectGpu();
-  struct GpuTiming {
-    std::unique_ptr<plume::RenderQueryPool> queries;
-    std::vector<uint8_t> categories;
-    std::vector<std::pair<uint64_t, uint64_t>> shaders;
-    bool pending = false;
-    bool sampled = false;
-  } gpu_timing_[kFramesInFlight];
-  struct DrawGpuCost { uint64_t ns = 0, draws = 0; };
-  std::map<std::pair<uint64_t, uint64_t>, DrawGpuCost> draw_gpu_costs_;
-  uint32_t draw_gpu_frames_ = 0;
   void WaitAll();
   bool BuildSwapChainTargets();
   void RebuildSwapChain();
@@ -551,12 +534,6 @@ class Backend {
   std::unordered_map<uint32_t, HostResource> resources_;
   uint32_t last_presented_ = kNoResource;
 
-  std::unique_ptr<plume::RenderTexture> readback_target_;
-  std::unique_ptr<plume::RenderFramebuffer> readback_framebuffer_;
-  std::unique_ptr<plume::RenderBuffer> readback_buffer_;
-  uint32_t readback_w_ = 0;
-  uint32_t readback_h_ = 0;
-
   // Draws.
   bool draws_ready_ = false;
   std::unique_ptr<plume::RenderPipelineLayout> draw_layout_;
@@ -609,8 +586,6 @@ class Backend {
     uint64_t frames = 0, draws = 0, uploads = 0, upload_bytes = 0;
     uint64_t prepare_ns = 0, record_ns = 0, present_ns = 0, pipeline_ns = 0;
     uint64_t gpu_wait_ns = 0;  // fence waits for a slot whose GPU work has not finished
-    uint64_t acquire_ns = 0, submit_ns = 0, dxgi_ns = 0;
-    uint64_t gpu_ns[5] = {}, gpu_frames = 0;
     uint64_t constant_reuses = 0, constant_uploads = 0;
     uint64_t pipelines_created = 0, shaders_created = 0;
   } stats_;
@@ -651,8 +626,6 @@ bool Backend::Create(rex::ui::Window* window) {
   for (uint32_t i = 0; i < kFramesInFlight; ++i) {
     lists_[i] = queue_->createCommandList();
     fences_[i] = device_->createCommandFence();
-    if (REXCVAR_GET(gpu_host_profile) || REXCVAR_GET(gpu_draw_profile))
-      gpu_timing_[i].queries = device_->createQueryPool(REXCVAR_GET(gpu_draw_profile) ? 4096 : 512);
     acquire_semaphores_[i] = device_->createCommandSemaphore();
   }
   // One back buffer beyond the frames in flight, so acquiring never waits on scanout.
@@ -860,15 +833,11 @@ void Backend::Destroy() {
     WaitAll();
   }
   overlay_.Destroy();
-  for (auto& timing : gpu_timing_) timing.queries.reset();
   if (draws_executed_ || draws_dropped_) {
     REXGPU_INFO("[gpu] draws executed {}, dropped {}; sampler slots {}/{}, evictions {}, table fallbacks {}",
                 draws_executed_, draws_dropped_, sampler_slot_count_, sampler_capacity_, sampler_evictions_,
                 sampler_set_fallbacks_);
   }
-  readback_framebuffer_.reset();
-  readback_target_.reset();
-  readback_buffer_.reset();
   if (!compile_threads_.empty()) {
     {
       std::lock_guard lock(compile_mutex_);
@@ -956,47 +925,9 @@ void Backend::BeginList() {
     submitted_[slot_] = false;
     ResetUploads(slot_);
   }
-  CollectGpu();
   lists_[slot_]->begin();
   list_open_ = true;
   bound_ = nullptr;
-}
-
-void Backend::CollectGpu() {
-  auto& timing = gpu_timing_[slot_];
-  if (!timing.queries || !timing.pending) return;
-  timing.queries->queryResults();
-  const auto* ns = timing.queries->getResults();
-  for (size_t i = 1; i < timing.categories.size(); ++i) {
-    const auto category = timing.categories[i - 1];
-    if (category < 5 && ns[i] >= ns[i - 1]) stats_.gpu_ns[category] += ns[i] - ns[i - 1];
-    if (timing.sampled && timing.shaders[i - 1].first && ns[i] >= ns[i - 1]) {
-      auto& cost = draw_gpu_costs_[timing.shaders[i - 1]];
-      cost.ns += ns[i] - ns[i - 1];
-      ++cost.draws;
-    }
-  }
-  if (timing.sampled) ++draw_gpu_frames_;
-  ++stats_.gpu_frames;
-  timing.categories.clear();
-  timing.shaders.clear();
-  timing.pending = false;
-}
-
-// Timestamp adjacent stage boundaries; query storage is reused only after the slot fence completes.
-void Backend::MarkGpu(uint8_t category, const DrawRecord* draw) {
-  auto& timing = gpu_timing_[slot_];
-  if (!timing.queries) return;
-  BeginList();
-  if (timing.categories.empty()) timing.sampled = REXCVAR_GET(gpu_draw_profile) && frame_counter_ % 30 == 0;
-  if (!timing.categories.empty() && timing.categories.back() == category && !(timing.sampled && draw)) return;
-  const uint32_t capacity = REXCVAR_GET(gpu_draw_profile) ? 4096 : 512;
-  if (timing.categories.size() >= capacity - (category == 5 ? 0 : 1)) return;
-  lists_[slot_]->writeTimestamp(timing.queries.get(), uint32_t(timing.categories.size()));
-  timing.categories.push_back(category);
-  timing.shaders.emplace_back(draw && timing.sampled && draw->vs ? draw->vs->runtime_hash : 0,
-                              draw && timing.sampled && draw->ps ? draw->ps->runtime_hash : 0);
-  if (category == 5) timing.pending = true;
 }
 
 // Closes the open list, runs it and waits, leaving the slot free for the next BeginList.
@@ -1332,7 +1263,6 @@ void Backend::Execute(const ResolveRecord& r) {
 }
 
 void Backend::Execute(const SwapRecord& r) {
-  using Clock = std::chrono::steady_clock;
   BeginList();
   HostResource* front = Get(r.front);
   if (resize_requested_.exchange(false, std::memory_order_acq_rel) || swap_chain_->needsResize()) {
@@ -1341,7 +1271,6 @@ void Backend::Execute(const SwapRecord& r) {
   }
   auto* list = lists_[slot_].get();
   uint32_t index = 0;
-  const auto acquire_start = Clock::now();
   bool presentable = !swap_framebuffers_.empty() &&
                      swap_chain_->acquireTexture(acquire_semaphores_[slot_].get(), &index);
   if (!presentable && !swap_framebuffers_.empty()) {
@@ -1351,7 +1280,6 @@ void Backend::Execute(const SwapRecord& r) {
     presentable = !swap_framebuffers_.empty() &&
                   swap_chain_->acquireTexture(acquire_semaphores_[slot_].get(), &index);
   }
-  stats_.acquire_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - acquire_start).count();
   if (presentable) {
     plume::RenderTexture* back = swap_chain_->getTexture(index);
     plume::RenderFramebuffer* back_framebuffer = swap_framebuffers_[index].get();
@@ -1383,19 +1311,14 @@ void Backend::Execute(const SwapRecord& r) {
     Unbind();
     list->barriers(plume::RenderBarrierStage::GRAPHICS,
                    plume::RenderTextureBarrier(back, plume::RenderTextureLayout::PRESENT));
-    MarkGpu(5);
     list->end();
     const plume::RenderCommandList* lists[] = {list};
     plume::RenderCommandSemaphore* waits[] = {acquire_semaphores_[slot_].get()};
     plume::RenderCommandSemaphore* signals[] = {render_semaphores_[index].get()};
-    const auto submit_start = Clock::now();
     queue_->executeCommandLists(lists, 1, waits, 1, signals, 1, fences_[slot_].get());
-    stats_.submit_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - submit_start).count();
-    const auto present_start = Clock::now();
     const int vsync = g_vsync_request.exchange(-1, std::memory_order_acq_rel);
     if (vsync >= 0) swap_chain_->setVsyncEnabled(vsync != 0);
     if (!swap_chain_->present(index, signals, 1)) resize_requested_.store(true, std::memory_order_release);
-    stats_.dxgi_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - present_start).count();
   } else {
     FlushTransitions();
     Unbind();
@@ -1529,56 +1452,6 @@ void Backend::Execute(const WritebackRecord& r) {
     buffer->unmap();
   }
   finish();
-}
-
-void Backend::Execute(const ReadbackRecord& r) {
-  ReadbackResult result;
-  auto it = resources_.find(last_presented_);
-  if (it != resources_.end()) {
-    HostResource& front = it->second;
-    const uint32_t w = front.width;
-    const uint32_t h = front.height;
-    const uint32_t row_texels = (w + 63) & ~63u;  // 256-byte rows for the buffer footprint
-    if (readback_w_ != w || readback_h_ != h) {
-      SubmitAndWait();
-      readback_framebuffer_.reset();
-      readback_target_ = device_->createTexture(plume::RenderTextureDesc::ColorTarget(w, h, kReadbackFormat));
-      const plume::RenderTexture* attachments[1] = {readback_target_.get()};
-      if (readback_target_) readback_framebuffer_ = device_->createFramebuffer(plume::RenderFramebufferDesc(attachments, 1));
-      readback_buffer_ = device_->createBuffer(plume::RenderBufferDesc::ReadbackBuffer(uint64_t(row_texels) * h * 4));
-      readback_w_ = w;
-      readback_h_ = h;
-    }
-    if (readback_target_ && readback_framebuffer_ && readback_buffer_) {
-      BeginList();
-      auto* list = lists_[slot_].get();
-      Blit(front, plume::RenderRect(0, 0, int32_t(w), int32_t(h)), readback_target_.get(),
-           readback_framebuffer_.get(), kReadbackFormat, plume::RenderRect(0, 0, int32_t(w), int32_t(h)), 1.0f, false);
-      Unbind();
-      list->barriers(plume::RenderBarrierStage::COPY,
-                     plume::RenderTextureBarrier(readback_target_.get(), plume::RenderTextureLayout::COPY_SOURCE));
-      list->copyTextureRegion(
-          plume::RenderTextureCopyLocation::PlacedFootprint(readback_buffer_.get(), kReadbackFormat, w, h, 1, row_texels),
-          plume::RenderTextureCopyLocation::Subresource(readback_target_.get()));
-      SubmitAndWait();
-      if (const auto* bytes = static_cast<const uint8_t*>(readback_buffer_->map())) {
-        result.width = w;
-        result.height = h;
-        result.rgbx.resize(size_t(w) * h * 4);
-        for (uint32_t y = 0; y < h; ++y) {
-          uint8_t* dst = result.rgbx.data() + size_t(y) * w * 4;
-          std::memcpy(dst, bytes + size_t(y) * row_texels * 4, size_t(w) * 4);
-          for (uint32_t x = 0; x < w; ++x) dst[x * 4 + 3] = 0xFF;
-        }
-        readback_buffer_->unmap();
-        result.ok = true;
-      }
-    }
-  }
-  std::lock_guard lock(r.slot->mutex);
-  r.slot->result = std::move(result);
-  r.slot->done = true;
-  r.slot->done_cv.notify_all();
 }
 
 // ------------------------------------------------------------------------------------------------ draws
@@ -2510,7 +2383,6 @@ void Backend::Execute(Packet& packet) {
     }
   }
   frame_cost_.specialize_ns = ns(t0, Clock::now());
-  if (frame_packet) MarkGpu(0);
   if (draws_ready_) PrepareUploads(packet);
   const auto t1 = Clock::now();
   stats_.prepare_ns += ns(t0, t1);
@@ -2523,8 +2395,6 @@ void Backend::Execute(Packet& packet) {
     }
     const auto start = Clock::now();
     const bool swap = std::holds_alternative<SwapRecord>(record);
-    if (frame_packet) MarkGpu(swap ? 4 : std::holds_alternative<ResolveRecord>(record) ? 3 :
-                             std::holds_alternative<ClearRecord>(record) ? 2 : 1, std::get_if<DrawRecord>(&record));
     Execute(record);
     if (swap) constant_uploads_.clear();
     (swap ? stats_.present_ns : stats_.record_ns) += ns(start, Clock::now());
@@ -2551,26 +2421,6 @@ void Backend::ReportStats() {
   ++stats_.frames;
   if (stats_.frames < kStatsWindow) return;
   const double f = double(stats_.frames);
-  if (draw_gpu_frames_) {
-    std::vector<std::pair<std::pair<uint64_t, uint64_t>, DrawGpuCost>> ranked(draw_gpu_costs_.begin(), draw_gpu_costs_.end());
-    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
-    for (size_t i = 0; i < std::min<size_t>(ranked.size(), 15); ++i) {
-      const auto& [shaders, cost] = ranked[i];
-      REXGPU_DEBUG("[gpu] draw profile #{}: VS {:016X} PS {:016X}: {:.2f} ms/frame, {:.1f} draws/frame ({} sampled frames)",
-                  i + 1, shaders.first, shaders.second, cost.ns / double(draw_gpu_frames_) / 1e6,
-                  cost.draws / double(draw_gpu_frames_), draw_gpu_frames_);
-    }
-    draw_gpu_costs_.clear();
-    draw_gpu_frames_ = 0;
-  }
-  if (REXCVAR_GET(gpu_host_profile)) {
-    const double g = double(std::max<uint64_t>(stats_.gpu_frames, 1)) * 1e6;
-    REXGPU_DEBUG("[gpu] host profile: acquire {:.2f} ms, submit {:.2f} ms, Present {:.2f} ms; "
-                "GPU uploads {:.2f}, draws {:.2f}, clears {:.2f}, resolves {:.2f}, final blit {:.2f} ms ({} frames)",
-                stats_.acquire_ns / f / 1e6, stats_.submit_ns / f / 1e6, stats_.dxgi_ns / f / 1e6,
-                stats_.gpu_ns[0] / g, stats_.gpu_ns[1] / g, stats_.gpu_ns[2] / g,
-                stats_.gpu_ns[3] / g, stats_.gpu_ns[4] / g, stats_.gpu_frames);
-  }
   REXGPU_DEBUG("[gpu] float uploads/frame: {:.0f} uploaded, {:.0f} reused ({:.2f} MB avoided)",
               stats_.constant_uploads / f, stats_.constant_reuses / f, stats_.constant_reuses * 4096.0 / f / 1048576.0);
   const uint64_t capture_ns = g_capture_ns.exchange(0);
@@ -2622,13 +2472,8 @@ bool EndsWithSwap(const Packet& packet) {
   return !packet.records.empty() && std::holds_alternative<SwapRecord>(packet.records.back());
 }
 
-void FailReadbacks(Packet& packet) {
+void FailWritebacks(Packet& packet) {
   for (auto& record : packet.records) {
-    if (auto* readback = std::get_if<ReadbackRecord>(&record)) {
-      std::lock_guard lock(readback->slot->mutex);
-      readback->slot->done = true;
-      readback->slot->done_cv.notify_all();
-    }
     if (auto* writeback = std::get_if<WritebackRecord>(&record)) {
       std::lock_guard lock(writeback->slot->mutex);
       writeback->slot->done = true;
@@ -2655,7 +2500,7 @@ void RenderThread(Renderer* r) {
     }
   }
   std::lock_guard lock(r->mutex);
-  for (auto& packet : r->packets) FailReadbacks(packet);
+  for (auto& packet : r->packets) FailWritebacks(packet);
   r->packets.clear();
   r->queued_frames = 0;
   r->guest_cv.notify_all();
@@ -2667,7 +2512,7 @@ void Push(Renderer* r, Packet packet, bool wait_for_room) {
     r->guest_cv.wait(lock, [r] { return r->stopping || r->queued_frames < kMaxQueuedFrames; });
   }
   if (r->stopping) {
-    FailReadbacks(packet);
+    FailWritebacks(packet);
     return;
   }
   if (EndsWithSwap(packet)) ++r->queued_frames;
@@ -2762,12 +2607,10 @@ void WaitForWarmup() {
 }
 
 void AddGuestTiming(int kind, uint64_t nanoseconds) {
-  if (kind < 0 || kind >= 16) return;
+  if (kind < 0 || kind >= 2) return;
   g_frame_guest_ns[kind].fetch_add(nanoseconds, std::memory_order_relaxed);
   g_frame_guest_count[kind].fetch_add(1, std::memory_order_relaxed);
 }
-
-bool BurstTimingEnabled() { return REXCVAR_GET(gpu_burst_profile); }
 
 bool AnyEvicted() { return g_evicted_any.load(std::memory_order_acquire); }
 
@@ -2824,25 +2667,6 @@ void EndFrame() {
   const uint64_t capture = g_frame_capture_ns.exchange(0);
   const uint64_t translate = g_frame_guest_ns[0].exchange(0), decode = g_frame_guest_ns[1].exchange(0);
   const uint32_t translations = g_frame_guest_count[0].exchange(0), decodes = g_frame_guest_count[1].exchange(0);
-  double burst[16] = {};
-  uint32_t calls[16] = {};
-  for (int i = 2; i < 16; ++i) {
-    burst[i] = g_frame_guest_ns[i].exchange(0) / 1e6;
-    calls[i] = g_frame_guest_count[i].exchange(0);
-  }
-  if (BurstTimingEnabled() && (capture > 20'000'000 || decodes >= 100)) {
-    REXGPU_DEBUG("[gpu] burst frame {}: capture {:.2f} ms; indices {:.2f} ({}), streams {:.2f} ({}), "
-                "describe {:.2f} ({}), texture key {:.2f} ({}), resource lookup {:.2f} ({}), "
-                "shader lookup {:.2f} ({}), preparation finish {:.2f} ({}), texture binding {:.2f} ({}), "
-                "registration {:.2f} ({}); inclusive ms, nested costs overlap",
-                frame, capture / 1e6, burst[2], calls[2], burst[3], calls[3], burst[4], calls[4],
-                burst[5], calls[5], burst[6], calls[6], burst[7], calls[7], burst[8], calls[8],
-                burst[9], calls[9], burst[10], calls[10]);
-    REXGPU_DEBUG("[gpu] burst streams {}: copy {:.2f} ms ({}), query {:.2f} ms ({}), "
-                "unowned checks {:.2f} ms ({}), {:.3f} MB copied",
-                frame, burst[11], calls[11], burst[12], calls[12], burst[13], calls[13], burst[14]);
-    REXGPU_DEBUG("[gpu] burst shader pack {}: {:.2f} ms ({})", frame, burst[15], calls[15]);
-  }
   if (capture > kSlowFrameNs) {
     REXGPU_DEBUG("[gpu] slow guest frame {}: capture {:.1f} ms, runtime translation {:.1f} ms ({}), texture decode "
                 "{:.1f} ms ({})",
@@ -2888,24 +2712,6 @@ void WritebackBeforeLock(uint32_t texture_address) {
   Push(r, std::move(packet), false);
   std::unique_lock lock(slot->mutex);
   slot->done_cv.wait(lock, [&] { return slot->done; });
-}
-
-bool ReadbackFrontBuffer(rex::ui::RawImage& image) {
-  Renderer* r = g_renderer;
-  if (!r) return false;
-  // Queued ahead of the frame being built, so it reads the last presented frame and nothing recorded since.
-  auto slot = std::make_shared<ReadbackSlot>();
-  Packet packet;
-  packet.records.push_back(ReadbackRecord{slot});
-  Push(r, std::move(packet), false);
-  std::unique_lock lock(slot->mutex);
-  slot->done_cv.wait(lock, [&] { return slot->done; });
-  if (!slot->result.ok) return false;
-  image.width = slot->result.width;
-  image.height = slot->result.height;
-  image.stride = size_t(image.width) * 4;
-  image.data = std::move(slot->result.rgbx);
-  return true;
 }
 
 }  // namespace ae::gpu

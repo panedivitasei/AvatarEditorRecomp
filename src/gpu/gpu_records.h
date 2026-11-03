@@ -69,25 +69,6 @@ struct SwapRecord {
   uint64_t frame = 0;
 };
 
-// Filled by the host thread; the guest thread waits on it.
-struct ReadbackResult {
-  bool ok = false;
-  uint32_t width = 0;
-  uint32_t height = 0;
-  std::vector<uint8_t> rgbx;
-};
-
-struct ReadbackSlot {
-  std::mutex mutex;
-  std::condition_variable done_cv;
-  bool done = false;
-  ReadbackResult result;
-};
-
-struct ReadbackRecord {
-  std::shared_ptr<ReadbackSlot> slot;
-};
-
 // ---------------------------------------------------------------------------------------------------------------
 // Draws
 
@@ -301,10 +282,10 @@ struct WritebackRecord {
   std::shared_ptr<WritebackSlot> slot;
 };
 
-using Record = std::variant<ClearRecord, ResolveRecord, SwapRecord, ReadbackRecord, DrawRecord, ReleaseRecord,
+using Record = std::variant<ClearRecord, ResolveRecord, SwapRecord, DrawRecord, ReleaseRecord,
                             TextureUploadRecord, WritebackRecord>;
 
-// One queue item: the records since the last hand-off, ending at a Swap or a readback request.
+// One queue item: the records since the last hand-off, ending at a Swap or a writeback request.
 struct Packet {
   std::vector<Record> records;
 };

@@ -1,5 +1,4 @@
 #include "gpu/gpu_texture_decode.h"
-#include "gpu/gpu_burst_timing.h"
 #include "gpu/precise_sleep.h"
 
 #include <algorithm>
@@ -436,7 +435,6 @@ std::array<uint8_t, 4> ComposeSwizzle(HostFormat format, const std::array<uint8_
 }
 
 bool DescribeTexture(const xenos::xe_gpu_texture_fetch_t& fetch, GuestTextureDesc& out) {
-  BurstTiming timing(4);
   out = {};
   out.fetch = fetch;
   switch (fetch.dimension) {

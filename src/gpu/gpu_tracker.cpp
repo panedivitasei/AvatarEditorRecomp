@@ -1,5 +1,4 @@
 #include "gpu/gpu_tracker.h"
-#include "gpu/gpu_burst_timing.h"
 #include "gpu/gpu_resolve_cache.h"
 #include "gpu/gpu_texture_decode.h"
 
@@ -56,7 +55,6 @@ uint32_t g_next_id = 1;
 }  // namespace
 
 ResourceDesc Surface(uint32_t surface_address, ResourceKind kind) {
-  BurstTiming timing(6);
   if (!surface_address) return {};
   const auto* surface = Guest<guest::D3DSurface>(surface_address);
   // A texture-level surface keeps its parent texture where the EDRAM fields would be; it cannot be bound as a target.
@@ -107,7 +105,6 @@ void RegisterTiledSurface(uint32_t surface_address, uint32_t width, uint32_t hei
 }
 
 ResourceDesc Texture(uint32_t texture_address) {
-  BurstTiming timing(6);
   if (!texture_address) return {};
   const auto* texture = Guest<guest::D3DBaseTexture>(texture_address);
   xenos::xe_gpu_texture_fetch_t fetch;
