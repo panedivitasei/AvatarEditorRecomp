@@ -54,6 +54,7 @@
 #include <rex/system/xtypes.h>
 #include <rex/types.h>
 
+#include "ae_achievements.h"
 #include "avatars/closet.h"
 #include "marketplace.h"
 
@@ -572,6 +573,10 @@ u32 NetDll_XHttpSendRequest_entry(u32 caller, u32 request_handle, mapped_string 
     if (fetched) {
       REXKRNL_INFO("[xhttp] {} http://{}:{}{} -> {} ({} bytes)", verb, host, port, request_path,
                    status, body.size());
+    }
+    // Startup already fetches offers and Epix tiles; FindCategories is the store opening.
+    if (fetched && status == 200 && path.find("methodName=FindCategories") != std::string::npos) {
+      ae::achievements::Unlock(ae::achievements::kWindowShopper);
     }
     // A filtered list answers with the match count the search box shows.
     if (fetched && status == 200 && request_path.find("&Names=NameFilter&") != std::string::npos) {

@@ -49,6 +49,7 @@
 #include <rex/system/xtypes.h>
 #include <rex/types.h>
 
+#include "ae_achievements.h"
 #include "gpu/gpu.h"
 #include "avatars/asset_pack.h"
 #include "avatars/closet.h"
@@ -272,6 +273,7 @@ static bool LoadAvatarAssetPack() {
     }
   }
   avatars::GetCloset().Load(closet_dir);
+  ae::achievements::OnClosetCount(avatars::GetCloset().items().size());
   return g_avatar_asset_pack.is_loaded();
 }
 
@@ -857,6 +859,15 @@ u32 XamAvatarGetAssets_entry(ppc_ptr_t<X_AVATAR_METADATA> avatar_metadata_ptr,
     // manifest capture/cache or receives the custom-avatar substitution.
     const bool random_npc =
         static_cast<uint64_t>(metadata->owner_xuid) == kRandomAvatarXuid;
+    // Props animate as soon as they are worn, so trying one on is Strike a Pose.
+    if (!random_npc) {
+      for (const auto& comp : metadata->components) {
+        if (comp.matches(avatars::ComponentCategory::kProp)) {
+          ae::achievements::Unlock(ae::achievements::kStrikeAPose);
+          break;
+        }
+      }
+    }
     const bool is_player_build =
         !random_npc &&
         (!g_have_metadata ||
@@ -1141,6 +1152,10 @@ u32 XamAvatarSetManifest_entry(u32 user_index, u32 avatar_info_ptr, mapped_void 
     const auto* meta =
         REX_KERNEL_MEMORY()->TranslateVirtual<const avatars::X_AVATAR_METADATA*>(avatar_info_ptr);
     if (!meta->body_component.asset_id.is_zero()) {
+      if (g_have_metadata) {
+        ae::achievements::OnManifestSaved(
+            *reinterpret_cast<const avatars::X_AVATAR_METADATA*>(g_captured_metadata), *meta);
+      }
       std::memcpy(g_captured_metadata, meta, sizeof(g_captured_metadata));
       g_have_metadata = true;
       WriteHostFile(AvatarManifestPath(), g_captured_metadata, sizeof(g_captured_metadata));
@@ -1426,6 +1441,7 @@ bool MarketplaceInstallItem(const avatars::AssetId& id) {
   if (ok) {
     REXKRNL_INFO("[avatar] installed {} '{}' ({:#x} bytes, icon {})", id.to_string(), item.name,
                  item.blob.size(), png.empty() ? "none" : "yes");
+    ae::achievements::OnClosetCount(avatars::GetCloset().items().size());
   }
   return ok;
 }

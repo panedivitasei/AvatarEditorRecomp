@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,13 +20,23 @@
 #include <rex/platform.h>
 #include <rex/rex_app.h>
 #include <rex/system/function_dispatcher.h>
+#include <rex/input/input_system.h>
 #include <rex/system/xmemory.h>
+#include <rex/ui/imgui_dialog.h>
+#include <rex/ui/imgui_drawer.h>
+#include <rex/ui/overlay/achievement_notification.h>
+#include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
 
+#include <jmlive/jmlive.h>
+#include <rexglue_guide/guide.h>
+
+#include "ae_achievements.h"
 #include "catalog_search.h"
 #include "fault_diag.h"
 #include "gpu/gpu.h"
+#include "gpu/gpu_overlay.h"
 #include "input_hooks.h"
 
 #if REX_PLATFORM_WIN32
@@ -34,6 +45,7 @@
 
 REXCVAR_DECLARE(std::string, user_data_root);
 REXCVAR_DECLARE(std::string, log_file);
+REXCVAR_DECLARE(std::string, user_name);
 
 // Shader pack generation input: the pack builder recompiles the shaders
 // embedded in the decrypted image, and this is the only place the decrypted
@@ -144,10 +156,73 @@ class AvatareditorApp : public rex::ReXApp {
     key_feed_.window = window();
     window()->AddInputListener(&key_feed_, 0);
     ae_search::Get().Attach(window());
+    // Each present asks the UI thread for the next overlay frame; one request is queued at a time.
+    ae::gpu::SetOverlayFrameCallback([this] {
+      if (overlay_queued_.exchange(true)) return;
+      if (!app_context().CallInUIThread([this] {
+            overlay_queued_ = false;
+            DrawOverlay();
+          })) {
+        overlay_queued_ = false;
+      }
+    });
     // The device comes up here, before any guest thread exists, so the first Swap already has a swap chain.
     ae::gpu::Initialize(window());
     return true;
   }
+
+  // Detached mode: ImGui draws through the native renderer (gpu_overlay.h), for JMlive's Guide and the SDK overlays.
+  std::unique_ptr<rex::ui::ImmediateDrawer> OnCreateImmediateDrawer() override {
+    return ae::gpu::CreateOverlayDrawer();
+  }
+
+  void OnConfigureFonts(ImFontAtlas* atlas) override {
+    rex::ReXApp::OnConfigureFonts(atlas);
+    rexglue_guide::ConfigureFonts(atlas);
+  }
+
+  // JMlive's Guide (F10): the local profile from the start, Game Jolt sign-in from inside it.
+  void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
+    rex::ReXApp::OnCreateDialogs(drawer);
+    // Installed builds (JMinstaller sets user_data_root) have no debug (F3) or settings (F4) overlay.
+    if (!REXCVAR_GET(user_data_root).empty()) {
+      for (const char* bind : {"bind_debug_overlay", "bind_settings"}) {
+        if (rex::cvar::GetFlagSource(bind) == rex::cvar::Source::kDefault) rex::cvar::SetFlagByName(bind, "");
+      }
+    }
+    jmlive::Configure({.gamertag = REXCVAR_GET(user_name)});
+    rexglue_guide::Install(this, drawer,
+                           {.title_name = "Avatar Editor",
+                            .data_dir = rex::filesystem::GetUserFolder() / "JMstudios" / "userdata" / "JMlive",
+                            .on_quit = [this] { OnWindowCloseRequested(); },
+                            .immediate_drawer = immediate_drawer(),
+                            .config_file = rex::filesystem::GetExecutableFolder() / "avatareditor.toml"});
+  }
+
+  // Game input pauses while the Guide is up, and while ImGui holds the mouse as the SDK's own callback did.
+  void OnPostSetup() override {
+    auto* input = static_cast<rex::input::InputSystem*>(runtime()->input_system());
+    if (input && imgui_drawer()) {
+      input->SetActiveCallback(
+          [this] { return !rexglue_guide::IsOpen() && !imgui_drawer()->GetIO().WantCaptureMouse; });
+    }
+  }
+
+  // UI thread: one ImGui frame into the overlay the renderer draws at its next present.
+  void DrawOverlay() {
+    if (!imgui_drawer() || !window()) return;
+    rex::ui::AppUIDrawContext context(window()->GetActualPhysicalWidth(), window()->GetActualPhysicalHeight());
+    ae::gpu::BeginOverlayFrame();
+    imgui_drawer()->Draw(context);
+    ae::gpu::EndOverlayFrame();
+    // The Guide starts listening for unlocks on its first frame, so Hello waits for that.
+    if (!hello_unlocked_) {
+      hello_unlocked_ = true;
+      ae::achievements::Unlock(ae::achievements::kHello);
+    }
+  }
+  std::atomic<bool> overlay_queued_{false};
+  bool hello_unlocked_ = false;
 
   void OnWindowPixelSizeChanged(uint32_t, uint32_t) override { ae::gpu::RequestResize(); }
 
@@ -156,6 +231,7 @@ class AvatareditorApp : public rex::ReXApp {
     if (!close_queued_) {
       close_queued_ = true;
       if (!app_context().CallInUIThreadDeferred([this] {
+            ae::gpu::SetOverlayFrameCallback(nullptr);
             ae::gpu::Shutdown();
             window()->RequestClose();
           })) {
@@ -166,7 +242,17 @@ class AvatareditorApp : public rex::ReXApp {
     return false;
   }
 
-  void OnShutdown() override { ae::gpu::Shutdown(); }
+  void OnShutdown() override {
+    rexglue_guide::Shutdown();
+    ae::gpu::SetOverlayFrameCallback(nullptr);
+    ae::gpu::Shutdown();
+  }
+
+  // The Guide shows unlocks and the achievements page; the SDK's ImGui ones would double them.
+  std::unique_ptr<rex::ui::AchievementNotificationDialog> CreateAchievementNotificationDialog() override {
+    return nullptr;
+  }
+  std::unique_ptr<rex::ui::ImGuiDialog> CreateAchievementsOverlay() override { return nullptr; }
 
   // Separate input listener feeding the keystroke synthesizer
   // (input_hooks.cpp); the base app's own listener keeps the overlay binds.
@@ -198,9 +284,10 @@ class AvatareditorApp : public rex::ReXApp {
   };
   KeyFeed key_feed_;
 
-  // Image dump for the shader pack build (tools/shaderpack): write the
-  // mapped, decrypted image and quit before any guest code runs.
+  // Registers the editor's achievements, then the image dump for the shader pack build
+  // (tools/shaderpack): write the mapped, decrypted image and quit before any guest code runs.
   void OnPostLoadXexImage() override {
+    ae::achievements::Register();
     const std::string out = REXCVAR_GET(dump_image_path);
     if (out.empty()) {
       return;

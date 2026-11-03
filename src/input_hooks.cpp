@@ -27,6 +27,7 @@
 #include <rex/ui/virtual_key.h>
 
 #include "input_hooks.h"
+#include <rexglue_guide/guide.h>
 
 namespace {
 
@@ -135,6 +136,8 @@ namespace ae_input {
 
 void OnHostKey(VirtualKey key, bool down, bool shift, bool ctrl, bool alt) {
   std::lock_guard<std::mutex> lock(g_mutex);
+  // The Guide reads the PC keyboard itself while it is up.
+  if (down && rexglue_guide::IsOpen()) return;
   if (down) {
     for (const PadBind& bind : kPadBinds) {
       if (!BindMatches(QueryBind(bind.cvar_name), key, shift, ctrl, alt)) continue;
@@ -211,7 +214,7 @@ REX_HOOK_RAW(__imp__XamInputGetKeystrokeEx) {
     }
   }
 
-  if (!keystroke_ptr) return;
+  if (!keystroke_ptr || rexglue_guide::IsOpen()) return;
   if ((flags & 0xFF) && (flags & 0x01) == 0) return;  // gamepad queries only
 
   QueuedStroke stroke;

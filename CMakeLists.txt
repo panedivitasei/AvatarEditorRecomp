@@ -22,6 +22,8 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 file(GLOB AVATAR_LIB_SOURCES src/kernel/xam/avatars/*.cpp)
 set(AVATAREDITOR_SOURCES
     src/main.cpp
+    src/ae_achievements.cpp
+    src/content_hooks.cpp
     src/patches.cpp
     src/xui_hooks.cpp
     src/search_state.cpp
@@ -44,7 +46,6 @@ set(AVATAREDITOR_SOURCES
     src/kernel/xam/xam_avatar.cpp
     src/kernel/xam/xam_user.cpp
     src/kernel/xam/xam_loader.cpp
-    src/kernel/xam/xam_ui.cpp
     src/kernel/xam/xhttp.cpp
     src/kernel/xam/marketplace_key.cpp
     src/kernel/xam/apps/xlivebase_app.cpp
@@ -117,6 +118,14 @@ endif()
 
 # No GPU plugin: the native renderer owns the window (see ae_app.h).
 rexglue_setup_target(avatareditor)
+
+# JMlive: the Guide, its keyboard (XamShowKeyboardUI) and achievements on a local profile, with Game Jolt friends.
+set(JMLIVE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../jmlive" CACHE PATH "")
+include("${JMLIVE_DIR}/jmlive/jmlive.cmake")
+jmlive_attach(avatareditor)
+# The Guide's icon for the game, embedded as metadata icon.png.
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.png" "${CMAKE_CURRENT_BINARY_DIR}/ae_metadata/icon.png" COPYONLY)
+rexglue_embed_metadata(avatareditor DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/ae_metadata")
 
 # The config is read from the executable root.
 if(NOT EXISTS "${CMAKE_BINARY_DIR}/avatareditor.toml")

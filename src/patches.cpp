@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 
+#include "ae_achievements.h"
 #include <fmt/format.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -371,6 +372,7 @@ void AE_MktPurchase(PPCRegister& r3) {
   // editor re-enumerates its assets on it (sub_920B8C40), so the wardrobe updates.
   REX_KERNEL_STATE()->BroadcastNotification(0x02000007u, 0);
   REXKRNL_INFO("[mkt-buy] {} bought and installed (tile {:#x})", id->to_string(), tile);
+  ae::achievements::Unlock(ae::achievements::kTreatYourself);
 }
 
 // Seeds the store's item generation word (App+0x2248508) so tiles leave
