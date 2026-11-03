@@ -1920,7 +1920,7 @@ u32 XamAvatarBeginEnumAssets_entry(u32 user_index, u32 items_per_enumerate, u32 
                                    u32 body_mask, u32 flags, mapped_void overlapped_ptr) {
   std::lock_guard<std::mutex> lock(g_asset_enum_mutex);
   g_asset_enumerator = AssetEnumerator(items_per_enumerate ? items_per_enumerate : 50);
-  REXKRNL_INFO("[avatar] enum assets cats={:#x} bodies={:#x} closet={}", category_mask, body_mask,
+  REXKRNL_DEBUG("[avatar] enum assets cats={:#x} bodies={:#x} closet={}", category_mask, body_mask,
                avatars::GetCloset().items().size());
 
   // Catalog search (Ctrl+F): while a query is armed, enumerate only items

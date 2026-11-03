@@ -1158,7 +1158,7 @@ u32 NetDll_XHttpCrackUrlW_entry(u32 caller, u32 url_guest, u32 url_length, u32 f
   // No host means the caller's config never resolved. Report failure rather
   // than handing back components it will dereference blind.
   if (!host_len) {
-    REXKRNL_WARN("XHttpCrackUrlW: no host in '{}'", rex::string::to_utf8(url));
+    REXKRNL_DEBUG("XHttpCrackUrlW: no host in '{}'", rex::string::to_utf8(url));
     return 0;
   }
 

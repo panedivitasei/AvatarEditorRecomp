@@ -87,7 +87,7 @@ ResourceDesc Surface(uint32_t surface_address, ResourceKind kind) {
   desc.height = tiled ? tiled->height : surface->height();
   desc.samples = uint8_t(1u << std::min<uint32_t>(key.msaa, 2));
   desc.format = depth ? HostFormatForDepthTarget(key.format) : HostFormatForColorTarget(key.format);
-  REXGPU_INFO("[gpu] {} surface {:#010x} -> host {} {}x{} {} (guest format {}, edram base {}, msaa {}{})",
+  REXGPU_DEBUG("[gpu] {} surface {:#010x} -> host {} {}x{} {} (guest format {}, edram base {}, msaa {}{})",
               depth ? "depth" : "colour", surface_address, desc.id, desc.width, desc.height,
               HostFormatName(desc.format), key.format, key.edram_base, key.msaa, tiled ? ", whole tiled area" : "");
   g_surfaces.emplace(key, desc);

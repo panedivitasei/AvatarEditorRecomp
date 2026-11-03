@@ -335,7 +335,7 @@ class AvatareditorApp : public rex::ReXApp {
                            rex::memory::kMemoryProtectRead |
                                rex::memory::kMemoryProtectWrite)) {
         memory->Zero(region.base, region.size);
-        REXLOG_INFO("System-exe shim region committed at {:08X}-{:08X}", region.base,
+        REXLOG_DEBUG("System-exe shim region committed at {:08X}-{:08X}", region.base,
                     region.base + region.size);
       } else {
         REXLOG_WARN("System-exe shim region at {:08X} could not be committed", region.base);
@@ -386,7 +386,7 @@ class AvatareditorApp : public rex::ReXApp {
     if (device->Initialize() &&
         runtime->file_system()->RegisterDevice(std::move(device))) {
       runtime->file_system()->RegisterSymbolicLink("font:", kFontMount);
-      REXLOG_INFO("Mounted {} at font:", fonts_root.string());
+      REXLOG_DEBUG("Mounted {} at font:", fonts_root.string());
     } else {
       REXLOG_WARN("font: mount failed for {}", fonts_root.string());
     }

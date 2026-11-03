@@ -741,7 +741,7 @@ bool Backend::CreateDrawResources() {
   sampler_slot_count_ = 0;
   sampler_slot_state_.assign(sampler_capacity_, 0);
   sampler_slot_frame_.assign(sampler_capacity_, 0);
-  REXGPU_INFO("[gpu] sampler table: {} slots (pack sampler_heap {})", sampler_capacity_, abi.sampler_heap);
+  REXGPU_DEBUG("[gpu] sampler table: {} slots (pack sampler_heap {})", sampler_capacity_, abi.sampler_heap);
 
   // Blanks: every descriptor slot starts as a 2D blank, the clamp targets included.
   blank_2d_ = device_->createTexture(plume::RenderTextureDesc::Texture2D(1, 1, 1, plume::RenderFormat::R8G8B8A8_UNORM));
@@ -781,7 +781,7 @@ bool Backend::CreateDrawResources() {
   list->barriers(plume::RenderBarrierStage::GRAPHICS_AND_COMPUTE,
                  plume::RenderBufferBarrier(shared_memory_.get(), plume::RenderBufferAccess::READ));
   SubmitAndWait();
-  REXGPU_INFO("[gpu] draw path ready: {} (b0 {} bytes, vfetch table {})", ShaderPackName(), abi.system_size,
+  REXGPU_DEBUG("[gpu] draw path ready: {} (b0 {} bytes, vfetch table {})", ShaderPackName(), abi.system_size,
               abi.vfetch_table);
   return true;
 }
@@ -823,7 +823,7 @@ void Backend::RebuildSwapChain() {
   if (!swap_chain_->resize() || !BuildSwapChainTargets()) {
     if (swap_chain_->getWidth() && swap_chain_->getHeight()) REXGPU_ERROR("[gpu] swap chain resize failed");
   } else {
-    REXGPU_INFO("[gpu] swap chain {}x{}", swap_chain_->getWidth(), swap_chain_->getHeight());
+    REXGPU_DEBUG("[gpu] swap chain {}x{}", swap_chain_->getWidth(), swap_chain_->getHeight());
   }
 }
 
@@ -834,7 +834,7 @@ void Backend::Destroy() {
   }
   overlay_.Destroy();
   if (draws_executed_ || draws_dropped_) {
-    REXGPU_INFO("[gpu] draws executed {}, dropped {}; sampler slots {}/{}, evictions {}, table fallbacks {}",
+    REXGPU_DEBUG("[gpu] draws executed {}, dropped {}; sampler slots {}/{}, evictions {}, table fallbacks {}",
                 draws_executed_, draws_dropped_, sampler_slot_count_, sampler_capacity_, sampler_evictions_,
                 sampler_set_fallbacks_);
   }
@@ -2360,7 +2360,7 @@ void Backend::WarmPipelines() {
     ++queued;
   }
   warming_ = false;
-  REXGPU_INFO("[gpu] pipeline warm-up: {} queued, {} skipped", queued, skipped);
+  REXGPU_DEBUG("[gpu] pipeline warm-up: {} queued, {} skipped", queued, skipped);
 }
 
 void Backend::Execute(Packet& packet) {
@@ -2602,7 +2602,7 @@ void WaitForWarmup() {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
-  REXGPU_INFO("[gpu] pipeline warm-up: {} compiled in {:.1f} s before the first frame", total,
+  REXGPU_DEBUG("[gpu] pipeline warm-up: {} compiled in {:.1f} s before the first frame", total,
               std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
 }
 

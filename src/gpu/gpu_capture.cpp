@@ -198,7 +198,7 @@ REX_HOOK_RAW(sub_9211F940) {
     fresh = s_seen.insert(shape).second;
   }
   if (fresh) {
-    REXGPU_INFO("[gpu] tiling bracket: {} tiles over ({},{})-({},{}), rt0 {:#010x} depth {:#010x} flags {:#x}", count,
+    REXGPU_DEBUG("[gpu] tiling bracket: {} tiles over ({},{})-({},{}), rt0 {:#010x} depth {:#010x} flags {:#x}", count,
                 tiles.left, tiles.top, tiles.right, tiles.bottom, uint32_t(d->render_targets[0]),
                 uint32_t(d->depth_stencil), ctx.r4.u32);
   }

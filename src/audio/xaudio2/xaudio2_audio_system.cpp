@@ -83,7 +83,7 @@ bool XAudio2AudioSystem::EnsureEngine() {
     return false;
   }
 
-  REXAPU_INFO("XAudio2: device + mastering voice created (lazy)");
+  REXAPU_DEBUG("XAudio2: device + mastering voice created (lazy)");
   return true;
 }
 

@@ -84,7 +84,7 @@ void InstallFaultReporter() {
   g_module_end = g_module_base + nt->OptionalHeader.SizeOfImage;
 #endif
   rex::arch::ExceptionHandler::Install(OnFault, nullptr);
-  REXLOG_INFO("[fault] reporter installed over {} guest functions, exe at {:#x}", g_functions.size(), g_module_base);
+  REXLOG_DEBUG("[fault] reporter installed over {} guest functions, exe at {:#x}", g_functions.size(), g_module_base);
 }
 
 }  // namespace ae::diag

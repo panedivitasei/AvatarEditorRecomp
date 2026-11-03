@@ -173,13 +173,13 @@ void End(uint32_t device) {
   // fault can be read back from the log; the tile buffers only count against the budget.
   if (!b.entries->empty()) {
     const Entry& last = b.entries->back();
-    REXGPU_INFO("[gpu] command buffer {:#010x} sealed with {} entries, flags {:#x}, tags {:#018x} {:#018x} {:#018x} "
+    REXGPU_DEBUG("[gpu] command buffer {:#010x} sealed with {} entries, flags {:#x}, tags {:#018x} {:#018x} {:#018x} "
                 "{:#018x} {:#018x}, vs {:#010x} variant {} ({} bytes), fetch30 {:#010x}",
                 it->second.buffer, b.entries->size(), b.flags, last.tags[0], last.tags[1], last.tags[2], last.tags[3],
                 last.tags[4], last.vs.object, last.vs.variant1 ? 1 : 0, last.vs.code.size(),
                 uint32_t(reinterpret_cast<const D3DDevice*>(last.device.data())->m_Constants.Fetch[30].dword[4]));
   } else if (Loud()) {
-    REXGPU_INFO("[gpu] command buffer {:#010x} sealed with 0 entries", it->second.buffer);
+    REXGPU_DEBUG("[gpu] command buffer {:#010x} sealed with 0 entries", it->second.buffer);
   }
   g_recording.erase(it);
 }

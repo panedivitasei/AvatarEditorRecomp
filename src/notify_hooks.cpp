@@ -41,7 +41,7 @@ void NotifyLiveConnected(uint64_t mask, uint32_t handle) {
                                       kLogonConnectionEstablished);
   // The front end re-evaluates live availability on a sign-in change.
   kernel_state->BroadcastNotification(kXnSysSigninChanged, 1);
-  REXKRNL_INFO("Live connection reported to listener {:08X} (mask {:#x})", handle, mask);
+  REXKRNL_DEBUG("Live connection reported to listener {:08X} (mask {:#x})", handle, mask);
 }
 
 }  // namespace
