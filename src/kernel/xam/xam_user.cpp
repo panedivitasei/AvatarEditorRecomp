@@ -211,6 +211,15 @@ typedef struct {
 } X_USER_READ_PROFILE_SETTINGS;
 static_assert_size(X_USER_READ_PROFILE_SETTINGS, 8);
 
+// XPROFILE_GAMERCARD_PERSONAL_PICTURE, which the runtime's profile lacks: the editor's Gamer Picture save reads it
+// before writing the tiles, and an empty value only picks the tile kind (18, not 50).
+static void EnsurePersonalPictureSetting(UserProfile* profile) {
+  constexpr uint32_t kPersonalPictureSettingId = 0x40640010u;
+  if (profile && !profile->GetSetting(kPersonalPictureSettingId)) {
+    profile->AddSetting(std::make_unique<UserProfile::UnicodeSetting>(kPersonalPictureSettingId, u""));
+  }
+}
+
 // https://github.com/oukiar/freestyledash/blob/master/Freestyle/Tools/Generic/xboxtools.cpp
 uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, uint32_t xuid_count,
                                       be<uint64_t>* xuids, uint32_t setting_count,
@@ -295,6 +304,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   // validity checking; titles read the player's avatar from this profile
   // setting at boot.
   EnsureAvatarProfileSetting(user_profile);
+  EnsurePersonalPictureSetting(user_profile);
 
   // First call asks for size (fill buffer_size_ptr).
   // Second call asks for buffer contents with that size.
@@ -365,9 +375,10 @@ u32 XamUserReadProfileSettings_entry(u32 title_id, u32 user_index, u32 xuid_coun
                                       setting_ids, 0, buffer_size_ptr, buffer_ptr, overlapped);
 }
 
+// The flags word comes before the size pointer: the editor's Gamer Picture save (sub_921FEDE0) passes 0, &size.
 u32 XamUserReadProfileSettingsEx_entry(u32 title_id, u32 user_index, u32 xuid_count,
                                        mapped_u64 xuids, u32 setting_count, mapped_u32 setting_ids,
-                                       mapped_u32 buffer_size_ptr, u32 unk_2,
+                                       u32 unk_2, mapped_u32 buffer_size_ptr,
                                        mapped_void buffer_ptr,
                                        ppc_ptr_t<XAM_OVERLAPPED> overlapped) {
   return XamUserReadProfileSettingsEx(title_id, user_index, xuid_count, xuids, setting_count,
