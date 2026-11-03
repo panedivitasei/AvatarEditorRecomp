@@ -33,9 +33,9 @@ See [BUILDING.md](BUILDING.md).
 
 Settings can be configured via `avatareditor.toml`
 
-- `Documents\JMstudios\userdata`, save data 
-- `userdata\avatar\avatar_manifest.bin`, the saved avatar
-- `userdata\avatar\gamerpic.png`, the saved AE gamer pic 
+- `Documents\JMstudios\userdata\Avatar Editor`, save data 
+- `userdata\Avatar\Manifest\avatar_manifest.bin`, the saved avatar
+- `userdata\Avatar\Manifest\gamerpic.png`, the saved AE gamer pic 
 
 ## Credits
 

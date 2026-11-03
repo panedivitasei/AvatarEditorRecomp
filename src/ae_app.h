@@ -119,10 +119,13 @@ class AvatareditorApp : public rex::ReXApp {
       }
       paths.game_data_root = p.lexically_normal();
     }
-    // Profiles and saves are shared with the other JMstudios titles through
-    // Documents\JMstudios\userdata.
-    if (REXCVAR_GET(user_data_root).empty()) {
-      paths.user_data_root = rex::filesystem::GetUserFolder() / "JMstudios" / "userdata";
+    // JMinstaller's layout, which dev builds default to: user data in userdata\Avatar Editor, the avatar shared in
+    // userdata\Avatar\Manifest.
+    const std::filesystem::path userdata = rex::filesystem::GetUserFolder() / "JMstudios" / "userdata";
+    const std::string user_root = REXCVAR_GET(user_data_root);
+    paths.user_data_root = user_root.empty() ? userdata / "Avatar Editor" : std::filesystem::path(user_root);
+    if (rex::cvar::GetFlagSource("avatar_data_dir") == rex::cvar::Source::kDefault) {
+      rex::cvar::SetFlagByName("avatar_data_dir", (userdata / "Avatar" / "Manifest").string());
     }
   }
 
