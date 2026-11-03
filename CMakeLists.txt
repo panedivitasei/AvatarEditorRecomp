@@ -8,6 +8,11 @@ project(avatareditor LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Shipped binaries carry no build-machine paths: everything under the checkout's parent folder
+# (this repo, the SDK, jmlive) is recorded relative to it.
+get_filename_component(CHECKOUT_PARENT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+add_compile_options("-ffile-prefix-map=${CHECKOUT_PARENT_DIR}/=")
+
 include(generated/rexglue.cmake)
 
 # sources.cmake is committed so a fresh tree knows the generated file names
@@ -108,8 +113,9 @@ if(WIN32)
         "${XENOS_RECOMP_THIRDPARTY_ROOT}/dxc-bin/bin/x64/dxil.dll"
         "$<TARGET_FILE_DIR:avatareditor>")
 endif()
-# The shader pack loader finds out/shaderpack/ae.pack relative to the source tree.
-target_compile_definitions(avatareditor PRIVATE AE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+# Dev builds fall back to out/shaderpack/ae.pack in the source tree; Release uses the pack beside the exe.
+target_compile_definitions(avatareditor PRIVATE
+    AE_SOURCE_DIR="$<$<NOT:$<CONFIG:Release>>:${CMAKE_CURRENT_SOURCE_DIR}>")
 
 # XAudio2 system library for the title audio backend.
 if(WIN32)
