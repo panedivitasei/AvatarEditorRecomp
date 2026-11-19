@@ -1289,6 +1289,8 @@ struct RemoteItem {
   std::string name;
   uint32_t categories = 0;
   uint8_t bodies = 0;
+  avatars::Closet::AwardDetails award;  // award ids only
+  std::string award_icon_path;          // server path of the game logo
 };
 
 static std::string HeaderValue(const std::string& block, const std::string& name) {
@@ -1349,6 +1351,11 @@ static bool FetchRemoteItem(const avatars::AssetId& id, RemoteItem& item) {
   if (!item.categories) item.categories = id.a.get();
   if (!item.bodies) item.bodies = uint8_t(id.c.get() & 0xF);
   if (item.name.empty()) item.name = guid;
+  if (avatars::IsAwardId(id)) {
+    item.award.title_name = PercentDecode(HeaderValue(headers, "X-Avatar-Award-Title-Name"));
+    item.award.description = PercentDecode(HeaderValue(headers, "X-Avatar-Award-Description"));
+    item.award_icon_path = HeaderValue(headers, "X-Avatar-Award-Title-Icon");
+  }
   avatars::GetCloset().RegisterCustomItem(id, item.blob.data(), item.blob.size());
   return true;
 }
@@ -1436,11 +1443,24 @@ bool MarketplaceInstallItem(const avatars::AssetId& id) {
   if (!avatars::GetCloset().ReadItemIcon(id, png)) {
     FetchRemoteIcon(id, png);
   }
+  const bool award = avatars::IsAwardId(id);
+  // Logo path is only honoured under /art/ on the store host.
+  if (award && item.award_icon_path.rfind("/art/", 0) == 0) {
+    std::string body;
+    if (MarketplaceGet(item.award_icon_path, &body) && !body.empty()) {
+      item.award.title_icon.assign(body.begin(), body.end());
+    }
+  }
   const bool ok = avatars::GetCloset().InstallItem(id, item.blob, png, item.categories,
-                                                  item.bodies, item.name);
+                                                  item.bodies, item.name,
+                                                  award ? &item.award : nullptr);
   if (ok) {
     REXKRNL_INFO("[avatar] installed {} '{}' ({:#x} bytes, icon {})", id.to_string(), item.name,
                  item.blob.size(), png.empty() ? "none" : "yes");
+    if (award) {
+      REXKRNL_INFO("[avatar] award {:08X} '{}' (logo {})", avatars::TitleIdOf(id),
+                   item.award.title_name, item.award.title_icon.empty() ? "none" : "yes");
+    }
     ae::achievements::OnClosetCount(avatars::GetCloset().items().size());
   }
   return ok;

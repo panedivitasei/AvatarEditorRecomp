@@ -265,9 +265,107 @@ static bool WriteWholeFile(const std::filesystem::path& path, const std::vector<
   return put == bytes.size();
 }
 
+// Appends a line; terminates an unterminated last line first.
+static bool AppendTsvLine(const std::filesystem::path& path, const std::string& line) {
+  const std::string text = ReadTextFile(path);
+  FILE* f = std::fopen(path.string().c_str(), "ab");
+  if (!f) {
+    return false;
+  }
+  if (!text.empty() && text.back() != '\n') std::fputc('\n', f);
+  std::fputs(line.c_str(), f);
+  std::fputc('\n', f);
+  return std::fclose(f) == 0;
+}
+
+static std::string TsvField(const std::string& text) {
+  std::string out;
+  for (char c : text) out.push_back(c == '\t' || c == '\n' || c == '\r' ? ' ' : c);
+  return out;
+}
+
+void Closet::ApplyInstalledAward(ClosetItem& item, const AwardDetails* award) {
+  const bool was_award = item.is_award;
+  item.is_award = true;
+  item.title_id = TitleIdOf(item.id);
+  char title_hex[16];
+  std::snprintf(title_hex, sizeof(title_hex), "%08X", item.title_id);
+  const std::string guid = item.id.to_string();
+  std::error_code ec;
+
+  if (award) {
+    // Logo, unless titles/ already has art.
+    static const char* const kExts[] = {"png", "jpg", "jpeg", "bmp", "gif"};
+    bool have_art = false;
+    for (const char* ext : kExts) {
+      have_art = have_art ||
+                 std::filesystem::exists(dir_ / "titles" / (std::string(title_hex) + "." + ext), ec);
+    }
+    const auto& art = award->title_icon;
+    const bool png = art.size() > 8 && std::memcmp(art.data(), "\x89PNG", 4) == 0;
+    const bool jpg = art.size() > 3 && art[0] == 0xFF && art[1] == 0xD8 && art[2] == 0xFF;
+    if (!have_art && (png || jpg)) {
+      std::filesystem::create_directories(dir_ / "titles", ec);
+      const auto path = dir_ / "titles" / (std::string(title_hex) + (png ? ".png" : ".jpg"));
+      if (!WriteWholeFile(path, art)) {
+        REXKRNL_WARN("[avatar] closet: cannot write {}", path.string());
+      }
+    }
+    // Title row, unless present.
+    if (!award->title_name.empty()) {
+      bool named = false;
+      for (const auto& row : ParseTsv(ReadTextFile(dir_ / "closet_titles.tsv"))) {
+        named = named || (row.size() >= 2 &&
+                          (uint32_t)std::strtoul(row[0].c_str(), nullptr, 16) == item.title_id);
+      }
+      if (!named) {
+        AppendTsvLine(dir_ / "closet_titles.tsv",
+                      std::string(title_hex) + "\t" + TsvField(award->title_name));
+      }
+    }
+    // Award row, unless present. Unlock 0 = bin mtime.
+    bool listed = false;
+    for (const auto& row : ParseTsv(ReadTextFile(dir_ / "closet_awards.tsv"))) {
+      if (row.empty()) continue;
+      std::string g = row[0];
+      for (auto& c : g) c = (char)std::tolower((unsigned char)c);
+      listed = listed || g == guid;
+    }
+    if (!listed && (!award->title_name.empty() || !award->description.empty())) {
+      AppendTsvLine(dir_ / "closet_awards.tsv",
+                    guid + "\t" + title_hex + "\t" + TsvField(award->title_name) + "\t" +
+                        TsvField(award->description) + "\t0");
+    }
+  }
+
+  // Same precedence as LoadAwardDetails: award row, title row, hex id.
+  for (const auto& row : ParseTsv(ReadTextFile(dir_ / "closet_awards.tsv"))) {
+    if (row.empty()) continue;
+    std::string g = row[0];
+    for (auto& c : g) c = (char)std::tolower((unsigned char)c);
+    if (g != guid) continue;
+    if (row.size() >= 3) item.title_name = row[2];
+    if (row.size() >= 4) item.description = row[3];
+    if (row.size() >= 5) item.unlock_time = std::strtoull(row[4].c_str(), nullptr, 10);
+  }
+  if (item.title_name.empty()) {
+    for (const auto& row : ParseTsv(ReadTextFile(dir_ / "closet_titles.tsv"))) {
+      if (row.size() >= 2 && (uint32_t)std::strtoul(row[0].c_str(), nullptr, 16) == item.title_id) {
+        item.title_name = row[1];
+      }
+    }
+  }
+  if (item.title_name.empty()) item.title_name = title_hex;
+  if (!item.unlock_time) {
+    auto ft = std::filesystem::last_write_time(dir_ / (guid + ".bin"), ec);
+    if (!ec) item.unlock_time = (uint64_t)ft.time_since_epoch().count();
+  }
+  if (!was_award) ++award_count_;
+}
+
 bool Closet::InstallItem(const AssetId& id, const std::vector<uint8_t>& blob,
                          const std::vector<uint8_t>& icon, uint32_t categories, uint8_t bodies,
-                         const std::string& name) {
+                         const std::string& name, const AwardDetails* award) {
   if (dir_.empty() || blob.empty()) {
     return false;
   }
@@ -282,7 +380,12 @@ bool Closet::InstallItem(const AssetId& id, const std::vector<uint8_t>& blob,
     WriteWholeFile(dir_ / "icons" / (guid + ".png"), icon);
   }
   if (Find(id)) {
-    return true;  // a reinstall: files refreshed, the row is already there
+    // Reinstall: files refreshed, row already present.
+    if (IsAwardId(id)) {
+      auto it = by_guid_.find(guid);
+      if (it != by_guid_.end()) ApplyInstalledAward(items_[it->second], award);
+    }
+    return true;
   }
   // Same row the Avatar Aura import writes: guid, categories hex, bodies, name.
   std::string safe_name;
@@ -302,6 +405,9 @@ bool Closet::InstallItem(const AssetId& id, const std::vector<uint8_t>& blob,
   item.categories = categories;
   item.bodies = bodies;
   item.name = safe_name;
+  if (IsAwardId(id)) {
+    ApplyInstalledAward(item, award);
+  }
   items_.push_back(std::move(item));
   std::sort(items_.begin(), items_.end(),
             [](const ClosetItem& a, const ClosetItem& b) { return a.name < b.name; });

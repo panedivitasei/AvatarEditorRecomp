@@ -90,12 +90,19 @@ class Closet {
   void RegisterCustomItem(const AssetId& id, const uint8_t* data, size_t size);
   void RegisterCustomIcon(const AssetId& id, const uint8_t* data, size_t size);
 
-  // A purchase landing: writes <guid>.bin and icons/<guid>.png, appends the
-  // closet_index.tsv row and lists the item, so it is owned and in the
-  // wardrobe from this call on.
+  // Award metadata from the store download; all optional.
+  struct AwardDetails {
+    std::string title_name;           // UTF-8
+    std::string description;          // UTF-8
+    std::vector<uint8_t> title_icon;  // PNG/JPEG for titles/<TITLEID>
+  };
+
+  // Store install: writes <guid>.bin, icons/<guid>.png and the index row, then
+  // lists the item. Award ids are flagged immediately; `award` fills absent
+  // sidecars (closet_titles.tsv, closet_awards.tsv, titles/).
   bool InstallItem(const AssetId& id, const std::vector<uint8_t>& blob,
                    const std::vector<uint8_t>& icon, uint32_t categories, uint8_t bodies,
-                   const std::string& name);
+                   const std::string& name, const AwardDetails* award = nullptr);
 
   // Reads the item's imported marketplace icon (icons/<guid>.png) as raw PNG
   // file bytes. False when the item exists but carries no icon art.
@@ -107,6 +114,8 @@ class Closet {
 
  private:
   void LoadAwardDetails();
+  // Flags an installed award, writes absent sidecars, fills its award fields.
+  void ApplyInstalledAward(ClosetItem& item, const AwardDetails* award);
 
   bool is_loaded_ = false;
   size_t award_count_ = 0;
