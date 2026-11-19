@@ -22,6 +22,9 @@ XInput controller and keyboard support.
 **Fullscreen toggle**  
 Press `F11` to toggle between window and fullscreen modes.
 
+**Guide** 
+Recreation using [RexLiveless](https://github.com/SolarCookies/RexLiveless)
+
 ## Companion Tool
 [Avatar Aura](https://github.com/panedivitasei/avatar-aura): Import items into the Avatar Editor. Or pose, animate and export your avatar as a 3D model.
 
