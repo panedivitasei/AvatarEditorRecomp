@@ -22,7 +22,7 @@ XInput controller and keyboard support.
 **Fullscreen toggle**  
 Press `F11` to toggle between window and fullscreen modes.
 
-**Guide** 
+**Guide**  
 Recreation using [RexLiveless](https://github.com/SolarCookies/RexLiveless)
 
 ## Companion Tool
